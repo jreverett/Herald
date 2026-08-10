@@ -296,6 +296,24 @@ class Protocol(unittest.TestCase):
                 p.kill()
         self.assertIn("ANSWER-42", out, err)
 
+    def test_ask_keeps_waiting_after_message_ack(self):
+        p = subprocess.Popen(
+            [sys.executable, HERALD_PY, "ask", "bob", "-m", "ask Jamie", "--timeout", "20"],
+            env=self._env("alice", "alice-ask"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            message = self.wait_for_inbox("bob", lambda i: i["text"] == "ask Jamie")
+            self.assertIsNotNone(message)
+            self.cli("bob", "reply", message["id"], "-m", "Received; I will ask Jamie.",
+                     "--meta", "herald_intent=ack", agent="bob-w")
+            self.cli("bob", "reply", message["id"], "-m", "Jamie approved it.", agent="bob-w")
+            out, err = p.communicate(timeout=25)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertIn("[ack] bob: Received; I will ask Jamie.", out, err)
+        self.assertIn("Jamie approved it.", out, err)
+
     def test_wait_read_folds_in_content_and_claims(self):
         p = subprocess.Popen(
             [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "15"],

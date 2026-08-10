@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -832,9 +832,10 @@ def cmd_ask(cfg, args):
     deadline = time.time() + (args.timeout or 300)
     while time.time() < deadline:
         write_session(started)
-        for name in sorted({p.name for p in INBOX_DIR.glob("*.json")} - known):
-            known.add(name)
-            item = json.loads((INBOX_DIR / name).read_text())
+        new_names = {p.name for p in INBOX_DIR.glob("*.json")} - known
+        known.update(new_names)
+        items = [json.loads((INBOX_DIR / name).read_text()) for name in new_names]
+        for item in sorted(items, key=lambda value: (value.get("received_ts", 0), value["id"])):
             if item.get("thread") != thread:
                 continue
             target = item.get("to_agent", "")
@@ -842,6 +843,9 @@ def cmd_ask(cfg, args):
                 continue
             if item["kind"] == "result" and item.get("status") in ("accepted", "working"):
                 print(f"[{item['status']}] {item['from']}: {item['text'][:200]}")
+                continue   # progress; keep waiting for the terminal reply
+            if item.get("meta", {}).get("herald_intent") == "ack":
+                print(f"[ack] {item['from']}: {item['text'][:200]}")
                 continue   # progress; keep waiting for the terminal reply
             _show_and_claim(item, me, args.out)
             clear_session()

@@ -2,6 +2,15 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.7.4
+
+- The receive protocol now requires an immediate acknowledgement for every
+  message and task. An acknowledgement states the next action and whether a
+  later reply will follow, including while the receiving agent waits for its
+  human.
+- Delayed message acknowledgements use `herald_intent: ack`. `herald ask` treats
+  them as progress and continues to wait for the final reply.
+
 ## 0.7.3
 
 - The skill now records that a timed-out `herald wait` exits 2. A short
