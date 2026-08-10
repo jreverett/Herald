@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """herald - peer-to-peer agent-to-agent messaging.
 
-Agent sessions (Claude Code, Codex CLI) on different machines hold threaded
+Agent sessions (Claude Code, Codex, Copilot) on different machines hold threaded
 conversations: messages, task requests with a lifecycle (pending -> working ->
 done/failed), results with attached files, and structured metadata. Each
 machine runs `herald daemon` (reachable over Tailscale); `herald wait` blocks until
@@ -14,6 +14,8 @@ Config in ~/.herald/config.json:
 {
   "me": "alice",
   "listen": {"host": "auto", "port": 8765},   // auto = Tailscale IP only
+  "default_mailbox": "main",
+  "mailboxes": ["main"],
   "peers": {
     "bob": {
       "url": "http://100.x.y.z:8765",       // how I reach bob
@@ -32,6 +34,7 @@ receiving agent triages them (see AGENTS.md).
 import argparse
 import atexit
 import base64
+import fcntl
 import json
 import os
 import secrets
@@ -43,10 +46,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.7.4"
+__version__ = "0.8.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -56,7 +60,10 @@ FILES_DIR = HERALD_DIR / "files"
 QUEUE_DIR = HERALD_DIR / "queue"
 ACTIVITY_DIR = HERALD_DIR / "activity"
 SESSIONS_DIR = HERALD_DIR / "sessions"
+CONSUMERS_DIR = HERALD_DIR / "consumers"
+FAILED_DIR = HERALD_DIR / "failed"
 STATUS_PATH = HERALD_DIR / "status.json"
+STATE_LOCK_PATH = HERALD_DIR / "state.lock"
 MAX_FILE_BYTES = 100 * 1024 * 1024
 KINDS = ("message", "task", "result")
 STATUSES = ("accepted", "working", "done", "failed")
@@ -75,8 +82,55 @@ def load_config():
 
 
 def ensure_dirs():
-    for d in (INBOX_DIR, OUTBOX_DIR, FILES_DIR, QUEUE_DIR, ACTIVITY_DIR, SESSIONS_DIR):
+    for d in (INBOX_DIR, OUTBOX_DIR, FILES_DIR, QUEUE_DIR, ACTIVITY_DIR,
+              SESSIONS_DIR, CONSUMERS_DIR, FAILED_DIR):
         d.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def state_lock():
+    HERALD_DIR.mkdir(parents=True, exist_ok=True)
+    with STATE_LOCK_PATH.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def atomic_write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
+    tmp.write_text(json.dumps(value, indent=2))
+    os.replace(tmp, path)
+
+
+def mailbox_name(cfg=None):
+    if os.environ.get("HERALD_MAILBOX"):
+        return os.environ["HERALD_MAILBOX"]
+    if cfg:
+        return str(cfg.get("default_mailbox") or "main")
+    return "main"
+
+
+def valid_mailbox_name(name):
+    return (bool(name) and len(name) <= 64
+            and all(char.isalnum() or char in "-_." for char in name)
+            and name not in (".", ".."))
+
+
+def configured_default_mailbox(cfg):
+    name = str(cfg.get("default_mailbox") or "main")
+    return name if valid_mailbox_name(name) else "main"
+
+
+def registered_mailboxes(cfg):
+    default = configured_default_mailbox(cfg)
+    mailboxes = cfg.get("mailboxes") or [default]
+    if isinstance(mailboxes, dict):
+        mailboxes = list(mailboxes)
+    names = [str(name) for name in mailboxes if valid_mailbox_name(str(name))]
+    return list(dict.fromkeys([default, *names]))
 
 
 def touch_activity(kind):
@@ -100,6 +154,10 @@ def write_status(fields):
 
 def new_id():
     return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+
+
+def new_delivery_id():
+    return secrets.token_hex(16)
 
 
 def agent_name():
@@ -135,40 +193,135 @@ def read_sessions():
             s = json.loads(p.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        out[s.get("agent", p.stem)] = s
+        session_id = s.get("session_id") or p.stem
+        s.setdefault("session_id", session_id)
+        s.setdefault("mailbox", "main")
+        s.setdefault("mode", "general")
+        out[session_id] = s
     return out
 
 
-def session_alive(agent, sessions=None):
-    """A session is live if it heartbeated within the lease. Same-machine
-    sessions also fail fast if their pid is gone (reboot-safe: pid absent)."""
+def _session_record_alive(session):
+    if session.get("host") == socket.gethostname() and isinstance(session.get("pid"), int):
+        if not is_pid_alive(session["pid"]):
+            return False
+    return (time.time() - session.get("heartbeat", 0)) <= SESSION_LEASE
+
+
+def session_alive(identifier, sessions=None):
+    """Return whether a listener instance or legacy agent label is live."""
     if sessions is None:
         sessions = read_sessions()
-    s = sessions.get(agent)
-    if not s:
-        return False
-    if s.get("host") == socket.gethostname() and isinstance(s.get("pid"), int):
-        if not is_pid_alive(s["pid"]):
-            return False
-    return (time.time() - s.get("heartbeat", 0)) <= SESSION_LEASE
+    if identifier in sessions:
+        return _session_record_alive(sessions[identifier])
+    return any(s.get("agent") == identifier and _session_record_alive(s)
+               for s in sessions.values())
 
 
-def write_session(started, waiting_on="inbox"):
+def live_sessions(sessions=None, mailbox=None, mode=None, agent=None):
+    sessions = sessions or read_sessions()
+    return [s for s in sessions.values()
+            if _session_record_alive(s)
+            and (mailbox is None or s.get("mailbox", "main") == mailbox)
+            and (mode is None or s.get("mode", "general") == mode)
+            and (agent is None or s.get("agent") == agent)]
+
+
+def write_session(listener, waiting_on="inbox"):
     try:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        me = agent_name()
-        (SESSIONS_DIR / f"{sanitize_filename(me)}.json").write_text(json.dumps({
-            "agent": me, "pid": os.getpid(), "host": socket.gethostname(),
-            "started": started, "heartbeat": time.time(), "waiting_on": waiting_on}))
+        record = {
+            "session_id": listener["session_id"],
+            "agent": listener["agent"],
+            "mailbox": listener["mailbox"],
+            "mode": listener["mode"],
+            "generation": listener.get("generation", 0),
+            "request_id": listener.get("request_id", ""),
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "started": listener["started"],
+            "heartbeat": time.time(),
+            "waiting_on": waiting_on,
+        }
+        atomic_write_json(SESSIONS_DIR / f"{sanitize_filename(listener['session_id'])}.json", record)
     except OSError:
         pass
 
 
-def clear_session():
+def clear_session(session_id):
     try:
-        (SESSIONS_DIR / f"{sanitize_filename(agent_name())}.json").unlink()
+        (SESSIONS_DIR / f"{sanitize_filename(session_id)}.json").unlink()
     except OSError:
         pass
+
+
+def consumer_path(mailbox):
+    return CONSUMERS_DIR / f"{sanitize_filename(mailbox)}.json"
+
+
+def register_listener(cfg, mode="general", takeover=False):
+    ensure_dirs()
+    listener = {
+        "session_id": f"listener-{new_id()}",
+        "agent": agent_name(),
+        "mailbox": mailbox_name(cfg),
+        "mode": mode,
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "request_id": "",
+    }
+    if mode == "general":
+        with state_lock():
+            path = consumer_path(listener["mailbox"])
+            try:
+                current = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                current = {}
+            generation = int(current.get("generation", 0))
+            if takeover or current.get("agent") != listener["agent"]:
+                generation += 1
+            listener["generation"] = max(1, generation)
+            atomic_write_json(path, {
+                "mailbox": listener["mailbox"],
+                "agent": listener["agent"],
+                "session_id": listener["session_id"],
+                "generation": listener["generation"],
+                "updated_at": time.time(),
+            })
+    write_session(listener)
+    return listener
+
+
+def consumer_is_current(listener):
+    if listener["mode"] != "general":
+        return True
+    try:
+        current = json.loads(consumer_path(listener["mailbox"]).read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return current.get("session_id") == listener["session_id"]
+
+
+def current_consumer(mailbox, sessions=None):
+    try:
+        current = json.loads(consumer_path(mailbox).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    sessions = sessions or read_sessions()
+    session = sessions.get(current.get("session_id", ""))
+    return session if session and _session_record_alive(session) else None
+
+
+def active_assignment(item, sessions=None):
+    sessions = sessions or read_sessions()
+    session_id = item.get("assigned_session", "")
+    session = sessions.get(session_id)
+    if not session or not _session_record_alive(session):
+        return None
+    if session.get("mode", "general") == "general":
+        consumer = current_consumer(item.get("to_mailbox") or "main", sessions)
+        if not consumer or consumer.get("session_id") != session_id:
+            return None
+    return session
 
 
 def sanitize_filename(name):
@@ -176,11 +329,96 @@ def sanitize_filename(name):
     return name.replace("..", "_") or "unnamed"
 
 
+def item_state(item):
+    if item.get("state"):
+        return item["state"]
+    if ((item.get("kind") == "result" and item.get("status") in ("accepted", "working"))
+            or item.get("meta", {}).get("herald_intent") == "ack"):
+        return "handled"
+    return "handled" if item.get("claimed_by") else "pending"
+
+
+def update_inbox_item(item_id, **changes):
+    path = INBOX_DIR / f"{item_id}.json"
+    with state_lock():
+        if not path.exists():
+            return None
+        item = json.loads(path.read_text())
+        item.update(changes)
+        atomic_write_json(path, item)
+        return item
+
+
+def _apply_source_delivery(payload, delivery_state, error=""):
+    item_id = payload.get("_source_item_id")
+    effect = payload.get("_source_effect")
+    if not item_id or not effect:
+        return
+    changes = {"response_delivery_id": payload.get("delivery_id", "")}
+    if delivery_state == "delivered":
+        if effect == "ack":
+            changes.update(state="active", acknowledged_at=time.time(), delivery_error="")
+        else:
+            changes.update(state="handled", handled_at=time.time(), delivery_error="")
+    elif delivery_state == "queued":
+        changes.update(state="active" if effect == "ack" else "responded_pending_delivery")
+        if effect == "ack":
+            changes["acknowledged_at"] = time.time()
+    else:
+        changes.update(state="delivery_failed", delivery_error=error, presented_generation=0)
+    update_inbox_item(item_id, **changes)
+
+
+def _update_outstanding_request(item):
+    reply_to = item.get("reply_to", "")
+    if not reply_to:
+        return
+    with state_lock():
+        path = OUTBOX_DIR / f"{reply_to}.json"
+        if not path.exists():
+            path = None
+            for candidate in OUTBOX_DIR.glob("*.json"):
+                try:
+                    request = json.loads(candidate.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if reply_to in request.get("remote_ids", []):
+                    path = candidate
+                    break
+            if path is None:
+                return
+        try:
+            request = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        is_progress = ((item.get("kind") == "result"
+                        and item.get("status") in ("accepted", "working"))
+                       or item.get("meta", {}).get("herald_intent") == "ack")
+        if is_progress:
+            waiting = request.get("awaiting_reply_ids")
+            if request.get("state") == "handled" or (waiting is not None and reply_to not in waiting):
+                return
+            request["state"] = "awaiting_terminal"
+            request["last_progress_at"] = item.get("received_ts", time.time())
+        else:
+            waiting = request.get("awaiting_reply_ids", [request.get("id", "")])
+            request["awaiting_reply_ids"] = [item_id for item_id in waiting
+                                              if item_id != reply_to]
+            if request["awaiting_reply_ids"]:
+                request["state"] = "awaiting_terminal"
+            else:
+                request["state"] = "handled"
+                request["handled_at"] = item.get("received_ts", time.time())
+        atomic_write_json(path, request)
+
+
 # ---------------- daemon (receiver) ----------------
 
 class Handler(BaseHTTPRequestHandler):
     notify_command = None
     me = None
+    default_mailbox = "main"
+    mailboxes = ["main"]
     peer_by_token = {}   # per-peer inbound token -> peer name, for authenticated identity
 
     def _json(self, code, obj):
@@ -193,7 +431,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/ping":
-            self._json(200, {"ok": True, "version": __version__, "me": self.me})
+            self._json(200, {"ok": True, "version": __version__, "me": self.me,
+                             "capabilities": ["mailboxes-v1", "delivery-id-v1"]})
         else:
             self._json(404, {"error": "not found"})
 
@@ -201,9 +440,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/send":
             self._json(404, {"error": "not found"})
             return
+        try:
+            runtime_cfg = load_config()
+        except (SystemExit, OSError, json.JSONDecodeError):
+            runtime_cfg = None
+        peer_by_token = ({p["issued_token"]: name
+                          for name, p in runtime_cfg.get("peers", {}).items()
+                          if p.get("issued_token")}
+                         if runtime_cfg else self.peer_by_token)
+        default_mailbox = configured_default_mailbox(runtime_cfg) if runtime_cfg else self.default_mailbox
+        mailboxes = registered_mailboxes(runtime_cfg) if runtime_cfg else self.mailboxes
         auth = self.headers.get("Authorization", "")
         tok = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
-        sender = self.peer_by_token.get(tok)   # each peer has its own inbound token; the token is the identity
+        sender = peer_by_token.get(tok)   # each peer has its own inbound token; the token is the identity
         if sender is None:
             self._json(401, {"error": "bad token"})
             return
@@ -220,48 +469,108 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": f"kind must be one of {KINDS}"})
             return
 
-        item_id = new_id()
-        stored = {
-            "id": item_id,
-            "thread": str(item.get("thread") or item_id)[:64],
-            "reply_to": str(item.get("reply_to", ""))[:64],
-            "from": sender,   # authoritative: the token proves who sent it, not the payload
-
-            "from_agent": str(item.get("from_agent", ""))[:64],
-            "to_agent": str(item.get("to_agent", ""))[:64],
-            "broadcast": bool(item.get("broadcast")),   # --all: every session wakes
-            "targeted": bool(item.get("targeted")),     # sender chose the session; honour give-up
-            "fallback": item["fallback"] if item.get("fallback") in FALLBACKS else "broadcast",
-            "kind": item["kind"],
-            "status": item.get("status", ""),
-            "text": str(item.get("text", ""))[:200_000],
-            "meta": item.get("meta") if isinstance(item.get("meta"), dict) else {},
-            "files": [],
-            "received": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "received_ts": time.time(),
-            "claimed_by": "",
-            "claimed_at": 0,
-        }
-        if stored["kind"] == "result" and stored["status"] not in STATUSES:
+        if item["kind"] == "result" and item.get("status") not in STATUSES:
             self._json(400, {"error": f"result status must be one of {STATUSES}"})
             return
+        decoded_files = []
         for f in item.get("files", []):
             raw = base64.b64decode(f.get("data_b64", ""))
             if len(raw) > MAX_FILE_BYTES:
                 self._json(413, {"error": "file too large"})
                 return
-            fname = sanitize_filename(f.get("filename", "unnamed"))
-            fpath = FILES_DIR / f"{item_id}_{fname}"
-            fpath.write_bytes(raw)
-            stored["files"].append(
-                {"filename": fname, "size": len(raw), "stored_path": str(fpath)})
-        if not stored["broadcast"] and not stored["to_agent"]:
-            stored["to_agent"] = _pick_live()   # anycast: deliver to one live session ('' -> _route assigns later)
-        (INBOX_DIR / f"{item_id}.json").write_text(json.dumps(stored, indent=2))
+            decoded_files.append((sanitize_filename(f.get("filename", "unnamed")), raw))
+
+        requested_mailbox = str(item.get("to_mailbox", ""))
+        if requested_mailbox and not valid_mailbox_name(requested_mailbox):
+            self._json(400, {"error": "invalid mailbox name"})
+            return
+        if requested_mailbox and not item.get("broadcast") and requested_mailbox not in mailboxes:
+            self._json(400, {"error": f"unknown mailbox '{requested_mailbox}'"})
+            return
+
+        delivery_id = str(item.get("delivery_id", ""))[:64]
+        stored_items = []
+        with state_lock():
+            if delivery_id:
+                for path in INBOX_DIR.glob("*.json"):
+                    try:
+                        existing = json.loads(path.read_text())
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if existing.get("from") == sender and existing.get("delivery_id") == delivery_id:
+                        self._json(200, {"ok": True, "id": existing["id"],
+                                         "thread": existing["thread"], "duplicate": True})
+                        return
+
+            destinations = mailboxes if item.get("broadcast") else [
+                str(item.get("to_mailbox") or default_mailbox)[:64]
+            ]
+            thread = str(item.get("thread", ""))[:64]
+            for destination in destinations:
+                item_id = new_id()
+                thread = thread or item_id
+                sessions = read_sessions()
+                preferred_session = str(item.get("to_session", ""))[:64]
+                selected = (sessions.get(preferred_session)
+                            if preferred_session and session_alive(preferred_session, sessions)
+                            else None)
+                target_agent = str(item.get("to_agent", ""))[:64]
+                target_listener = _pick_live(sessions, agent=target_agent) if target_agent else None
+                if target_listener and item.get("to_mailbox"):
+                    consumer = current_consumer(destination, sessions)
+                    if not consumer or consumer.get("session_id") != target_listener.get("session_id"):
+                        target_listener = None
+                selected = selected or target_listener
+                if not selected and (not item.get("targeted") or item.get("to_mailbox")):
+                    selected = current_consumer(destination, sessions) or _pick_live(
+                        sessions, mailbox=destination)
+                stored = {
+                    "id": item_id,
+                    "delivery_id": delivery_id,
+                    "thread": thread,
+                    "reply_to": str(item.get("reply_to", ""))[:64],
+                    "from": sender,
+                    "from_agent": str(item.get("from_agent", ""))[:64],
+                    "from_mailbox": str(item.get("from_mailbox") or "main")[:64],
+                    "from_session": str(item.get("from_session", ""))[:64],
+                    "to_agent": str(target_agent or (
+                        selected.get("agent", "") if selected else ""))[:64],
+                    "to_mailbox": destination,
+                    "preferred_session": preferred_session,
+                    "assigned_session": selected.get("session_id", "") if selected else "",
+                    "broadcast": bool(item.get("broadcast")),
+                    "targeted": bool(item.get("targeted")),
+                    "mailbox_targeted": bool(item.get("to_mailbox")),
+                    "fallback": item["fallback"] if item.get("fallback") in FALLBACKS else "hold",
+                    "kind": item["kind"],
+                    "status": item.get("status", ""),
+                    "text": str(item.get("text", ""))[:200_000],
+                    "meta": item.get("meta") if isinstance(item.get("meta"), dict) else {},
+                    "files": [],
+                    "received": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "received_ts": time.time(),
+                    "state": "pending",
+                    "claimed_by": "",
+                    "claimed_mailbox": "",
+                    "claimed_at": 0,
+                    "presented_generation": 0,
+                }
+                for fname, raw in decoded_files:
+                    fpath = FILES_DIR / f"{item_id}_{fname}"
+                    fpath.write_bytes(raw)
+                    stored["files"].append(
+                        {"filename": fname, "size": len(raw), "stored_path": str(fpath)})
+                atomic_write_json(INBOX_DIR / f"{item_id}.json", stored)
+                stored_items.append(stored)
+
+        for stored in stored_items:
+            _update_outstanding_request(stored)
         touch_activity("recv")
-        self._json(200, {"ok": True, "id": item_id, "thread": stored["thread"]})
+        first = stored_items[0]
+        self._json(200, {"ok": True, "id": first["id"], "thread": first["thread"],
+                         "ids": [stored["id"] for stored in stored_items]})
         if self.notify_command:
-            summary = f"{stored['from']}: {stored['kind']} - {stored['text'][:120]}"
+            summary = f"{first['from']}: {first['kind']} - {first['text'][:120]}"
             try:
                 subprocess.Popen(self.notify_command + [summary],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -294,6 +603,8 @@ def cmd_daemon(cfg, args):
     port = listen.get("port", 8765)
     Handler.notify_command = cfg.get("notify_command")
     Handler.me = cfg["me"]
+    Handler.default_mailbox = configured_default_mailbox(cfg)
+    Handler.mailboxes = registered_mailboxes(cfg)
     Handler.peer_by_token = {p["issued_token"]: name
                              for name, p in cfg.get("peers", {}).items() if p.get("issued_token")}
     scope = "tailnet-only" if listen.get("host", "auto") == "auto" else "custom bind"
@@ -329,6 +640,8 @@ def _maintenance_loop(me, listen, started):
             # pick up newly issued/removed peer tokens without needing a restart
             Handler.peer_by_token = {p["issued_token"]: name
                                      for name, p in cfg.get("peers", {}).items() if p.get("issued_token")}
+            Handler.default_mailbox = configured_default_mailbox(cfg)
+            Handler.mailboxes = registered_mailboxes(cfg)
             try:
                 _route(cfg)   # keep single-copy items assigned to one live session
             except (OSError, json.JSONDecodeError):
@@ -348,87 +661,110 @@ def _maintenance_loop(me, listen, started):
         time.sleep(HEARTBEAT_INTERVAL)
 
 
-def _pick_live(sessions=None):
-    """One live session to hand a single-copy item to: the most recently
-    heartbeated, or '' if nobody is listening."""
-    if sessions is None:
-        sessions = read_sessions()
-    live = [(s.get("heartbeat", 0), n) for n, s in sessions.items() if session_alive(n, sessions)]
-    return max(live)[1] if live else ""
+def _pick_live(sessions=None, mailbox=None, agent=None, mode="general"):
+    sessions = sessions or read_sessions()
+    live = live_sessions(sessions, mailbox=mailbox, mode=mode, agent=agent)
+    return max(live, key=lambda session: session.get("heartbeat", 0)) if live else None
 
 
 def _route(cfg):
-    """Single-delivery: keep each anycast item (not broadcast, not sender-
-    targeted) assigned to exactly one live session, so only that session's
-    `wait` wakes for it. Reassign if its session dies. Sender-targeted items are
-    left to _reap's give-up logic."""
+    """Assign each open item to one eligible listener instance."""
     sessions = read_sessions()
-    for p in INBOX_DIR.glob("*.json"):
-        try:
-            item = json.loads(p.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if item.get("broadcast") or item.get("claimed_by") or item.get("targeted"):
-            continue
-        cur = item.get("to_agent", "")
-        if cur and session_alive(cur, sessions):
-            continue
-        chosen = _pick_live(sessions)
-        if chosen and chosen != cur:
-            item["to_agent"] = chosen
+    with state_lock():
+        for path in INBOX_DIR.glob("*.json"):
             try:
-                p.write_text(json.dumps(item, indent=2))
-            except OSError:
-                pass
+                item = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if item_state(item) == "handled":
+                continue
+            preferred = item.get("preferred_session", "")
+            if preferred and session_alive(preferred, sessions):
+                if item.get("assigned_session") != preferred:
+                    item["assigned_session"] = preferred
+                    atomic_write_json(path, item)
+                continue
+            if item.get("targeted") and item.get("to_agent"):
+                chosen = _pick_live(sessions, agent=item["to_agent"])
+                if chosen and item.get("mailbox_targeted"):
+                    consumer = current_consumer(item.get("to_mailbox") or "main", sessions)
+                    if not consumer or consumer.get("session_id") != chosen.get("session_id"):
+                        chosen = None
+                if chosen:
+                    next_session = chosen["session_id"]
+                    if item.get("assigned_session") != next_session:
+                        item["assigned_session"] = next_session
+                        atomic_write_json(path, item)
+                    continue
+                if item.get("targeted") and not item.get("mailbox_targeted"):
+                    if item.get("assigned_session"):
+                        item["assigned_session"] = ""
+                        atomic_write_json(path, item)
+                    continue
+            assigned = item.get("assigned_session", "")
+            if active_assignment(item, sessions):
+                continue
+            destination = item.get("to_mailbox") or configured_default_mailbox(cfg)
+            chosen = current_consumer(destination, sessions) or _pick_live(
+                sessions, mailbox=destination)
+            next_session = chosen.get("session_id", "") if chosen else ""
+            if next_session != assigned:
+                item["assigned_session"] = next_session
+                atomic_write_json(path, item)
 
 
 def _reap(cfg):
-    """Prune dead session records and release targeted items whose target
-    session never showed up (informing the original sender)."""
+    """Prune dead listeners and apply explicit target fallback policies."""
     now = time.time()
     sessions = read_sessions()
-    for name in list(sessions):
-        if not session_alive(name, sessions):
+    for session_id in list(sessions):
+        if not session_alive(session_id, sessions):
             try:
-                (SESSIONS_DIR / f"{sanitize_filename(name)}.json").unlink()
+                (SESSIONS_DIR / f"{sanitize_filename(session_id)}.json").unlink()
             except OSError:
                 pass
-            sessions.pop(name, None)
-    for p in INBOX_DIR.glob("*.json"):
-        try:
-            item = json.loads(p.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        target = item.get("to_agent", "")
-        if (not target or not item.get("targeted") or item.get("claimed_by")
-                or item.get("unpinned") or item.get("bounced")):
-            continue   # anycast items are handled by _route, not the give-up path
-        if session_alive(target, sessions):
-            continue
-        if now - item.get("received_ts", 0) < TARGET_GIVEUP:
-            continue
-        if item.get("fallback", "broadcast") == "hold":
-            continue
-        if item.get("fallback") == "bounce":
-            _notify_origin(cfg, item, target,
-                           f"Undeliverable: agent '{target}' was unreachable for your "
-                           f"{item.get('kind')} in thread {item.get('thread')}; not reassigned.",
-                           "undeliverable")
-            item["bounced"] = True
-        else:
-            chosen = _pick_live(sessions)
-            _notify_origin(cfg, item, target,
-                           f"Reassigned: agent '{target}' was unreachable, so your "
-                           f"{item.get('kind')} in thread {item.get('thread')} went to "
-                           f"another of {cfg['me']}'s sessions.",
-                           "reassigned")
-            item["unpinned"] = True
-            item["targeted"] = False    # now anycast; _route moves it on if that session dies too
-            item["to_agent"] = chosen   # one live session, or "" until _route assigns one
-        try:
-            p.write_text(json.dumps(item, indent=2))
-        except OSError:
-            pass
+            sessions.pop(session_id, None)
+    notices = []
+    with state_lock():
+        for path in INBOX_DIR.glob("*.json"):
+            try:
+                item = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            assigned = item.get("assigned_session", "")
+            if assigned and not session_alive(assigned, sessions):
+                item["assigned_session"] = ""
+            if (item_state(item) == "handled" or item.get("claimed_by")
+                    or item.get("unpinned") or item.get("bounced")):
+                atomic_write_json(path, item)
+                continue
+            targeted = item.get("targeted") or item.get("mailbox_targeted")
+            if not targeted or now - item.get("received_ts", 0) < TARGET_GIVEUP:
+                atomic_write_json(path, item)
+                continue
+            target = item.get("to_mailbox") if item.get("mailbox_targeted") else item.get("to_agent")
+            target_live = (current_consumer(target, sessions) if item.get("mailbox_targeted")
+                           else _pick_live(sessions, agent=target))
+            if target_live or item.get("fallback", "hold") == "hold":
+                atomic_write_json(path, item)
+                continue
+            target_type = "mailbox" if item.get("mailbox_targeted") else "agent"
+            if item.get("fallback") == "bounce":
+                item.update(bounced=True, state="handled", handled_at=now)
+                notices.append((item, target,
+                                f"Undeliverable: {target_type} '{target}' was unavailable for your "
+                                f"{item.get('kind')} in thread {item.get('thread')}; not reassigned.",
+                                "undeliverable"))
+            else:
+                item.update(unpinned=True, targeted=False, mailbox_targeted=False,
+                            to_agent="", to_mailbox=configured_default_mailbox(cfg), assigned_session="")
+                notices.append((item, target,
+                                f"Reassigned: {target_type} '{target}' was unavailable, so your "
+                                f"{item.get('kind')} in thread {item.get('thread')} went to "
+                                f"the default mailbox for {cfg['me']}.", "reassigned"))
+            atomic_write_json(path, item)
+    for item, target, text_value, intent in notices:
+        _notify_origin(cfg, item, target, text_value, intent)
 
 
 def _notify_origin(cfg, item, target, text, intent):
@@ -438,6 +774,9 @@ def _notify_origin(cfg, item, target, text, intent):
     payload = {"kind": "message", "text": text,
                "thread": item.get("thread", ""), "reply_to": item.get("id", ""),
                "to_agent": item.get("from_agent", ""),
+               "to_mailbox": item.get("from_mailbox") or "main",
+               "to_session": item.get("from_session", ""),
+               "fallback": "hold",
                "meta": {"herald_intent": intent, "target": target}}
     try:
         deliver(cfg, peer, payload)
@@ -460,11 +799,11 @@ def parse_meta(pairs):
 def _post(cfg, peer, payload):
     """Send one payload to a peer. Raises URLError if unreachable,
     HTTPError if the peer is reachable but rejects it."""
-    payload["from"] = cfg["me"]
-    payload["from_agent"] = sender_agent()
+    wire_payload = {k: v for k, v in payload.items() if not k.startswith("_")}
+    wire_payload["from"] = cfg["me"]
     req = urllib.request.Request(
         peer["url"].rstrip("/") + "/send",
-        data=json.dumps(payload).encode(),
+        data=json.dumps(wire_payload).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {peer['token']}"},
     )
@@ -475,26 +814,55 @@ def _post(cfg, peer, payload):
 
 def _record_outbox(payload, result, peer_name):
     ensure_dirs()
-    record = dict(payload)
-    record.pop("_qid", None)
-    for f in record.get("files", []):
-        f.pop("data_b64", None)
+    record = {k: v for k, v in payload.items() if not k.startswith("_")}
+    record["files"] = [{k: v for k, v in f.items() if k != "data_b64"}
+                       for f in payload.get("files", [])]
     record.update(id=result["id"], thread=result["thread"], to=peer_name,
+                  remote_ids=result.get("ids") or [result["id"]],
                   sent=time.strftime("%Y-%m-%d %H:%M:%S"))
-    (OUTBOX_DIR / f"{result['id']}.json").write_text(json.dumps(record, indent=2))
+    with state_lock():
+        if payload.get("_expects_terminal"):
+            record["state"] = "awaiting_terminal"
+            record["awaiting_reply_ids"] = list(record["remote_ids"])
+            for path in INBOX_DIR.glob("*.json"):
+                try:
+                    response = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if response.get("reply_to") not in record["remote_ids"]:
+                    continue
+                if not ((response.get("kind") == "result"
+                         and response.get("status") in ("accepted", "working"))
+                        or response.get("meta", {}).get("herald_intent") == "ack"):
+                    record["awaiting_reply_ids"] = [item_id
+                                                     for item_id in record["awaiting_reply_ids"]
+                                                     if item_id != response.get("reply_to")]
+            if not record["awaiting_reply_ids"]:
+                record["state"] = "handled"
+                record["handled_at"] = time.time()
+        atomic_write_json(OUTBOX_DIR / f"{result['id']}.json", record)
 
 
 def enqueue(peer_name, payload):
     d = QUEUE_DIR / sanitize_filename(peer_name)
     d.mkdir(parents=True, exist_ok=True)
     payload.setdefault("_qid", new_id())
-    (d / f"{payload['_qid']}.json").write_text(json.dumps(payload))
+    atomic_write_json(d / f"{payload['_qid']}.json", payload)
     return len(list(d.glob("*.json")))
+
+
+def record_failed_delivery(peer_name, payload, error):
+    failed = dict(payload)
+    failed["_peer"] = peer_name
+    failed["_delivery_error"] = error
+    failed["_failed_at"] = time.time()
+    item_id = payload.get("delivery_id") or payload.get("_qid") or new_id()
+    atomic_write_json(FAILED_DIR / f"{sanitize_filename(item_id)}.json", failed)
 
 
 def flush_queue(cfg, peer_name, verbose=False):
     """Retry queued items for a peer, oldest first. Stops at the first
-    unreachable error (peer still down); drops items the peer rejects."""
+    unreachable error (peer still down); records items the peer rejects."""
     peer = cfg.get("peers", {}).get(peer_name)
     d = QUEUE_DIR / sanitize_filename(peer_name)
     if not peer or not d.exists():
@@ -505,13 +873,17 @@ def flush_queue(cfg, peer_name, verbose=False):
         try:
             result = _post(cfg, peer, payload)
         except urllib.error.HTTPError as e:
+            error = f"rejected ({e.code} {e.reason})"
+            _apply_source_delivery(payload, "failed", error)
+            record_failed_delivery(peer_name, payload, error)
             f.unlink()
             if verbose:
-                print(f"  dropped queued item for {peer_name}: rejected ({e.code})")
+                print(f"  failed queued item for {peer_name}: rejected ({e.code})")
             continue
         except urllib.error.URLError:
             break
         _record_outbox(payload, result, peer_name)
+        _apply_source_delivery(payload, "delivered")
         f.unlink()
         sent += 1
     if sent and verbose:
@@ -523,10 +895,16 @@ def deliver(cfg, peer_name, payload, queue_on_fail=True):
     peer = cfg.get("peers", {}).get(peer_name)
     if not peer:
         sys.exit(f"Unknown peer '{peer_name}'. Known: {', '.join(cfg.get('peers', {}))}")
+    payload.setdefault("delivery_id", new_delivery_id())
+    payload.setdefault("from_agent", sender_agent())
+    payload.setdefault("from_mailbox", mailbox_name(cfg))
     flush_queue(cfg, peer_name)
     try:
         result = _post(cfg, peer, payload)
     except urllib.error.HTTPError as e:
+        error = f"rejected ({e.code} {e.reason})"
+        _apply_source_delivery(payload, "failed", error)
+        record_failed_delivery(peer_name, payload, error)
         sys.exit(f"Send to {peer_name} rejected ({e.code} {e.reason}) - "
                  f"check the peer token/URL; not queued.")
     except urllib.error.URLError as e:
@@ -536,9 +914,13 @@ def deliver(cfg, peer_name, payload, queue_on_fail=True):
         reason = getattr(e, "reason", e)
         print(f"Peer '{peer_name}' is unreachable ({reason}) - queued for retry "
               f"({depth} pending). Delivers on next contact, or run: herald flush {peer_name}")
-        return None
+        _apply_source_delivery(payload, "queued")
+        return {"delivery_state": "queued", "delivery_id": payload["delivery_id"]}
 
     _record_outbox(payload, result, peer_name)
+    _apply_source_delivery(payload, "delivered")
+    result["delivery_state"] = "delivered"
+    result["delivery_id"] = payload["delivery_id"]
     return result
 
 
@@ -569,17 +951,22 @@ def cmd_send(cfg, args):
     }
     if args.task:
         payload["status"] = "pending"
+        payload["_expects_terminal"] = True
     if args.thread:
         payload["thread"] = args.thread
     if args.all:
         payload["broadcast"] = True
-    elif args.agent:
-        payload["to_agent"] = args.agent
-        payload["targeted"] = True
-        payload["fallback"] = args.fallback
+    else:
+        if args.mailbox:
+            payload["to_mailbox"] = args.mailbox
+            payload["fallback"] = args.fallback
+        if args.agent:
+            payload["to_agent"] = args.agent
+            payload["targeted"] = True
+            payload["fallback"] = args.fallback
     attach_files(payload, args.file)
     result = deliver(cfg, args.peer, payload)
-    if result is None:
+    if result["delivery_state"] == "queued":
         return
     print(f"Delivered to {args.peer}: {payload['kind']} id {result['id']}, thread {result['thread']}")
 
@@ -593,24 +980,31 @@ def find_inbox_item(item_id):
 
 def cmd_reply(cfg, args):
     orig = find_inbox_item(args.id)
+    meta = parse_meta(args.meta)
     payload = {
         "kind": "message",
         "text": args.message or "",
         "thread": orig["thread"],
         "reply_to": orig["id"],
-        "meta": parse_meta(args.meta),
+        "meta": meta,
+        "_source_item_id": orig["id"],
+        "_source_effect": "ack" if meta.get("herald_intent") == "ack" else "final",
     }
     if args.all:
         payload["broadcast"] = True
     else:
         target = args.agent or orig.get("from_agent") or ""
+        target_mailbox = args.mailbox or orig.get("from_mailbox") or "main"
+        payload["to_mailbox"] = target_mailbox
+        payload["fallback"] = args.fallback
         if target:
             payload["to_agent"] = target
             payload["targeted"] = True
-            payload["fallback"] = args.fallback
+        if orig.get("from_session") and not args.agent and not args.mailbox:
+            payload["to_session"] = orig["from_session"]
     attach_files(payload, args.file)
     result = deliver(cfg, orig["from"], payload)
-    if result is None:
+    if result["delivery_state"] == "queued":
         return
     print(f"Replied to {orig['from']} in thread {orig['thread']} (id {result['id']})")
 
@@ -626,18 +1020,24 @@ def cmd_result(cfg, args):
         "thread": orig["thread"],
         "reply_to": orig["id"],
         "meta": parse_meta(args.meta),
+        "_source_item_id": orig["id"],
+        "_source_effect": "ack" if args.status in ("accepted", "working") else "final",
     }
     if args.all:
         payload["broadcast"] = True
     else:
         target = args.agent or orig.get("from_agent") or ""
+        target_mailbox = args.mailbox or orig.get("from_mailbox") or "main"
+        payload["to_mailbox"] = target_mailbox
+        payload["fallback"] = args.fallback
         if target:
             payload["to_agent"] = target
             payload["targeted"] = True
-            payload["fallback"] = args.fallback
+        if orig.get("from_session") and not args.agent and not args.mailbox:
+            payload["to_session"] = orig["from_session"]
     attach_files(payload, args.file)
     result = deliver(cfg, orig["from"], payload)
-    if result is None:
+    if result["delivery_state"] == "queued":
         return
     print(f"Sent {args.status} result to {orig['from']} in thread {orig['thread']} (id {result['id']})")
 
@@ -683,23 +1083,131 @@ def cmd_flush(cfg, args):
 def summarise(i, direction):
     who = f"from {i['from']}" if direction == "in" else f"to {i['to']}"
     status = f" [{i['status']}]" if i.get("status") else ""
-    target = f" ->{i['to_agent']}" if i.get("to_agent") else ""
+    state = f" [{item_state(i)}]" if direction == "in" else f" [{i.get('state')}]" if i.get("state") else ""
+    target = (f" ->{i['to_agent']} mailbox {i.get('to_mailbox', 'main')}"
+              if i.get("to_agent") else f" ->{i.get('to_mailbox', 'main')}")
     files = f" ({len(i['files'])} file{'s' if len(i['files']) != 1 else ''})" if i.get("files") else ""
     claimed = f" (claimed: {i['claimed_by']})" if i.get("claimed_by") else ""
     preview = i["text"][:80].replace("\n", " ")
-    return f"{i['id']}  {i['kind']:<7}{status}{target} {who}{files}{claimed}  {preview}"
+    return f"{i['id']}  {i['kind']:<7}{status}{state}{target} {who}{files}{claimed}  {preview}"
+
+
+def _item_matches_mailbox(item, mailbox, agent):
+    if (item.get("to_mailbox") or "main") != mailbox:
+        return False
+    if (item.get("targeted") and not item.get("mailbox_targeted")
+            and item.get("to_agent") and item.get("to_agent") != agent
+            and not item.get("unpinned")):
+        return False
+    return True
+
+
+def _is_progress_item(item):
+    return ((item.get("kind") == "result" and item.get("status") in ("accepted", "working"))
+            or item.get("meta", {}).get("herald_intent") == "ack")
+
+
+def _claim_item(item_id, agent, mailbox, listener=None, force=False):
+    path = INBOX_DIR / f"{item_id}.json"
+    with state_lock():
+        if not path.exists():
+            sys.exit(f"No inbox item {item_id}")
+        item = json.loads(path.read_text())
+        if not force and not _item_matches_mailbox(item, mailbox, agent):
+            target = item.get("to_agent") or item.get("to_mailbox") or "main"
+            sys.exit(f"Item {item_id} is addressed to '{target}', not this agent mailbox.")
+        assignment = active_assignment(item)
+        if (not force and assignment and assignment.get("agent") != agent):
+            sys.exit(f"Item {item_id} is assigned to live agent '{assignment.get('agent')}'.")
+        owner_mailbox = item.get("claimed_mailbox", "")
+        if owner_mailbox and owner_mailbox != mailbox and not force:
+            sys.exit(f"Item {item_id} is active in mailbox '{owner_mailbox}'.")
+        if (not force and item.get("claimed_by") not in ("", agent)
+                and item_state(item) != "pending"):
+            sys.exit(f"Item {item_id} is active under agent '{item.get('claimed_by')}'. "
+                     "Use `herald resume` to take over the mailbox.")
+        if not force:
+            item["claimed_by"] = agent
+            item["claimed_mailbox"] = mailbox
+            item["claimed_at"] = item.get("claimed_at") or time.time()
+            if item_state(item) == "pending":
+                item["state"] = "handled" if _is_progress_item(item) else "active"
+                if item["state"] == "handled":
+                    item["handled_at"] = time.time()
+            if listener:
+                item["assigned_session"] = listener["session_id"]
+                item["presented_generation"] = listener.get("generation", 0)
+            atomic_write_json(path, item)
+        return item
+
+
+def _claim_next(listener):
+    sessions = read_sessions()
+    with state_lock():
+        candidates = []
+        for path in INBOX_DIR.glob("*.json"):
+            try:
+                item = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            state = item_state(item)
+            if state == "handled":
+                continue
+            if not _item_matches_mailbox(item, listener["mailbox"], listener["agent"]):
+                continue
+            if listener["mode"] == "ask":
+                if not listener.get("request_id") or item.get("reply_to") != listener["request_id"]:
+                    continue
+            elif state != "pending" and item.get("presented_generation", 0) >= listener["generation"]:
+                continue
+            preferred = item.get("preferred_session", "")
+            if preferred and preferred != listener["session_id"] and session_alive(preferred, sessions):
+                continue
+            assigned = item.get("assigned_session", "")
+            assignment = active_assignment(item, sessions)
+            if assignment and assigned != listener["session_id"]:
+                continue
+            candidates.append((item.get("received_ts", 0), item["id"], path, item))
+        if not candidates:
+            return None
+        _, _, path, item = min(candidates)
+        item["claimed_by"] = listener["agent"]
+        item["claimed_mailbox"] = listener["mailbox"]
+        item["claimed_at"] = item.get("claimed_at") or time.time()
+        item["assigned_session"] = listener["session_id"]
+        item["presented_generation"] = listener.get("generation", 0)
+        item["state"] = "handled" if listener["mode"] == "ask" or _is_progress_item(item) else (
+            "active" if item_state(item) == "pending" else item_state(item))
+        if item["state"] == "handled":
+            item["handled_at"] = time.time()
+        atomic_write_json(path, item)
+        return item
+
+
+def _show_item(item, out_dir=None):
+    shown = {k: v for k, v in item.items() if k != "files"}
+    shown["files"] = [f["filename"] for f in item.get("files", [])]
+    print(json.dumps(shown, indent=2))
+    for attached in item.get("files", []):
+        out = Path(out_dir or ".") / attached["filename"]
+        out.write_bytes(Path(attached["stored_path"]).read_bytes())
+        print(f"File written to {out.resolve()}")
 
 
 def cmd_inbox(cfg, args):
     ensure_dirs()
     items = [json.loads(p.read_text()) for p in sorted(INBOX_DIR.glob("*.json"))]
-    if args.unclaimed:
-        items = [i for i in items if not i.get("claimed_by")]
+    if args.history:
+        items = [i for i in items if item_state(i) == "handled"]
+    elif args.unclaimed:
+        items = [i for i in items if item_state(i) == "pending"]
+    else:
+        items = [i for i in items if item_state(i) != "handled"]
     if args.mine:
-        me = agent_name()
-        items = [i for i in items if not i.get("to_agent") or i.get("to_agent") == me]
+        items = [i for i in items if _item_matches_mailbox(
+            i, mailbox_name(cfg), agent_name())]
     if not items:
-        print("No unclaimed items" if args.unclaimed else "Inbox empty")
+        print("No matching inbox items")
         return
     for i in items:
         flag = " " if i.get("claimed_by") else "*"
@@ -707,28 +1215,23 @@ def cmd_inbox(cfg, args):
 
 
 def cmd_read(cfg, args):
-    path = INBOX_DIR / f"{args.id}.json"
+    item = _claim_item(args.id, agent_name(), mailbox_name(cfg), force=args.force)
+    _show_item(item, args.out)
+
+
+def cmd_close(cfg, args):
+    item = _claim_item(args.id, agent_name(), mailbox_name(cfg))
+    update_inbox_item(item["id"], state="handled", handled_at=time.time())
+    print(f"Closed inbox item {item['id']}")
+
+
+def cmd_reopen(cfg, args):
     item = find_inbox_item(args.id)
-    me_agent = agent_name()
-    target = item.get("to_agent", "")
-    if target and target != me_agent and not item.get("unpinned") and not args.force:
-        sys.exit(f"Item {args.id} is addressed to agent '{target}', not '{me_agent}'. "
-                 f"Leave it for that session, or use --force to handle it anyway.")
-    owner = item.get("claimed_by", "")
-    if owner and owner != me_agent and not args.force and session_alive(owner):
-        sys.exit(f"Already claimed by agent '{owner}' - it is handling this "
-                 f"item (use --force to read anyway without claiming)")
-    shown = {k: v for k, v in item.items() if k != "files"}
-    shown["files"] = [f["filename"] for f in item["files"]]
-    print(json.dumps(shown, indent=2))
-    for f in item["files"]:
-        out = Path(args.out or ".") / f["filename"]
-        out.write_bytes(Path(f["stored_path"]).read_bytes())
-        print(f"File written to {out.resolve()}")
-    if not args.force and (not owner or owner == me_agent or not session_alive(owner)):
-        item["claimed_by"] = me_agent
-        item["claimed_at"] = time.time()
-        path.write_text(json.dumps(item, indent=2))
+    if not _item_matches_mailbox(item, mailbox_name(cfg), agent_name()):
+        sys.exit(f"Item {args.id} belongs to another mailbox")
+    update_inbox_item(item["id"], state="pending", claimed_by="", claimed_mailbox="",
+                      claimed_at=0, handled_at=0, assigned_session="", presented_generation=0)
+    print(f"Reopened inbox item {item['id']}")
 
 
 def cmd_thread(cfg, args):
@@ -746,56 +1249,55 @@ def cmd_thread(cfg, args):
         print(f"{ts} {arrow} {summarise(i, direction)}")
 
 
-def _show_and_claim(item, me, out_dir=None):
-    """Print an item's full content (writing its files out) and claim it for
-    this agent. Used by `read`, and by `wait --read` / `ask` to fold the read
-    into the same turn."""
-    path = INBOX_DIR / f"{item['id']}.json"
-    shown = {k: v for k, v in item.items() if k != "files"}
-    shown["files"] = [f["filename"] for f in item["files"]]
-    print(json.dumps(shown, indent=2))
-    for f in item["files"]:
-        out = Path(out_dir or ".") / f["filename"]
-        out.write_bytes(Path(f["stored_path"]).read_bytes())
-        print(f"File written to {out.resolve()}")
-    item["claimed_by"] = me
-    item["claimed_at"] = time.time()
-    path.write_text(json.dumps(item, indent=2))
+def _open_outstanding_requests(mailbox):
+    records = []
+    for path in OUTBOX_DIR.glob("*.json"):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if record.get("state") == "awaiting_terminal" and record.get("from_mailbox", "main") == mailbox:
+            records.append(record)
+    return records
 
 
 def cmd_wait(cfg, args):
-    ensure_dirs()
-    me = agent_name()
-    started = time.strftime("%Y-%m-%d %H:%M:%S")
-    atexit.register(clear_session)
-    signal.signal(signal.SIGTERM, lambda *a: (clear_session(), sys.exit(0)))
-    known = {p.name for p in INBOX_DIR.glob("*.json")}
+    listener = register_listener(cfg, mode="general", takeover=getattr(args, "resume", False))
+    atexit.register(clear_session, listener["session_id"])
+    signal.signal(signal.SIGTERM,
+                  lambda *a: (clear_session(listener["session_id"]), sys.exit(0)))
+    if getattr(args, "resume", False):
+        outstanding = _open_outstanding_requests(listener["mailbox"])
+        if outstanding:
+            print(f"{len(outstanding)} outgoing request(s) still await a final reply", flush=True)
     deadline = time.time() + args.timeout if args.timeout else None
     while True:
-        write_session(started)
-        mine = []
-        for name in sorted({p.name for p in INBOX_DIR.glob("*.json")} - known):
-            item = json.loads((INBOX_DIR / name).read_text())
-            if item.get("broadcast"):
-                mine.append(item)          # --all: every session wakes
-            elif item.get("to_agent", "") == me:
-                mine.append(item)          # single-delivery: this copy is for me
-            # else: assigned to another session, or not yet assigned - skip silently, no agent woken
-        if mine:
-            for item in mine:
-                if args.read:
-                    _show_and_claim(item, me, args.out)   # fold the read into this turn
-                else:
-                    status = f" [{item['status']}]" if item.get("status") else ""
-                    print(f"NEW {item['kind']}{status} from {item['from']}: "
-                          f"id {item['id']}, thread {item['thread']}")
-            clear_session()
+        if not consumer_is_current(listener):
+            clear_session(listener["session_id"])
+            print(f"Mailbox '{listener['mailbox']}' moved to another agent listener")
+            return
+        write_session(listener)
+        item = _claim_next(listener)
+        if item:
+            if args.read or getattr(args, "resume", False):
+                _show_item(item, args.out)
+            else:
+                status = f" [{item['status']}]" if item.get("status") else ""
+                print(f"NEW {item['kind']}{status} from {item['from']}: "
+                      f"id {item['id']}, thread {item['thread']}")
+            clear_session(listener["session_id"])
             return
         if deadline and time.time() > deadline:
             print("Timed out with no new items")
-            clear_session()
+            clear_session(listener["session_id"])
             sys.exit(2)
         time.sleep(1)
+
+
+def cmd_resume(cfg, args):
+    args.resume = True
+    args.read = True
+    cmd_wait(cfg, args)
 
 
 def cmd_ask(cfg, args):
@@ -806,52 +1308,50 @@ def cmd_ask(cfg, args):
         sys.exit("Use --task or --message, not both")
     if not (args.task or args.message):
         sys.exit("Nothing to ask: use --task or --message")
-    ensure_dirs()
-    me = agent_name()
+    listener = register_listener(cfg, mode="ask")
+    atexit.register(clear_session, listener["session_id"])
+    signal.signal(signal.SIGTERM,
+                  lambda *a: (clear_session(listener["session_id"]), sys.exit(0)))
     payload = {
         "kind": "task" if args.task else "message",
         "text": args.task or args.message,
         "meta": parse_meta(args.meta),
+        "from_session": listener["session_id"],
+        "_expects_terminal": True,
     }
     if args.task:
         payload["status"] = "pending"
+    if args.mailbox:
+        payload["to_mailbox"] = args.mailbox
+        payload["fallback"] = args.fallback
     if args.agent:
         payload["to_agent"] = args.agent
+        payload["targeted"] = True
         payload["fallback"] = args.fallback
     attach_files(payload, args.file)
-    known = {p.name for p in INBOX_DIR.glob("*.json")}
     result = deliver(cfg, args.peer, payload)
-    if result is None:
-        print("Peer is offline - queued; can't wait synchronously. Use `herald wait` for the reply.")
+    if result["delivery_state"] == "queued":
+        clear_session(listener["session_id"])
+        print("The request is queued. Run `herald resume` to receive the reply.")
         return
     thread = result["thread"]
+    listener["request_id"] = result["id"]
+    write_session(listener, waiting_on=f"reply:{result['id']}")
     print(f"Sent {payload['kind']} to {args.peer} (thread {thread}); waiting for reply...")
-    started = time.strftime("%Y-%m-%d %H:%M:%S")
-    atexit.register(clear_session)
-    signal.signal(signal.SIGTERM, lambda *a: (clear_session(), sys.exit(0)))
     deadline = time.time() + (args.timeout or 300)
     while time.time() < deadline:
-        write_session(started)
-        new_names = {p.name for p in INBOX_DIR.glob("*.json")} - known
-        known.update(new_names)
-        items = [json.loads((INBOX_DIR / name).read_text()) for name in new_names]
-        for item in sorted(items, key=lambda value: (value.get("received_ts", 0), value["id"])):
-            if item.get("thread") != thread:
+        write_session(listener, waiting_on=f"reply:{result['id']}")
+        item = _claim_next(listener)
+        if item:
+            if _is_progress_item(item):
+                label = item.get("status") or "ack"
+                print(f"[{label}] {item['from']}: {item['text'][:200]}")
                 continue
-            target = item.get("to_agent", "")
-            if target and target != me:
-                continue
-            if item["kind"] == "result" and item.get("status") in ("accepted", "working"):
-                print(f"[{item['status']}] {item['from']}: {item['text'][:200]}")
-                continue   # progress; keep waiting for the terminal reply
-            if item.get("meta", {}).get("herald_intent") == "ack":
-                print(f"[ack] {item['from']}: {item['text'][:200]}")
-                continue   # progress; keep waiting for the terminal reply
-            _show_and_claim(item, me, args.out)
-            clear_session()
+            _show_item(item, args.out)
+            clear_session(listener["session_id"])
             return
         time.sleep(1)
-    clear_session()
+    clear_session(listener["session_id"])
     print(f"No reply from {args.peer} within {args.timeout or 300}s (still open in thread {thread}).")
     sys.exit(2)
 
@@ -881,13 +1381,16 @@ def cmd_sessions(cfg, args):
     ensure_dirs()
     sessions = read_sessions()
     now = time.time()
-    live = sorted((n, s) for n, s in sessions.items() if session_alive(n, sessions))
+    live = sorted((session_id, session) for session_id, session in sessions.items()
+                  if session_alive(session_id, sessions))
     if not live:
         print("No live agent sessions")
         return
-    for name, s in live:
+    for session_id, s in live:
         age = now - s.get("heartbeat", 0)
-        print(f"{name}  host {s.get('host', '?')} pid {s.get('pid', '?')}  "
+        print(f"{s.get('agent', '?')}  mailbox {s.get('mailbox', 'main')}  "
+              f"mode {s.get('mode', 'general')}  listener {session_id}  "
+              f"host {s.get('host', '?')} pid {s.get('pid', '?')}  "
               f"heartbeat {age:.0f}s ago  waiting on {s.get('waiting_on', '?')}")
 
 
@@ -913,7 +1416,7 @@ def cmd_introduce(cfg, args):
     # issue this peer their own inbound token so we can authenticate them by it
     issued = cfg["peers"][args.peer].get("issued_token") or secrets.token_urlsafe(24)
     cfg["peers"][args.peer]["issued_token"] = issued
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    atomic_write_json(CONFIG_PATH, cfg)
     payload = {
         "kind": "message",
         "text": f"{cfg['me']} would like to connect - accept with: herald accept <item-id>",
@@ -921,7 +1424,7 @@ def cmd_introduce(cfg, args):
                  "url": url, "token": issued},
     }
     result = deliver(cfg, args.peer, payload)
-    if result is None:
+    if result["delivery_state"] == "queued":
         return   # queued while the peer is offline; deliver already reported it
     print(f"Introduction sent to {args.peer} (id {result['id']}); "
           f"once accepted they can message you back")
@@ -938,14 +1441,16 @@ def cmd_accept(cfg, args):
     peer = cfg.setdefault("peers", {}).setdefault(name, {})   # keep any token we already issued them
     peer["url"] = url
     peer["token"] = token
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
-    item["claimed_by"] = agent_name()
-    item["claimed_at"] = time.time()
-    (INBOX_DIR / f"{item['id']}.json").write_text(json.dumps(item, indent=2))
+    atomic_write_json(CONFIG_PATH, cfg)
     payload = {"kind": "message",
                "text": f"{cfg['me']} accepted your introduction - connected.",
                "thread": item["thread"], "reply_to": item["id"],
-               "meta": {"herald_intent": "accepted", "name": cfg["me"]}}
+               "meta": {"herald_intent": "accepted", "name": cfg["me"]},
+               "to_mailbox": item.get("from_mailbox") or "main",
+               "to_agent": item.get("from_agent", ""),
+               "to_session": item.get("from_session", ""),
+               "fallback": "hold",
+               "_source_item_id": item["id"], "_source_effect": "final"}
     deliver(cfg, name, payload)
     print(f"Peer '{name}' added ({url}) and confirmation sent")
 
@@ -962,7 +1467,7 @@ def cmd_peer(cfg, args):
         url = f"http://{resolve_listen_host(listen.get('host', 'auto'))}:{listen.get('port', 8765)}"
         issued = secrets.token_urlsafe(24)
         cfg.setdefault("peers", {}).setdefault(args.name, {})["issued_token"] = issued
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+        atomic_write_json(CONFIG_PATH, cfg)
         print(f"Issued an inbound token for '{args.name}'. Send them these two commands:")
         print(f"  herald peer add {cfg['me']} {url} {issued}")
         print(f"  herald introduce {cfg['me']}")
@@ -977,8 +1482,47 @@ def cmd_peer(cfg, args):
         if args.name not in cfg.get("peers", {}):
             sys.exit(f"No peer '{args.name}'")
         del cfg["peers"][args.name]
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    atomic_write_json(CONFIG_PATH, cfg)
     print(f"Peer '{args.name}' {'added' if args.action == 'add' else 'removed'}")
+
+
+def cmd_mailbox(cfg, args):
+    names = registered_mailboxes(cfg)
+    if args.action == "list":
+        for name in names:
+            marker = " (default)" if name == configured_default_mailbox(cfg) else ""
+            print(f"{name}{marker}")
+        return
+    if not args.name:
+        sys.exit("mailbox add/remove/default needs a name")
+    if not valid_mailbox_name(args.name):
+        sys.exit("Mailbox names can contain letters, numbers, '-', '_', and '.' (maximum 64)")
+    if args.action == "add":
+        if args.name not in names:
+            names.append(args.name)
+    elif args.action == "remove":
+        if args.name == configured_default_mailbox(cfg):
+            sys.exit("Cannot remove the default mailbox")
+        if live_sessions(mailbox=args.name):
+            sys.exit(f"Cannot remove mailbox '{args.name}' while it has a live listener")
+        open_items = []
+        for path in INBOX_DIR.glob("*.json"):
+            try:
+                item = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if item.get("to_mailbox") == args.name and item_state(item) != "handled":
+                open_items.append(item)
+        if open_items:
+            sys.exit(f"Cannot remove mailbox '{args.name}': {len(open_items)} open item(s) remain")
+        names = [name for name in names if name != args.name]
+    else:
+        if args.name not in names:
+            names.append(args.name)
+        cfg["default_mailbox"] = args.name
+    cfg["mailboxes"] = names
+    atomic_write_json(CONFIG_PATH, cfg)
+    print(f"Mailbox '{args.name}' updated")
 
 
 def cmd_init(cfg_unused, args):
@@ -988,9 +1532,11 @@ def cmd_init(cfg_unused, args):
     cfg = {
         "me": args.me,
         "listen": {"host": "auto", "port": args.port},
+        "default_mailbox": "main",
+        "mailboxes": ["main"],
         "peers": {},
     }
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    atomic_write_json(CONFIG_PATH, cfg)
     ensure_dirs()
     print(f"Wrote {CONFIG_PATH}")
     print("To connect a peer, issue them a token: herald peer issue <name>")
@@ -1016,11 +1562,12 @@ def main():
     sp.add_argument("--meta", action="append", help="key=value, repeatable")
     sp.add_argument("--thread", help="continue an existing thread")
     sp.add_argument("--agent", help="address a specific session of the peer (see: herald sessions)")
-    sp.add_argument("--fallback", choices=FALLBACKS, default="broadcast",
+    sp.add_argument("--mailbox", help="address a durable mailbox at the peer")
+    sp.add_argument("--fallback", choices=FALLBACKS, default="hold",
                     help="if the target session never appears: broadcast (release to any), "
                          "hold (keep pinned), bounce (return undeliverable to you)")
     sp.add_argument("--all", action="store_true",
-                    help="deliver to ALL the recipient's sessions (default: one)")
+                    help="deliver to all registered recipient mailboxes")
 
     sp = sub.add_parser("reply", help="reply to an inbox item (peer/thread inferred)")
     sp.add_argument("id")
@@ -1028,8 +1575,9 @@ def main():
     sp.add_argument("--file", "-f", action="append")
     sp.add_argument("--meta", action="append")
     sp.add_argument("--agent", help="override the target session (defaults to the sender's)")
-    sp.add_argument("--fallback", choices=FALLBACKS, default="broadcast")
-    sp.add_argument("--all", action="store_true", help="deliver to ALL the recipient's sessions")
+    sp.add_argument("--mailbox", help="override the target mailbox")
+    sp.add_argument("--fallback", choices=FALLBACKS, default="hold")
+    sp.add_argument("--all", action="store_true", help="deliver to all recipient mailboxes")
 
     sp = sub.add_parser("result", help="send a task status/result back to its sender")
     sp.add_argument("id", help="the inbox task item id")
@@ -1038,18 +1586,26 @@ def main():
     sp.add_argument("--file", "-f", action="append")
     sp.add_argument("--meta", action="append")
     sp.add_argument("--agent", help="override the target session (defaults to the sender's)")
-    sp.add_argument("--fallback", choices=FALLBACKS, default="broadcast")
-    sp.add_argument("--all", action="store_true", help="deliver to ALL the recipient's sessions")
+    sp.add_argument("--mailbox", help="override the target mailbox")
+    sp.add_argument("--fallback", choices=FALLBACKS, default="hold")
+    sp.add_argument("--all", action="store_true", help="deliver to all recipient mailboxes")
 
     sp = sub.add_parser("inbox", help="list received items")
     sp.add_argument("--unclaimed", action="store_true")
+    sp.add_argument("--history", action="store_true", help="show handled items instead of open work")
     sp.add_argument("--mine", action="store_true",
-                    help="only items addressed to this agent or broadcast")
+                    help="only items for this mailbox and exact agent targets")
 
     sp = sub.add_parser("read", help="show an item (writes files to cwd), claim it for this agent")
     sp.add_argument("id")
     sp.add_argument("--out")
     sp.add_argument("--force", action="store_true", help="read without claiming, even if claimed")
+
+    sp = sub.add_parser("close", help="mark an inbox item handled")
+    sp.add_argument("id")
+
+    sp = sub.add_parser("reopen", help="return a handled inbox item to pending")
+    sp.add_argument("id")
 
     sp = sub.add_parser("introduce", help="send a peer my address+token so they can add me")
     sp.add_argument("peer")
@@ -1063,16 +1619,24 @@ def main():
     sp.add_argument("url", nargs="?")
     sp.add_argument("token", nargs="?")
 
+    sp = sub.add_parser("mailbox", help="manage durable mailboxes")
+    sp.add_argument("action", choices=["list", "add", "remove", "default"])
+    sp.add_argument("name", nargs="?")
+
     sub.add_parser("access", help="audit who can reach whom and who is authenticated")
 
     sp = sub.add_parser("thread", help="show a whole conversation, both directions")
     sp.add_argument("id")
 
-    sp = sub.add_parser("wait", help="block until a new item arrives")
+    sp = sub.add_parser("wait", help="block until eligible open work is available")
     sp.add_argument("--timeout", type=int, default=0)
     sp.add_argument("--read", action="store_true",
                     help="show and claim each new item on wake (folds in the read)")
     sp.add_argument("--out", help="directory for attached files (with --read)")
+
+    sp = sub.add_parser("resume", help="take over a mailbox, surface open work, and wait")
+    sp.add_argument("--timeout", type=int, default=0)
+    sp.add_argument("--out", help="directory for attached files")
 
     sp = sub.add_parser("ask", help="send and block for the reply in one turn (reachable peers only)")
     sp.add_argument("peer")
@@ -1081,7 +1645,8 @@ def main():
     sp.add_argument("--file", "-f", action="append")
     sp.add_argument("--meta", action="append", help="key=value, repeatable")
     sp.add_argument("--agent", help="address a specific session of the peer")
-    sp.add_argument("--fallback", choices=FALLBACKS, default="broadcast")
+    sp.add_argument("--mailbox", help="address a durable mailbox at the peer")
+    sp.add_argument("--fallback", choices=FALLBACKS, default="hold")
     sp.add_argument("--timeout", type=int, default=300, help="seconds to wait for the reply")
     sp.add_argument("--out", help="directory for attached files in the reply")
 
@@ -1096,7 +1661,8 @@ def main():
     sub.add_parser("sessions", help="list agent sessions currently listening")
 
     args = p.parse_args()
-    identity_commands = {"send", "reply", "result", "read", "wait", "ask"}
+    identity_commands = {"send", "reply", "result", "read", "close", "reopen",
+                         "wait", "resume", "ask"}
     if args.cmd in identity_commands and not os.environ.get("HERALD_AGENT"):
         sys.exit(
             f"HERALD_AGENT is required for `herald {args.cmd}`. Set one stable session name "
@@ -1109,10 +1675,18 @@ def main():
             "and use it for every related command."
         )
     cfg = None if args.cmd == "init" else load_config()
+    selected_mailbox = os.environ.get("HERALD_MAILBOX")
+    if (cfg and selected_mailbox and args.cmd != "mailbox"
+            and selected_mailbox not in registered_mailboxes(cfg)):
+        sys.exit(f"Unknown local mailbox '{selected_mailbox}'. Add it with: "
+                 f"herald mailbox add {selected_mailbox}")
     {"init": cmd_init, "daemon": cmd_daemon, "send": cmd_send, "reply": cmd_reply,
-     "result": cmd_result, "inbox": cmd_inbox, "read": cmd_read, "peer": cmd_peer,
+     "result": cmd_result, "inbox": cmd_inbox, "read": cmd_read,
+     "close": cmd_close, "reopen": cmd_reopen, "peer": cmd_peer,
+     "mailbox": cmd_mailbox,
      "introduce": cmd_introduce, "accept": cmd_accept, "ask": cmd_ask, "ping": cmd_ping,
-     "access": cmd_access, "thread": cmd_thread, "wait": cmd_wait, "flush": cmd_flush,
+     "access": cmd_access, "thread": cmd_thread, "wait": cmd_wait,
+     "resume": cmd_resume, "flush": cmd_flush,
      "status": cmd_status, "sessions": cmd_sessions}[args.cmd](cfg, args)
 
 

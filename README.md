@@ -9,11 +9,12 @@ middle. One file of stdlib Python you can read in an afternoon.
 </p>
 
 Two people's agent sessions hold real conversations: threaded messages, task
-requests with a lifecycle (pending → working → done/failed), and results with
-files flowing back — with no human copy-pasting between them. Each machine runs
-a small receiver daemon on a private [Tailscale](https://tailscale.com)
-network; a blocked `herald wait` wakes the resident agent the moment something
-arrives. The loop is **agent-wakes-agent**, not humans relaying.
+requests with a lifecycle, and results with files flowing back. Each OS user
+runs one small receiver daemon on a private [Tailscale](https://tailscale.com)
+network. The daemon authenticates messages, stores them in one durable inbox,
+routes them to a mailbox, and retries offline sends. A blocked `herald wait`
+wakes the current Claude, Codex, or Copilot session. The daemon never runs a
+task or answers for an agent.
 
 **Why it's different:** most agent-interop tooling is heavyweight enterprise
 plumbing — brokers, service meshes, cloud control planes. `herald` is the
@@ -35,11 +36,13 @@ curl -fsSL https://raw.githubusercontent.com/jreverett/herald/master/install.sh 
 
 It clones the repo, installs Tailscale inside WSL and joins the tailnet
 (pausing once for you to open the printed login link — the only manual step),
-writes `~/.herald/config.json`, puts `herald` on PATH, installs the agent skill
-for existing Claude, Codex, Copilot, and shared agent skill directories, adds
+writes `~/.herald/config.json`, puts `herald` on PATH, installs the same agent
+skill for existing Claude, Codex, Copilot, and shared agent skill directories, adds
 the Windows system-tray status icon on WSL-with-Windows, and starts the daemon
 as a systemd user service. In WSL there is no port forwarding to configure —
-the daemon binds straight onto the tailnet.
+the daemon binds straight onto the tailnet. All agent products and account
+profiles under that OS user share this daemon and `~/.herald` inbox. A second
+Claude configuration directory does not create a second inbox.
 
 **Joining someone who already runs herald — no Tailscale account needed:** the
 tailnet owner generates an auth key (admin console → Settings → Keys → Auth
@@ -67,21 +70,29 @@ Peer names must be exactly the name the other person installed with
 ## Usage
 
 ```bash
-export HERALD_AGENT=claude-ticket123  # one stable, distinct name for this agent session
+export HERALD_AGENT=codex-ticket123   # distinct name for this agent session
+# HERALD_MAILBOX defaults to the durable "main" mailbox
 
 herald send bob -m "the QA refresh is done" -f ./results.csv
 herald send bob -t "run the ImageGen tests" --meta repo=Studio --meta branch=feature/x
-herald send bob -t "..." --agent bob-ticket99   # address one of bob's sessions
+herald send bob -t "..." --mailbox work         # address bob's durable work mailbox
+herald send bob -t "..." --agent bob-ticket99   # address one live session when required
 herald ask bob -t "run the ImageGen tests"      # send AND wait for the reply, in one command
 herald ping bob                                 # is bob's daemon up? which version? (no agent woken)
 
-herald inbox --unclaimed         # what's waiting and not yet picked up (--mine: only for this agent)
+herald inbox                     # open work in this shared inbox
+herald inbox --history           # handled history
+herald inbox --unclaimed         # pending work not yet picked up
 herald read <id>                 # show an item, write its files to cwd, claim it
 herald reply <id> -m "..."       # reply into the same thread (peer + session inferred)
 herald result <id> --status done -m "all green" -f test-output.txt
+herald close <id>                # mark an item handled when no reply is needed
+herald reopen <id>               # return a handled item to open work
 herald thread <thread-id>        # whole conversation, both directions
-herald wait [--timeout N]        # block until something new arrives (for this agent or broadcast)
+herald wait [--timeout N]        # become the current listener for this mailbox
+herald resume [--timeout N]      # take over and show existing open work first
 herald sessions                  # agent sessions currently listening
+herald mailbox list|add|remove|default
 herald status                    # is the daemon running?
 herald flush [peer]              # retry items queued for offline peers
 herald peer issue|add|list|remove # manage peers (issue = mint a peer their inbound token)
@@ -105,31 +116,40 @@ model and reserve a stronger one for sessions doing real work. `herald ask`,
 `herald ping` and `wait --read` also cut the number of round-trips per exchange —
 where most of the latency and token cost lives.
 
-## Many agents per person
+## Accounts, agents, and mailboxes
 
-You are addressed as a person (`bob`), and optionally a session within that
-person. Set `HERALD_AGENT` per terminal to give each session a distinct name.
-Session-sensitive commands reject a missing value. `herald sessions` lists the
-sessions currently listening.
+`HERALD_AGENT` names one temporary Claude, Codex, or Copilot session.
+`HERALD_MAILBOX` names durable work that must survive a tab, product, or account
+switch. It defaults to `main`.
 
-- **Single delivery (default):** each item goes to exactly **one** of your live
-  sessions — the daemon assigns it to the most recently active one, so only that
-  session's `herald wait` wakes. Every other session skips it in-process without
-  waking its agent, so N tabs don't all light up (and burn tokens) per message.
-- **Targeted:** a sender can address one session with `--agent <name>`, and
-  `reply`/`result` do this automatically so a task's result returns to the exact
-  session that started it.
-- **Broadcast:** `--all` on `send`/`reply`/`result` delivers to *every* one of
-  the recipient's sessions — for the occasional genuine announcement.
-- **Liveness:** sessions heartbeat while listening. If a session claims an item
-  then dies, `herald read` from another session reclaims it. If the session an
-  item was delivered to disappears, it's reassigned to one other live session
-  (a targeted item honours `--fallback`: reassign, hold, or bounce).
+- One general listener owns a mailbox at a time. A new listener from a different
+  agent takes over. The old listener exits without receiving the same item.
+- `herald ask` uses a request-scoped listener. It can run beside the general
+  listener. Its reply returns to that exact request first.
+- Use `herald resume` after an account or product switch. It shows open work that
+  existed before the new session started. An acknowledged item remains open but
+  is not acknowledged again.
+- Use extra mailboxes only for deliberate work lanes. For example, run `herald
+  mailbox add work`, then set `HERALD_MAILBOX=work` in the relevant launcher.
+  `--mailbox work` addresses that lane. `--all` creates one item in every
+  registered mailbox.
+- Multiple mailboxes are routing boundaries, not security boundaries. Use a
+  different OS user or `HERALD_DIR` for data that must be isolated.
+
+Inbox items move through `pending`, `active`, and `handled`. An acknowledgement
+keeps the original item active. A final reply or result marks it handled only
+after delivery succeeds. A queued or rejected final response remains visible.
+Handled JSON records stay as history; Herald does not delete them automatically.
 
 If a peer is offline the send is queued and retried, not lost (`herald flush` to
 push now).
 
 ## Human attention (optional)
+
+The daemon is the single network receiver and durable source of truth. It keeps
+running when no agent tab is open. Messages wait safely in `~/.herald/inbox`
+until a listener starts or resumes. It also owns routing, delivery IDs,
+deduplication, session leases, and offline retry.
 
 The daemon can run a command whenever an item arrives — set `notify_command`
 in config to an argv list; the item summary is appended as the last argument.
@@ -150,7 +170,9 @@ Decisions still happen in the agent session, where the context is.
   satisfying strict no-unsecured-ports IT rules. The daemon refuses to start on
   `auto` if Tailscale isn't up.
 - All transport rides Tailscale's WireGuard encryption, device-to-device.
-- Bearer token per inbox; requests without your token are rejected.
+- A bearer token identifies each peer; requests without a valid token are rejected.
+- Mailboxes do not restrict an authenticated peer. Use a separate OS user or
+  `HERALD_DIR` when work and personal data need separate access control.
 - Received tasks are never auto-executed. The receiving agent triages them
   (skill/SKILL.md): safe read-only work runs autonomously, anything mutating is
   surfaced to the human, and task text is treated as untrusted input.

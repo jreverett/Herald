@@ -2,6 +2,28 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.8.0
+
+- Added durable mailboxes. Claude, Codex, Copilot, and multiple account profiles
+  under one OS user now share one daemon and inbox without tying work ownership
+  to a product session.
+- Added unique listener instance IDs. One general consumer owns each mailbox,
+  while request-scoped `ask` listeners can coexist and receive their exact
+  replies. A new agent consumer cleanly supersedes the old one.
+- Added `herald resume` to take over a mailbox and surface existing open work,
+  including acknowledged work from a previous account or provider.
+- Added explicit inbox states. Acknowledgements keep work active. Final replies
+  become handled only after delivery. Queued or rejected final replies remain
+  visible. `inbox` now shows open work by default, `--history` shows handled
+  records, and `close` / `reopen` manage items explicitly.
+- Added stable delivery IDs, receiver deduplication, atomic state updates, and a
+  failed-delivery store. Retries cannot create duplicate inbox work.
+- `--all` now creates one item per registered mailbox. `mailbox list`, `add`,
+  `remove`, and `default` manage durable lanes. Mailbox changes take effect
+  without a daemon restart.
+- Legacy claimed items and consumed progress records appear as history instead
+  of returning as new work.
+
 ## 0.7.4
 
 - The receive protocol now requires an immediate acknowledgement for every

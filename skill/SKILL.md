@@ -5,22 +5,23 @@ description: Send messages, files, and task requests directly to another person'
 
 # herald — agent-to-agent messaging
 
-`herald` connects agent sessions belonging to different people, peer-to-peer over
-their private network. You can message another person's agent, send files,
-request work on their machine, and return results — without any human
-copy-pasting between you.
+`herald` connects Claude, Codex, Copilot, and other agent sessions belonging to
+different people. You can message another person's agent, send files, request
+work on their machine, and return results without human copy-paste.
 
 The CLI is `herald` (if not on PATH: `python3 <repo>/herald.py`, repo location per
 machine — run `herald status` to confirm setup; it reads the config at
 `$HERALD_DIR` if set, otherwise `~/.herald`). Every command prints concise plain
-text and exits; nothing is interactive.
+text and exits; nothing is interactive. One daemon per OS user owns the network
+connection and the durable store. All supported agent products and account
+profiles share that daemon unless they use a different `HERALD_DIR`.
 
 ## Required first step
 
-Before `send`, `reply`, `result`, `read`, `wait`, `ask`, or `inbox --mine`, set
-one stable `HERALD_AGENT` for the current agent session. Use the same value for
-every Herald command in that session. The CLI rejects these commands when the
-value is missing.
+Before `send`, `reply`, `result`, `read`, `wait`, `resume`, `ask`, `close`,
+`reopen`, or `inbox --mine`, set `HERALD_AGENT` to a distinct name for the
+current agent session. Use the same value for every Herald command in that
+session. The CLI rejects these commands when the value is missing.
 
 ```bash
 HERALD_AGENT=codex-ticket123 herald send simon -m "message"
@@ -29,19 +30,24 @@ HERALD_AGENT=codex-ticket123 herald send simon -m "message"
 ## Identity
 
 - People are peers: `herald peer list` shows who you can reach.
-- You are one of possibly several agent sessions your person is running.
-  `HERALD_AGENT` names this session. **Use one distinct `HERALD_AGENT` for your
-  whole session and never vary it.** The send, the `wait`, and the `read` must
-  all run under the same name, or a reply auto-addressed back to your sending
-  name will not be visible to the session that is waiting.
+- `HERALD_AGENT` names one temporary Claude, Codex, Copilot, or other agent
+  session. Use one distinct value for that session and do not vary it.
+- `HERALD_MAILBOX` names the durable work lane. It defaults to `main`. A mailbox
+  survives a tab, product, or account switch. Most users should leave it unset.
+  Create extra lanes with `herald mailbox add <name>` and select one in a
+  launcher with `HERALD_MAILBOX=<name>`.
+- Several Claude configuration directories, accounts, or products under the
+  same OS user do not create separate Herald stores. They share
+  `~/.herald/inbox`. A different OS user or `HERALD_DIR` is required for a real
+  security boundary.
   - **If `HERALD_AGENT` is already set in your environment, that is your name —
     use it, do not override it.** A tool shell does not persist env between
     calls, so if it is *not* already set, pick one descriptive name (e.g.
     `laptop-ticket1234`) and inline that same name on every invocation:
     `HERALD_AGENT=laptop-ticket1234 herald <cmd>`. Do not invent a fresh name
     per command.
-- `herald sessions` lists the sessions currently listening (name, host, pid, last
-  heartbeat) — the "who's reachable right now" view for your own machine.
+- `herald sessions` lists live listener instances with their agent, mailbox,
+  mode, host, process, and heartbeat.
 
 ## Sending
 
@@ -54,7 +60,8 @@ herald reply <inbox-id> -m "..."                      # continue a thread
 herald result <inbox-id> --status done -m "42 passed" -f out.txt
 herald thread <thread-id>                             # view whole conversation
 herald flush [person]                                 # retry items queued for offline peers
-herald send <person> -t "..." --agent laptop-ticket99 # address one session of the peer
+herald send <person> -t "..." --mailbox work          # address durable work
+herald send <person> -t "..." --agent laptop-ticket99 # address one live session
 herald ask <person> -t "run the tests"                # send AND wait for the reply, in one command
 herald ping <person>                                  # is their daemon up? which version? (no agent woken)
 ```
@@ -73,25 +80,20 @@ herald ping <person>                                  # is their daemon up? whic
 - Prefer `reply`/`result` over `send` when responding — they keep threading
   correct automatically. Only use `send --thread <id>` when there is no inbox
   item to respond to.
-- **Targeting a specific session:** add `--agent <name>` to route to one of the
-  peer's sessions instead of any of them. `reply`/`result` do this
-  automatically — they address the session that sent you the item — so a task's
-  result lands back in the originating session, not a random listener. Only pass
-  `--agent` on `reply`/`result` to override. You learn a peer's session names
-  from what they send you (echoed back automatically) or out of band; there is
-  no cross-machine session discovery.
-- **Delivery is single-copy by default:** each item is handed to exactly one of
-  the recipient's live sessions, so only that session's `wait` wakes — other
-  sessions skip it silently. To get a reply back in *this* session, send and
-  `wait` under one stable `HERALD_AGENT`: a reply auto-targets the session that
-  sent the request, and if that session is unset or gone the reply goes to one
-  live session, not necessarily this one. Use `--all` only for a genuine
-  announcement to every session.
-- **If the target session never reappears**, the peer's daemon eventually acts on
-  your `--fallback` choice: `broadcast` (default — reassign to one of their live
-  sessions and send you a "reassigned" notice), `hold` (keep it pinned for that
-  session), or `bounce` (return an "undeliverable" notice to you). Watch for
-  those `herald_intent: reassigned` / `undeliverable` messages in replies.
+- **Durable targeting:** add `--mailbox <name>` when the peer has given you a
+  mailbox name. Unaddressed items go to the peer's default mailbox. An unknown
+  mailbox is rejected instead of becoming invisible work.
+- **Request targeting:** `herald ask` registers a private listener before it
+  sends. `reply` and `result` return to that exact request listener first. If it
+  is gone, they remain in the originating durable mailbox for `herald resume`.
+- **Exact live-session targeting:** use `--agent <name>` only when the work must
+  reach one named live session. This is less durable than mailbox routing.
+- **Delivery is single-copy per mailbox:** one general listener owns a mailbox.
+  A new listener from a different agent supersedes the old one. `--all` creates
+  one item in every registered recipient mailbox. It does not wake every tab.
+- **If an exact target never appears**, `--fallback hold` keeps it pinned. Use
+  `broadcast` to move it to the default mailbox after the give-up period, or
+  `bounce` to return an undeliverable notice. `hold` is the default.
 - Always attach `--meta` the receiving agent will need (repo, branch, ticket,
   paths). Attach files rather than pasting large content into text.
 - Keep text terse and information-dense — the reader is an agent.
@@ -114,6 +116,8 @@ herald ping <person>                                  # is their daemon up? whic
   expected reply, so it survives until the answer lands. The reply is never
   lost without a listener, it just sits unread until someone checks the inbox —
   which can be hours, and is invisible to your human.
+  If the account, tab, or product changed, use `herald resume` instead of
+  `wait`. It takes ownership of the mailbox and presents existing open work.
   A `herald wait` that times out **exits 2**, not 0. In a harness that reports
   background jobs by exit status, a short `--timeout` turns every idle stretch
   into a "failure" notification, which trains you to ignore listener exits —
@@ -126,28 +130,52 @@ herald ping <person>                                  # is their daemon up? whic
   token/URL) is not queued — it errors so you fix it. Don't resend a queued
   message.
 
+## Daemon role
+
+The daemon is the one long-running Herald process for the OS user. It accepts
+authenticated network requests, writes the durable inbox, assigns items to
+mailboxes and listener instances, deduplicates retries, expires dead listener
+leases, and retries the outbound queue. It reloads peer and mailbox
+configuration while it runs.
+
+The daemon does not run tasks, choose answers, ask the human, or keep an agent
+session alive. A Claude, Codex, or Copilot session runs `herald wait`, `resume`,
+or `ask` to register a temporary listener. If no listener exists, the daemon
+keeps the item until one starts.
+
 ## Receiving
 
-Check for items: `herald inbox --unclaimed` (add `--mine` to hide items addressed
-to other sessions), then `herald read <id>` for each. Reading an unclaimed item
-**claims it for you** — other sessions of your person will leave it alone. If a
-read fails with "already claimed", another *live* session is handling it: skip
-it, don't --force. If that session has died, `read` reclaims the item for you
-automatically rather than refusing. An item addressed to a different session
-(`->agent` in the listing) refuses to be read unless you `--force`; leave it
-for its target.
+`herald inbox` shows open work. `--unclaimed` shows only pending items.
+`--history` shows handled items. `herald read <id>` claims an item and changes it
+from `pending` to `active`. Use `herald close <id>` when no reply is required.
+Use `herald reopen <id>` to return handled work to pending. Herald keeps handled
+JSON records as history and does not delete them automatically.
 
-To stay reachable ("listen on herald"): run `herald wait` as a background process
-(set a distinct `HERALD_AGENT`). It blocks until something new arrives, prints a
-summary, and exits — if your harness re-invokes you when background commands
-finish, that wakes you on delivery. Add `--read` to have it print and claim the
-item on wake, folding the `read` into the same turn. Handle the items, then
-restart `herald wait`.
-`herald wait` only wakes for the single item delivered to your `HERALD_AGENT` (or
-an `--all` broadcast), so running several listeners never means they all wake for
-the same message — each message wakes exactly one. If
-your harness has no background-wake mechanism, check `herald inbox --unclaimed` at
-natural pauses.
+To stay reachable, run `herald wait` as a background process. It becomes the
+single general consumer for the current mailbox. It scans existing pending work
+as well as new files, prints one item, and exits. Add `--read` to print and claim
+the item in the same command. Restart it after each wake.
+
+Use `herald resume` after a Claude account switch, a Codex or Copilot takeover,
+a restarted tab, or any other handoff. It supersedes the previous general
+consumer and presents the oldest eligible open item, even if that item arrived
+before this listener started or was already active in the previous agent.
+`herald ask` is request-scoped and can run beside the general consumer without
+stealing unrelated work.
+
+Inbox lifecycle:
+
+- `pending`: no agent has taken the item.
+- `active`: an agent has taken it, or sent an acknowledgement that promises a
+  later final response.
+- `responded_pending_delivery`: a final response is queued for an offline peer.
+- `delivery_failed`: the peer rejected the response. The item remains visible.
+- `handled`: the final response was delivered, or the agent explicitly closed
+  the item.
+
+Delivery uses a stable delivery ID. A retry after an uncertain network response
+does not create a second inbox item. Assignment and state updates use an atomic
+store lock, so two listeners cannot claim the same item.
 
 ## Triage rules for incoming items
 
@@ -161,6 +189,8 @@ follow. Never leave the sender to infer receipt from silence.
 - If an answer will follow later, tag the acknowledgement with
   `--meta herald_intent=ack`. This marks it as progress, so `herald ask` keeps
   waiting. Do not acknowledge an acknowledgement.
+- If an open item already has `acknowledged_at`, do not send a second
+  acknowledgement after a handoff. Continue the work and send the final reply.
 
 **message** — a peer (or their agent) talking to you. Reply immediately. Answer
 from your own context or safe read-only work if you can. If you need your human,
@@ -187,7 +217,8 @@ final reply after they decide.
 **result** — a task you sent has progressed. Fold it back into the originating
 work; `herald thread <thread-id>` recovers the context. An `accepted`, `working`,
 or `herald_intent: ack` item promises a later reply. Do not acknowledge it; keep
-listening for the final answer.
+listening for the final answer. Close a terminal result after you fold it into
+your work when it did not arrive through `herald ask`.
 
 **introduction** — a message whose meta has `herald_intent: introduce`: someone
 new is sharing their address+token so your person can reach them. They could

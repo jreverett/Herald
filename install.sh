@@ -142,7 +142,7 @@ if [ -z "$SKIP_NETWORK" ]; then
   fi
 fi
 
-# 1. config + inbox
+# 1. one shared config + inbox for every agent product under this OS user
 if [ -f "$HOME/.herald/config.json" ]; then
   echo "~/.herald/config.json already exists, keeping it"
 else
@@ -158,13 +158,16 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *)
   echo "Added ~/.local/bin to PATH in ~/.bashrc (open a new shell)" ;;
 esac
 
-# 3. agent skill/instructions - install into every supported agent skills dir
+# 3. agent skill/instructions - install into every supported agent profile
 # that exists, plus any directory that already has herald or the old a2a skill.
 skill_dirs=""
-for agent_home in "$HOME/.claude" "$HOME/.agents" "$HOME/.codex" "$HOME/.copilot"; do
+for agent_home in "$HOME/.agents" "$HOME/.claude" "$HOME"/.claude-* "$HOME"/.claude_* \
+                  "$HOME/.codex" "$HOME"/.codex-* "$HOME"/.codex_* \
+                  "$HOME/.copilot" "$HOME"/.copilot-* "$HOME"/.copilot_*; do
   [ -d "$agent_home" ] && skill_dirs="$skill_dirs $agent_home/skills"
 done
 [ -n "${CLAUDE_CONFIG_DIR:-}" ] && skill_dirs="$skill_dirs ${CLAUDE_CONFIG_DIR%/}/skills"
+[ -n "${CODEX_HOME:-}" ] && skill_dirs="$skill_dirs ${CODEX_HOME%/}/skills"
 for d in "$HOME"/.*/skills; do
   if [ -e "$d/herald" ] || [ -e "$d/a2a" ]; then
     skill_dirs="$skill_dirs $d"

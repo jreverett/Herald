@@ -11,6 +11,7 @@ made repeatable.
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -78,6 +79,28 @@ class PureFunctions(unittest.TestCase):
         for token in ("X", "task", "pending", "bob", "->laptop-1", "do the thing"):
             self.assertIn(token, line)
 
+    def test_legacy_claimed_and_progress_items_are_history(self):
+        claimed = {"claimed_by": "old-agent", "kind": "message", "meta": {}}
+        progress = {"claimed_by": "", "kind": "result", "status": "working", "meta": {}}
+        pending = {"claimed_by": "", "kind": "message", "meta": {}}
+
+        self.assertEqual(herald.item_state(claimed), "handled")
+        self.assertEqual(herald.item_state(progress), "handled")
+        self.assertEqual(herald.item_state(pending), "pending")
+
+    def test_configured_default_mailbox_ignores_agent_selection(self):
+        saved = os.environ.get("HERALD_MAILBOX")
+        try:
+            os.environ["HERALD_MAILBOX"] = "personal"
+
+            self.assertEqual(herald.configured_default_mailbox(
+                {"default_mailbox": "main", "mailboxes": ["main", "personal"]}), "main")
+        finally:
+            if saved is None:
+                os.environ.pop("HERALD_MAILBOX", None)
+            else:
+                os.environ["HERALD_MAILBOX"] = saved
+
 
 class Protocol(unittest.TestCase):
     """Two loopback daemons (alice + bob) driven through the CLI."""
@@ -119,11 +142,14 @@ class Protocol(unittest.TestCase):
         with open(os.path.join(self.homes[me], "config.json"), "w") as f:
             json.dump(cfg, f)
 
-    def _env(self, name, agent=None):
+    def _env(self, name, agent=None, mailbox=None):
         env = dict(os.environ, HERALD_DIR=self.homes[name])
         env.pop("HERALD_AGENT", None)
+        env.pop("HERALD_MAILBOX", None)
         if agent:
             env["HERALD_AGENT"] = agent
+        if mailbox:
+            env["HERALD_MAILBOX"] = mailbox
         return env
 
     def start_daemon(self, name):
@@ -140,9 +166,17 @@ class Protocol(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 p.kill()
 
-    def cli(self, name, *args, agent=None, timeout=20):
-        return subprocess.run([sys.executable, HERALD_PY, *args], env=self._env(name, agent),
+    def cli(self, name, *args, agent=None, mailbox=None, timeout=20):
+        return subprocess.run([sys.executable, HERALD_PY, *args], env=self._env(name, agent, mailbox),
                               cwd=self.root, capture_output=True, text=True, timeout=timeout)
+
+    def set_mailboxes(self, name, default, *mailboxes):
+        path = os.path.join(self.homes[name], "config.json")
+        cfg = self._load(path)
+        cfg["default_mailbox"] = default
+        cfg["mailboxes"] = list(mailboxes)
+        with open(path, "w") as f:
+            json.dump(cfg, f)
 
     def _wait_port(self, port, timeout=8):
         end = time.time() + timeout
@@ -161,6 +195,12 @@ class Protocol(unittest.TestCase):
 
     def inbox(self, name):
         d = os.path.join(self.homes[name], "inbox")
+        if not os.path.isdir(d):
+            return []
+        return [self._load(os.path.join(d, f)) for f in sorted(os.listdir(d)) if f.endswith(".json")]
+
+    def outbox(self, name):
+        d = os.path.join(self.homes[name], "outbox")
         if not os.path.isdir(d):
             return []
         return [self._load(os.path.join(d, f)) for f in sorted(os.listdir(d)) if f.endswith(".json")]
@@ -233,6 +273,10 @@ class Protocol(unittest.TestCase):
         claimed = self.wait_for_inbox("bob", lambda i: i["id"] == item["id"] and i.get("claimed_by") == "bob-1")
         self.assertIsNotNone(claimed)
 
+        duplicate = self.cli("bob", "read", item["id"], agent="bob-2")
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn("herald resume", duplicate.stderr)
+
     def test_result_auto_targets_sending_session(self):
         # regression: a reply must route back to the exact session that sent the task.
         self.cli("alice", "send", "bob", "-t", "do X", agent="alice-1")
@@ -254,6 +298,29 @@ class Protocol(unittest.TestCase):
         self.assertIn("addressed to", (wrong.stderr + wrong.stdout).lower())
         right = self.cli("bob", "read", task["id"], agent="bob-target")
         self.assertEqual(right.returncode, 0, right.stderr)
+
+    def test_exact_target_does_not_wake_another_listener(self):
+        other = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "12"],
+            env=self._env("bob", "bob-other"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(1)
+            self.cli("alice", "send", "bob", "-t", "EXACT-TARGET",
+                     "--agent", "bob-target", agent="alice-1")
+            time.sleep(1)
+            self.assertIsNone(other.poll())
+
+            target = self.cli("bob", "wait", "--read", "--timeout", "5",
+                              agent="bob-target")
+        finally:
+            if other.poll() is None:
+                other.kill()
+            other_out, other_err = other.communicate()
+
+        self.assertEqual(target.returncode, 0, target.stderr)
+        self.assertIn("EXACT-TARGET", target.stdout)
+        self.assertNotIn("EXACT-TARGET", other_out, other_err)
 
     def test_claim_stolen_from_dead_session(self):
         self.cli("alice", "send", "bob", "-m", "orphaned", agent="alice-1")
@@ -314,13 +381,43 @@ class Protocol(unittest.TestCase):
         self.assertIn("[ack] bob: Received; I will ask Jamie.", out, err)
         self.assertIn("Jamie approved it.", out, err)
 
+    def test_ask_reply_goes_to_scoped_listener_not_general_consumer(self):
+        general = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "20"],
+            env=self._env("alice", "codex-general"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ask = None
+        try:
+            time.sleep(1)
+            ask = subprocess.Popen(
+                [sys.executable, HERALD_PY, "ask", "bob", "-t", "SCOPED-REQUEST",
+                 "--timeout", "15"],
+                env=self._env("alice", "copilot-ask"), cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            task = self.wait_for_inbox("bob", lambda i: i.get("text") == "SCOPED-REQUEST")
+            self.assertIsNotNone(task)
+            self.cli("bob", "result", task["id"], "--status", "done",
+                     "-m", "SCOPED-ANSWER", agent="bob-worker")
+            ask_out, ask_err = ask.communicate(timeout=18)
+        finally:
+            if ask and ask.poll() is None:
+                ask.kill()
+            if general.poll() is None:
+                general.kill()
+            general_out, general_err = general.communicate()
+
+        self.assertIn("SCOPED-ANSWER", ask_out, ask_err)
+        self.assertNotIn("SCOPED-ANSWER", general_out, general_err)
+        reply = self.wait_for_inbox("alice", lambda i: i.get("text") == "SCOPED-ANSWER")
+        self.assertEqual(reply.get("state"), "handled")
+
     def test_wait_read_folds_in_content_and_claims(self):
         p = subprocess.Popen(
             [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "15"],
             env=self._env("bob", "bob-wr"), cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            time.sleep(1)   # let wait snapshot the inbox before we send
+            time.sleep(1)   # let the listener register before the send
             self.cli("alice", "send", "bob", "-m", "HELLO-WR", agent="alice-1")
             out, err = p.communicate(timeout=18)
         finally:
@@ -330,13 +427,229 @@ class Protocol(unittest.TestCase):
         item = self.wait_for_inbox("bob", lambda i: i.get("text") == "HELLO-WR")
         self.assertEqual(item.get("claimed_by"), "bob-wr")
 
+    def test_wait_reads_pending_item_that_predates_listener(self):
+        self.cli("alice", "send", "bob", "-m", "WAITING-BEFORE-START",
+                 agent="alice-1")
 
-    def test_all_flag_broadcasts(self):
+        r = self.cli("bob", "wait", "--read", "--timeout", "5", agent="bob-later")
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("WAITING-BEFORE-START", r.stdout)
+
+    def test_provider_switch_resumes_acknowledged_work_without_second_ack(self):
+        self.cli("alice", "send", "bob", "-t", "needs human approval", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i.get("text") == "needs human approval")
+        self.cli("bob", "read", task["id"], agent="claude-work")
+        self.cli("bob", "result", task["id"], "--status", "accepted",
+                 "-m", "Received. I will ask Simon.", agent="claude-work")
+        before = len([i for i in self.inbox("alice") if i.get("reply_to") == task["id"]])
+
+        r = self.cli("bob", "resume", "--timeout", "5", agent="codex-personal")
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("needs human approval", r.stdout)
+        after = len([i for i in self.inbox("alice") if i.get("reply_to") == task["id"]])
+        self.assertEqual(after, before)
+        resumed = self.wait_for_inbox("bob", lambda i: i.get("id") == task["id"])
+        self.assertEqual(resumed.get("claimed_by"), "codex-personal")
+        self.assertTrue(resumed.get("acknowledged_at"))
+
+    def test_resume_reoffers_open_work_to_same_agent_name(self):
+        self.cli("alice", "send", "bob", "-t", "resume same identity", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i.get("text") == "resume same identity")
+        self.cli("bob", "read", task["id"], agent="stable-agent")
+        self.cli("bob", "result", task["id"], "--status", "accepted",
+                 "-m", "Received. I will ask the human.", agent="stable-agent")
+
+        resumed = self.cli("bob", "resume", "--timeout", "5", agent="stable-agent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("resume same identity", resumed.stdout)
+
+    def test_new_provider_listener_supersedes_old_consumer(self):
+        old = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "15"],
+            env=self._env("bob", "claude-work"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        new = None
+        try:
+            time.sleep(1)
+            new = subprocess.Popen(
+                [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "15"],
+                env=self._env("bob", "copilot-personal"), cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(1)
+            self.cli("alice", "send", "bob", "-m", "ONLY-NEW-CONSUMER", agent="alice-1")
+            new_out, new_err = new.communicate(timeout=18)
+            old_out, old_err = old.communicate(timeout=18)
+        finally:
+            for process in (old, new):
+                if process and process.poll() is None:
+                    process.kill()
+        self.assertIn("ONLY-NEW-CONSUMER", new_out, new_err)
+        self.assertIn("moved to another agent listener", old_out, old_err)
+        self.assertNotIn("ONLY-NEW-CONSUMER", old_out)
+
+    def test_provider_handoff_takes_item_assigned_to_suspended_listener(self):
+        old = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "20"],
+            env=self._env("bob", "claude-work"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(1)
+            os.kill(old.pid, signal.SIGSTOP)
+            self.cli("alice", "send", "bob", "-m", "ASSIGNED-BEFORE-SWITCH",
+                     agent="alice-1")
+            item = self.wait_for_inbox(
+                "bob", lambda i: i.get("text") == "ASSIGNED-BEFORE-SWITCH")
+            self.assertTrue(item.get("assigned_session"))
+
+            replacement = self.cli("bob", "resume", "--timeout", "5",
+                                   agent="codex-personal")
+        finally:
+            old.kill()
+            old.communicate()
+
+        self.assertEqual(replacement.returncode, 0, replacement.stderr)
+        self.assertIn("ASSIGNED-BEFORE-SWITCH", replacement.stdout)
+
+    def test_mailboxes_do_not_cross_deliver(self):
+        self.set_mailboxes("bob", "work", "work", "personal")
+        time.sleep(1)
+        self.cli("alice", "send", "bob", "-m", "WORK-ONLY", "--mailbox", "work",
+                 agent="alice-1")
+
+        personal = self.cli("bob", "resume", "--timeout", "2",
+                            agent="copilot-personal", mailbox="personal", timeout=5)
+        work = self.cli("bob", "resume", "--timeout", "5",
+                        agent="codex-work", mailbox="work")
+
+        self.assertEqual(personal.returncode, 2)
+        self.assertNotIn("WORK-ONLY", personal.stdout)
+        self.assertEqual(work.returncode, 0, work.stderr)
+        self.assertIn("WORK-ONLY", work.stdout)
+
+    def test_unknown_mailbox_is_rejected(self):
+        rejected = self.cli("alice", "send", "bob", "-m", "NOWHERE",
+                            "--mailbox", "missing", agent="alice-1")
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("rejected", rejected.stderr.lower())
+        self.assertFalse(any(i.get("text") == "NOWHERE" for i in self.inbox("bob")))
+
+    def test_duplicate_delivery_id_creates_one_inbox_item(self):
+        payload = {"kind": "message", "text": "ONCE", "delivery_id": "stable-delivery"}
+        req = lambda: urllib.request.Request(
+            f"http://127.0.0.1:{self.ports['bob']}/send",
+            data=json.dumps(payload).encode(),
+            headers={"Authorization": f"Bearer {self.TB}", "Content-Type": "application/json"})
+
+        first = json.loads(urllib.request.urlopen(req()).read())
+        second = json.loads(urllib.request.urlopen(req()).read())
+
+        matches = [i for i in self.inbox("bob") if i.get("delivery_id") == "stable-delivery"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(first["id"], second["id"])
+        self.assertTrue(second.get("duplicate"))
+
+    def test_broadcast_creates_one_item_per_mailbox(self):
+        self.set_mailboxes("bob", "work", "work", "personal")
+        time.sleep(1)
+
+        self.cli("alice", "send", "bob", "-m", "ALL-MAILBOXES", "--all", agent="alice-1")
+
+        matches = [i for i in self.inbox("bob") if i.get("text") == "ALL-MAILBOXES"]
+        self.assertEqual({i.get("to_mailbox") for i in matches}, {"work", "personal"})
+        self.assertEqual(len(matches), 2)
+
+    def test_broadcast_task_waits_for_each_mailbox_result(self):
+        self.set_mailboxes("bob", "work", "work", "personal")
+        self.cli("alice", "send", "bob", "-t", "ALL-WORK", "--all", agent="alice-1")
+        tasks = [i for i in self.inbox("bob") if i.get("text") == "ALL-WORK"]
+        self.assertEqual(len(tasks), 2)
+
+        self.cli("bob", "result", tasks[0]["id"], "--status", "done",
+                 "-m", "first", agent="bob-1")
+        request = next(i for i in self.outbox("alice") if i.get("text") == "ALL-WORK")
+        self.assertEqual(request.get("state"), "awaiting_terminal")
+        self.assertEqual(len(request.get("awaiting_reply_ids", [])), 1)
+
+        self.cli("bob", "result", tasks[1]["id"], "--status", "done",
+                 "-m", "second", agent="bob-2")
+        request = next(i for i in self.outbox("alice") if i.get("text") == "ALL-WORK")
+        self.assertEqual(request.get("state"), "handled")
+        self.assertEqual(request.get("awaiting_reply_ids"), [])
+
+    def test_queued_final_result_closes_source_after_delivery(self):
+        self.cli("alice", "send", "bob", "-t", "finish later", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i.get("text") == "finish later")
+        self.cli("bob", "read", task["id"], agent="bob-worker")
+        self.stop_daemon("alice")
+
+        queued = self.cli("bob", "result", task["id"], "--status", "done",
+                          "-m", "finished", agent="bob-worker")
+
+        pending = self.wait_for_inbox("bob", lambda i: i.get("id") == task["id"])
+        self.assertIn("queued", (queued.stdout + queued.stderr).lower())
+        self.assertEqual(pending.get("state"), "responded_pending_delivery")
+
+        self.start_daemon("alice")
+        self.assertTrue(self._wait_port(self.ports["alice"]))
+        self.cli("bob", "flush", "alice")
+        handled = self.wait_for_inbox("bob", lambda i: i.get("id") == task["id"])
+        self.assertEqual(handled.get("state"), "handled")
+
+    def test_queued_ack_is_recorded_before_provider_handoff(self):
+        self.cli("alice", "send", "bob", "-t", "ack while offline", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i.get("text") == "ack while offline")
+        self.stop_daemon("alice")
+
+        queued = self.cli("bob", "result", task["id"], "--status", "accepted",
+                          "-m", "Received. I will ask.", agent="claude-work")
+        source = self.wait_for_inbox("bob", lambda i: i.get("id") == task["id"])
+
+        self.assertIn("queued", (queued.stdout + queued.stderr).lower())
+        self.assertEqual(source.get("state"), "active")
+        self.assertTrue(source.get("acknowledged_at"))
+
+    def test_rejected_final_result_keeps_source_visible(self):
+        self.cli("alice", "send", "bob", "-t", "reject final", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i.get("text") == "reject final")
+        path = os.path.join(self.homes["bob"], "config.json")
+        cfg = self._load(path)
+        cfg["peers"]["alice"]["token"] = "wrong-token"
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+
+        rejected = self.cli("bob", "result", task["id"], "--status", "done",
+                            "-m", "cannot deliver", agent="bob-worker")
+
+        source = self.wait_for_inbox("bob", lambda i: i.get("id") == task["id"])
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(source.get("state"), "delivery_failed")
+        self.assertIn("rejected", source.get("delivery_error", ""))
+
+    def test_ask_agent_sets_targeted_flag(self):
+        process = subprocess.Popen(
+            [sys.executable, HERALD_PY, "ask", "bob", "-t", "TARGETED-ASK",
+             "--agent", "bob-target", "--timeout", "20"],
+            env=self._env("alice", "alice-ask"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            task = self.wait_for_inbox("bob", lambda i: i.get("text") == "TARGETED-ASK")
+            self.assertTrue(task.get("targeted"))
+            self.assertEqual(task.get("to_agent"), "bob-target")
+        finally:
+            process.kill()
+            process.communicate()
+
+
+    def test_all_flag_marks_broadcast_delivery(self):
         self.cli("alice", "send", "bob", "-m", "announce", "--all", agent="alice-1")
         item = self.wait_for_inbox("bob", lambda i: i["text"] == "announce")
         self.assertIsNotNone(item)
         self.assertTrue(item.get("broadcast"))
-        self.assertEqual(item.get("to_agent", ""), "")   # every session wakes; not pinned to one
+        self.assertEqual(item.get("to_agent", ""), "")
 
     def test_anycast_delivered_to_one_live_session(self):
         # inject a live listening session for bob (this test process's pid is alive)
