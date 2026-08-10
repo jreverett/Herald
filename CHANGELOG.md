@@ -2,6 +2,16 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.8.2
+
+- `close` and `reopen` now work on an item whose agent session is gone. An item
+  pinned to an exact agent, or claimed by one, was unreachable to every other
+  agent once that session ended - and the reaper skips claimed items, so it
+  never came back either. The only way out was to guess the dead session's name
+  and set `HERALD_AGENT` to it. `reopen` also releases the dead pin, so the
+  mailbox's general listener can pick the item up. An item whose target session
+  is still live stays private to it, as before.
+
 ## 0.8.1
 
 - Added the terminal bell (BEL), rung when the human is blocking the turn and an

@@ -483,6 +483,45 @@ class Protocol(unittest.TestCase):
         self.assertEqual(pathlib.Path(bell).read_bytes(), b"\a")
         self.assertIn("Rang the terminal bell", r.stdout)
 
+    def test_close_and_reopen_free_an_item_pinned_to_a_gone_session(self):
+        def pin(text):
+            self.cli("alice", "send", "bob", "-t", text, "--agent", "ghost-session",
+                     agent="alice-1")
+            item = self.wait_for_inbox("bob", lambda i: i.get("text") == text)
+            self.cli("bob", "read", item["id"], agent="ghost-session")   # the session then dies
+            return item
+
+        closed = pin("PINNED-CLOSE")
+        r = self.cli("bob", "close", closed["id"], agent="bob-other")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        reopened = pin("PINNED-REOPEN")
+        r = self.cli("bob", "reopen", reopened["id"], agent="bob-other")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        freed = self.wait_for_inbox("bob", lambda i: i["id"] == reopened["id"]
+                                    and i.get("state") == "pending")
+        self.assertEqual(freed.get("to_agent"), "")
+        self.assertTrue(freed.get("unpinned"))
+
+    def test_pinned_item_stays_private_to_a_live_target_session(self):
+        listener = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--timeout", "15"],
+            env=self._env("bob", "bob-live-target"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(1)
+            self.cli("alice", "send", "bob", "-t", "PINNED-LIVE",
+                     "--agent", "bob-live-target", agent="alice-1")
+            item = self.wait_for_inbox("bob", lambda i: i.get("text") == "PINNED-LIVE")
+
+            r = self.cli("bob", "close", item["id"], agent="bob-other")
+
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("bob-live-target", r.stderr)
+        finally:
+            listener.kill()
+            listener.communicate()
+
     def test_wait_reads_pending_item_that_predates_listener(self):
         self.cli("alice", "send", "bob", "-m", "WAITING-BEFORE-START",
                  agent="alice-1")

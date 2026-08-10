@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1164,13 +1164,24 @@ def _is_progress_item(item):
             or item.get("meta", {}).get("herald_intent") == "ack")
 
 
-def _claim_item(item_id, agent, mailbox, listener=None, force=False):
+def orphaned(item, mailbox, sessions=None):
+    """The item is pinned to, or claimed by, an agent with no live session. The
+    reaper skips items that were already claimed, so an explicit close or reopen
+    from the same mailbox is the only way one of these leaves the open list."""
+    if (item.get("to_mailbox") or "main") != mailbox:
+        return False
+    owners = {item.get("to_agent", ""), item.get("claimed_by", "")} - {""}
+    return bool(owners) and not any(_pick_live(sessions, agent=owner) for owner in owners)
+
+
+def _claim_item(item_id, agent, mailbox, listener=None, force=False, allow_orphan=False):
     path = INBOX_DIR / f"{item_id}.json"
     with state_lock():
         if not path.exists():
             sys.exit(f"No inbox item {item_id}")
         item = json.loads(path.read_text())
-        if not force and not _item_matches_mailbox(item, mailbox, agent):
+        orphan = allow_orphan and orphaned(item, mailbox)
+        if not force and not orphan and not _item_matches_mailbox(item, mailbox, agent):
             target = item.get("to_agent") or item.get("to_mailbox") or "main"
             sys.exit(f"Item {item_id} is addressed to '{target}', not this agent mailbox.")
         assignment = active_assignment(item)
@@ -1179,7 +1190,7 @@ def _claim_item(item_id, agent, mailbox, listener=None, force=False):
         owner_mailbox = item.get("claimed_mailbox", "")
         if owner_mailbox and owner_mailbox != mailbox and not force:
             sys.exit(f"Item {item_id} is active in mailbox '{owner_mailbox}'.")
-        if (not force and item.get("claimed_by") not in ("", agent)
+        if (not force and not orphan and item.get("claimed_by") not in ("", agent)
                 and item_state(item) != "pending"):
             sys.exit(f"Item {item_id} is active under agent '{item.get('claimed_by')}'. "
                      "Use `herald resume` to take over the mailbox.")
@@ -1277,18 +1288,25 @@ def cmd_read(cfg, args):
 
 
 def cmd_close(cfg, args):
-    item = _claim_item(args.id, agent_name(), mailbox_name(cfg))
+    item = _claim_item(args.id, agent_name(), mailbox_name(cfg), allow_orphan=True)
     update_inbox_item(item["id"], state="handled", handled_at=time.time())
     print(f"Closed inbox item {item['id']}")
 
 
 def cmd_reopen(cfg, args):
+    mailbox = mailbox_name(cfg)
     item = find_inbox_item(args.id)
-    if not _item_matches_mailbox(item, mailbox_name(cfg), agent_name()):
+    orphan = orphaned(item, mailbox)
+    if not _item_matches_mailbox(item, mailbox, agent_name()) and not orphan:
         sys.exit(f"Item {args.id} belongs to another mailbox")
+    # a pin to a session that no longer exists would make the item invisible again
+    released = ({"unpinned": True, "targeted": False, "to_agent": ""}
+                if orphan and item.get("to_agent") and item["to_agent"] != agent_name() else {})
     update_inbox_item(item["id"], state="pending", claimed_by="", claimed_mailbox="",
-                      claimed_at=0, handled_at=0, assigned_session="", presented_generation=0)
-    print(f"Reopened inbox item {item['id']}")
+                      claimed_at=0, handled_at=0, assigned_session="",
+                      presented_generation=0, **released)
+    print(f"Reopened inbox item {item['id']}"
+          + (f", released from the gone session '{item['to_agent']}'" if released else ""))
 
 
 def cmd_thread(cfg, args):

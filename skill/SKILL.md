@@ -149,7 +149,11 @@ keeps the item until one starts.
 `--history` shows handled items. `herald read <id>` claims an item and changes it
 from `pending` to `active`. Use `herald close <id>` when no reply is required.
 Use `herald reopen <id>` to return handled work to pending. Herald keeps handled
-JSON records as history and does not delete them automatically.
+JSON records as history and does not delete them automatically. `close` and
+`reopen` also work on an item left behind by a session that has ended, so open
+work is never stranded under a name nobody uses any more; `reopen` releases it
+back to the mailbox. An item whose target session is still live stays private
+to it.
 
 To stay reachable, run `herald wait` as a background process. It becomes the
 single general consumer for the current mailbox. It scans existing pending work
