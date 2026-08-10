@@ -151,6 +151,21 @@ running when no agent tab is open. Messages wait safely in `~/.herald/inbox`
 until a listener starts or resumes. It also owns routing, delivery IDs,
 deduplication, session leases, and offline retry.
 
+Herald writes a BEL character to your terminal when you are blocking the turn —
+an agent cannot proceed or reply until you answer — so the tab beeps or flashes
+while you are looking elsewhere. What the terminal does with BEL is the
+terminal's choice. Nothing else rings: work arriving, work an agent handles by
+itself, and progress updates are all silent.
+
+`herald result --status accepted` rings, because the protocol defines that
+status as "waiting for my human to decide". An agent rings it directly with
+`herald bell` for anything else it must stop and ask about.
+
+Nothing to set up; agent harnesses run commands without a controlling terminal,
+so Herald finds the terminal that owns the session. Turn it off with
+`HERALD_BELL=0` or `"bell": false` in config, or point it at a specific device
+with `HERALD_BELL_TTY=/dev/pts/3`.
+
 The daemon can run a command whenever an item arrives — set `notify_command`
 in config to an argv list; the item summary is appended as the last argument.
 `notify-windows.sh` raises a Windows toast from WSL:

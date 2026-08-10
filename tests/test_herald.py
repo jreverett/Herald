@@ -11,6 +11,7 @@ made repeatable.
 
 import json
 import os
+import pathlib
 import signal
 import socket
 import subprocess
@@ -50,6 +51,37 @@ class PureFunctions(unittest.TestCase):
         self.assertEqual(herald.parse_meta(None), {})
         with self.assertRaises(SystemExit):
             herald.parse_meta(["no-equals"])
+
+    def test_bell_enabled_defaults_on_and_env_beats_config(self):
+        saved = os.environ.pop("HERALD_BELL", None)
+        try:
+            self.assertTrue(herald.bell_enabled())
+            self.assertTrue(herald.bell_enabled({}))
+            self.assertFalse(herald.bell_enabled({"bell": False}))
+            os.environ["HERALD_BELL"] = "0"
+            self.assertFalse(herald.bell_enabled())
+            os.environ["HERALD_BELL"] = "1"
+            self.assertTrue(herald.bell_enabled({"bell": False}))
+        finally:
+            os.environ.pop("HERALD_BELL", None)
+            if saved is not None:
+                os.environ["HERALD_BELL"] = saved
+
+    def test_ring_bell_writes_bel_to_the_named_device(self):
+        target = os.path.join(tempfile.mkdtemp(prefix="herald-bell-"), "tty")
+        saved = os.environ.pop("HERALD_BELL", None)
+        os.environ["HERALD_BELL_TTY"] = target
+        try:
+            herald.ring_bell()
+            self.assertEqual(pathlib.Path(target).read_bytes(), b"\a")
+
+            os.remove(target)
+            herald.ring_bell({"bell": False})
+            self.assertFalse(os.path.exists(target))
+        finally:
+            os.environ.pop("HERALD_BELL_TTY", None)
+            if saved is not None:
+                os.environ["HERALD_BELL"] = saved
 
     def test_new_id_format_and_uniqueness(self):
         import re
@@ -426,6 +458,30 @@ class Protocol(unittest.TestCase):
         self.assertIn("HELLO-WR", out, err)
         item = self.wait_for_inbox("bob", lambda i: i.get("text") == "HELLO-WR")
         self.assertEqual(item.get("claimed_by"), "bob-wr")
+
+    def test_bell_rings_only_when_the_human_blocks_the_turn(self):
+        bell = os.path.join(self.root, "bell-tty")
+
+        def run(*args, agent="bob-bell"):
+            return subprocess.run([sys.executable, HERALD_PY, *args],
+                                  env=dict(self._env("bob", agent), HERALD_BELL_TTY=bell),
+                                  cwd=self.root, capture_output=True, text=True, timeout=20)
+
+        self.cli("alice", "send", "bob", "-t", "run the tests", agent="alice-1")
+        run("wait", "--read", "--timeout", "10")
+        self.assertFalse(os.path.exists(bell), "arriving work alone must not ring the bell")
+
+        task = self.wait_for_inbox("bob", lambda i: i["kind"] == "task")
+        run("result", task["id"], "--status", "working", "-m", "on it")
+        self.assertFalse(os.path.exists(bell), "autonomous work must not ring the bell")
+
+        run("result", task["id"], "--status", "accepted", "-m", "asking my human")
+        self.assertEqual(pathlib.Path(bell).read_bytes(), b"\a")
+
+        os.remove(bell)
+        r = run("bell", agent=None)
+        self.assertEqual(pathlib.Path(bell).read_bytes(), b"\a")
+        self.assertIn("Rang the terminal bell", r.stdout)
 
     def test_wait_reads_pending_item_that_predates_listener(self):
         self.cli("alice", "send", "bob", "-m", "WAITING-BEFORE-START",

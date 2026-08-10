@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -73,6 +73,8 @@ HEARTBEAT_INTERVAL = 5
 SESSION_LEASE = 75          # a session with no heartbeat in this long is treated as gone
 TARGET_GIVEUP = 300         # release a targeted item whose target never reappears after this
 SUSPEND_GAP = HEARTBEAT_INTERVAL * 6   # a maintenance tick later than this means the host slept
+TTY_SEARCH_DEPTH = 12
+PTS_MAJOR = 136
 
 
 def load_config():
@@ -150,6 +152,59 @@ def write_status(fields):
         tmp.replace(STATUS_PATH)
     except OSError:
         pass
+
+
+def bell_enabled(cfg=None):
+    override = os.environ.get("HERALD_BELL", "").strip().lower()
+    if override:
+        return override not in ("0", "off", "false", "no")
+    return cfg.get("bell", True) is not False if cfg else True
+
+
+def owning_tty():
+    """Terminal device that owns this process tree, or None. An agent harness
+    runs herald with pipes for stdio and no controlling terminal, so the tty
+    the human is watching belongs to an ancestor process."""
+    pid = os.getpid()
+    for _ in range(TTY_SEARCH_DEPTH):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            fields = stat[stat.rindex(")") + 2:].split()
+            ppid, tty_nr = int(fields[1]), int(fields[4])
+        except (OSError, ValueError, IndexError):
+            return None
+        if tty_nr:
+            major = (tty_nr >> 8) & 0xfff
+            minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00)
+            return f"/dev/pts/{minor}" if major == PTS_MAJOR else None
+        if ppid <= 1:
+            return None
+        pid = ppid
+    return None
+
+
+def ring_bell(cfg=None):
+    """Emit BEL when the human is blocking the turn. What the terminal does
+    with it (beep, flash, tab badge) is the terminal's choice."""
+    if not bell_enabled(cfg):
+        return False
+    for target in (os.environ.get("HERALD_BELL_TTY"), "/dev/tty", owning_tty()):
+        if not target:
+            continue
+        try:
+            with open(target, "wb", buffering=0) as tty:
+                tty.write(b"\a")
+            return True
+        except OSError:
+            continue
+    try:
+        if sys.stderr.isatty():
+            sys.stderr.write("\a")
+            sys.stderr.flush()
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 def new_id():
@@ -1037,6 +1092,8 @@ def cmd_result(cfg, args):
             payload["to_session"] = orig["from_session"]
     attach_files(payload, args.file)
     result = deliver(cfg, orig["from"], payload)
+    if args.status == "accepted":   # the protocol's "waiting for my human to decide"
+        ring_bell(cfg)
     if result["delivery_state"] == "queued":
         return
     print(f"Sent {args.status} result to {orig['from']} in thread {orig['thread']} (id {result['id']})")
@@ -1356,6 +1413,14 @@ def cmd_ask(cfg, args):
     sys.exit(2)
 
 
+def cmd_bell(cfg, args):
+    """Ring the terminal because the turn cannot continue without the human."""
+    if ring_bell(cfg):
+        print("Rang the terminal bell")
+    else:
+        print("No terminal to ring (bell disabled, or no terminal owns this session)")
+
+
 def cmd_ping(cfg, args):
     """Ask a peer's daemon if it's up and what version it runs - answered by the
     daemon itself, no agent woken. Cheap liveness/version check."""
@@ -1650,6 +1715,8 @@ def main():
     sp.add_argument("--timeout", type=int, default=300, help="seconds to wait for the reply")
     sp.add_argument("--out", help="directory for attached files in the reply")
 
+    sub.add_parser("bell", help="ring the terminal: this turn cannot continue without the human")
+
     sp = sub.add_parser("ping", help="check a peer's daemon is up and its version (no agent woken)")
     sp.add_argument("peer", nargs="?", help="a single peer (default: all)")
 
@@ -1685,6 +1752,7 @@ def main():
      "close": cmd_close, "reopen": cmd_reopen, "peer": cmd_peer,
      "mailbox": cmd_mailbox,
      "introduce": cmd_introduce, "accept": cmd_accept, "ask": cmd_ask, "ping": cmd_ping,
+     "bell": cmd_bell,
      "access": cmd_access, "thread": cmd_thread, "wait": cmd_wait,
      "resume": cmd_resume, "flush": cmd_flush,
      "status": cmd_status, "sessions": cmd_sessions}[args.cmd](cfg, args)

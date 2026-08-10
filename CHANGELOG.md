@@ -2,6 +2,18 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.8.1
+
+- Added the terminal bell (BEL), rung when the human is blocking the turn and an
+  agent cannot proceed or reply without them. `herald result --status accepted`
+  rings it, since that status means "waiting for my human to decide", and
+  `herald bell` rings it for every other point where an agent must stop and ask.
+  Arriving work, autonomous work, and progress updates stay silent.
+- The bell goes to the terminal that owns the session, so it still arrives when
+  an agent harness runs Herald with pipes for stdio and no controlling terminal.
+  `HERALD_BELL=0` or `"bell": false` disables it; `HERALD_BELL_TTY` names an
+  explicit device.
+
 ## 0.8.0
 
 - Added durable mailboxes. Claude, Codex, Copilot, and multiple account profiles
