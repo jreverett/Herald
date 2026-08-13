@@ -75,7 +75,13 @@ herald ping <person>                                  # is their daemon up? whic
 - An acknowledgement is progress, not the final answer. If it says a later
   reply will follow, keep listening. `herald ask` does this automatically for
   task results with status `accepted` or `working`, and for replies whose meta
-  includes `herald_intent: ack`.
+  includes `herald_intent: ack`, and each one restarts its idle timeout.
+- **Tell your human when an acknowledgement arrives, and what it said.** They
+  cannot see the listener's output and otherwise have no way to tell "the peer
+  is working on it" apart from "nothing happened". Report who acknowledged, what
+  they said they would do, and that you are still waiting. `ask` prints the ack
+  as soon as it lands, so read the background command's output file rather than
+  waiting for the command to finish.
 
 - Prefer `reply`/`result` over `send` when responding — they keep threading
   correct automatically. Only use `send --thread <id>` when there is no inbox
@@ -112,6 +118,10 @@ herald ping <person>                                  # is their daemon up? whic
     item, and `--timeout` exits silently on expiry. Either way it is gone. When
     a wait returns, check whether anything is still outstanding and start a
     fresh listener if so — treat "wait returned" as "restart it", not "done".
+    The same applies to `ask`: its `--timeout` is an **idle** timeout (an
+    acknowledgement restarts it), but a peer that acknowledges and then goes
+    quiet for longer than the window still ends the listener, and the message
+    says so. Run `herald resume` when that happens.
   Prefer a background `herald wait` with no `--timeout` for an open-ended
   expected reply, so it survives until the answer lands. The reply is never
   lost without a listener, it just sits unread until someone checks the inbox —

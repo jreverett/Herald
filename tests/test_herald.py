@@ -413,6 +413,30 @@ class Protocol(unittest.TestCase):
         self.assertIn("[ack] bob: Received; I will ask Jamie.", out, err)
         self.assertIn("Jamie approved it.", out, err)
 
+    def test_ack_restarts_the_ask_timeout_instead_of_counting_against_it(self):
+        long_ack = "Received. " + "I will review it and reply with findings. " * 6
+        p = subprocess.Popen(
+            [sys.executable, HERALD_PY, "ask", "bob", "-t", "review please", "--timeout", "8"],
+            env=self._env("alice", "alice-ask"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            task = self.wait_for_inbox("bob", lambda i: i["kind"] == "task")
+            self.assertIsNotNone(task)
+            time.sleep(4)
+            self.cli("bob", "result", task["id"], "--status", "working", "-m", long_ack,
+                     agent="bob-w")
+            # Past the original 8s deadline, but within 8s of the acknowledgement.
+            time.sleep(6)
+            self.cli("bob", "result", task["id"], "--status", "done", "-m", "FINAL-ANSWER",
+                     agent="bob-w")
+            out, err = p.communicate(timeout=25)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertEqual(0, p.returncode, f"ask should not time out after an ack\n{out}\n{err}")
+        self.assertIn("FINAL-ANSWER", out, err)
+        self.assertIn(long_ack, out, "the acknowledgement must be printed in full")
+
     def test_ask_reply_goes_to_scoped_listener_not_general_consumer(self):
         general = subprocess.Popen(
             [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "20"],

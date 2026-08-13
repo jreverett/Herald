@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1413,21 +1413,34 @@ def cmd_ask(cfg, args):
     listener["request_id"] = result["id"]
     write_session(listener, waiting_on=f"reply:{result['id']}")
     print(f"Sent {payload['kind']} to {args.peer} (thread {thread}); waiting for reply...")
-    deadline = time.time() + (args.timeout or 300)
+    idle_timeout = args.timeout or 300
+    deadline = time.time() + idle_timeout
+    progress = None
     while time.time() < deadline:
         write_session(listener, waiting_on=f"reply:{result['id']}")
         item = _claim_next(listener)
         if item:
             if _is_progress_item(item):
+                # The peer has committed to a later reply, so the wait restarts from here
+                # rather than expiring on the original deadline.
+                progress = item
                 label = item.get("status") or "ack"
-                print(f"[{label}] {item['from']}: {item['text'][:200]}")
+                print(f"[{label}] {item['from']}: {item['text']}", flush=True)
+                print(f"-- a final reply is expected; waiting up to {idle_timeout}s "
+                      "from now for it", flush=True)
+                deadline = time.time() + idle_timeout
                 continue
             _show_item(item, args.out)
             clear_session(listener["session_id"])
             return
         time.sleep(1)
     clear_session(listener["session_id"])
-    print(f"No reply from {args.peer} within {args.timeout or 300}s (still open in thread {thread}).")
+    if progress:
+        print(f"{args.peer} acknowledged but sent no final reply within {idle_timeout}s "
+              f"of that acknowledgement (still open in thread {thread}).")
+    else:
+        print(f"No reply from {args.peer} within {idle_timeout}s (still open in thread {thread}).")
+    print("Nothing is listening now - run `herald resume` to receive the reply.")
     sys.exit(2)
 
 
@@ -1730,7 +1743,8 @@ def main():
     sp.add_argument("--agent", help="address a specific session of the peer")
     sp.add_argument("--mailbox", help="address a durable mailbox at the peer")
     sp.add_argument("--fallback", choices=FALLBACKS, default="hold")
-    sp.add_argument("--timeout", type=int, default=300, help="seconds to wait for the reply")
+    sp.add_argument("--timeout", type=int, default=300,
+                    help="seconds to wait without progress; an acknowledgement restarts it")
     sp.add_argument("--out", help="directory for attached files in the reply")
 
     sub.add_parser("bell", help="ring the terminal: this turn cannot continue without the human")

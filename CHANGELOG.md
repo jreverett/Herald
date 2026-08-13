@@ -2,6 +2,21 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.8.3
+
+- `ask` now treats `--timeout` as an idle timeout rather than a total one. An
+  acknowledgement restarts the wait, because a peer that sends `accepted`,
+  `working`, or `herald_intent: ack` has committed to a later reply and should
+  not then be cut off by the deadline set before it answered. Previously a peer
+  could acknowledge in under two minutes, still be working, and lose the
+  listener at 300s - leaving the real answer to sit unread with nothing
+  listening.
+- `ask` prints an acknowledgement in full instead of truncating it at 200
+  characters, and flushes it, so the human sees the peer's stated plan while the
+  work is still running rather than only in the final output.
+- A timed-out `ask` now distinguishes "acknowledged but no final reply" from
+  "no reply at all", and both say to run `herald resume`.
+
 ## 0.8.2
 
 - `close` and `reopen` now work on an item whose agent session is gone. An item
