@@ -437,6 +437,34 @@ class Protocol(unittest.TestCase):
         self.assertIn("FINAL-ANSWER", out, err)
         self.assertIn(long_ack, out, "the acknowledgement must be printed in full")
 
+    def test_ask_writes_files_attached_to_a_progress_item(self):
+        payload = pathlib.Path(self.root) / "findings.md"
+        payload.write_text("REVIEW-BODY")
+        out = pathlib.Path(self.root) / "asked"
+        out.mkdir()
+        p = subprocess.Popen(
+            [sys.executable, HERALD_PY, "ask", "bob", "-t", "review please",
+             "--timeout", "10", "--out", str(out)],
+            env=self._env("alice", "alice-ask"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            task = self.wait_for_inbox("bob", lambda i: i["kind"] == "task")
+            self.assertIsNotNone(task)
+            # 'accepted' carries finished work while a remaining part needs the human.
+            self.cli("bob", "result", task["id"], "--status", "accepted",
+                     "-m", "Part 1 done, findings.md attached", "-f", str(payload),
+                     agent="bob-w")
+            self.cli("bob", "result", task["id"], "--status", "done", "-m", "all done",
+                     agent="bob-w")
+            out_text, err = p.communicate(timeout=25)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        written = out / "findings.md"
+        self.assertTrue(written.is_file(),
+                        f"progress attachment was not written\n{out_text}\n{err}")
+        self.assertEqual("REVIEW-BODY", written.read_text())
+
     def test_ask_reply_goes_to_scoped_listener_not_general_consumer(self):
         general = subprocess.Popen(
             [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "20"],

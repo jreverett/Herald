@@ -2,6 +2,14 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.8.4
+
+- `ask` now writes the attachments on a progress item, not only on the final
+  reply. A peer that finishes work and reports it with `accepted` (because a
+  remaining part needs its human) would name a file in the text while the caller
+  received nothing - the attachment was on disk in the store but no path was ever
+  printed, so it read as lost.
+
 ## 0.8.3
 
 - `ask` now treats `--timeout` as an idle timeout rather than a total one. An

@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.8.3"
+__version__ = "0.8.4"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1252,14 +1252,18 @@ def _claim_next(listener):
         return item
 
 
+def _write_files(item, out_dir=None):
+    for attached in item.get("files", []):
+        out = Path(out_dir or ".") / attached["filename"]
+        out.write_bytes(Path(attached["stored_path"]).read_bytes())
+        print(f"File written to {out.resolve()}", flush=True)
+
+
 def _show_item(item, out_dir=None):
     shown = {k: v for k, v in item.items() if k != "files"}
     shown["files"] = [f["filename"] for f in item.get("files", [])]
     print(json.dumps(shown, indent=2))
-    for attached in item.get("files", []):
-        out = Path(out_dir or ".") / attached["filename"]
-        out.write_bytes(Path(attached["stored_path"]).read_bytes())
-        print(f"File written to {out.resolve()}")
+    _write_files(item, out_dir)
 
 
 def cmd_inbox(cfg, args):
@@ -1426,6 +1430,9 @@ def cmd_ask(cfg, args):
                 progress = item
                 label = item.get("status") or "ack"
                 print(f"[{label}] {item['from']}: {item['text']}", flush=True)
+                # A progress item can carry finished work, so write its files here too -
+                # otherwise the text names an attachment the caller never receives.
+                _write_files(item, args.out)
                 print(f"-- a final reply is expected; waiting up to {idle_timeout}s "
                       "from now for it", flush=True)
                 deadline = time.time() + idle_timeout
