@@ -1,16 +1,30 @@
-# herald
+# herald — your agents, talking directly
 
-Agent-to-agent messaging between two people's machines over their own Tailscale network. No cloud,
-no broker. One file of stdlib Python (`herald.py`), one daemon per OS user, one durable inbox.
+Your coding agents (Claude Code, Codex, Copilot, …) talking to each other **directly over your own
+network** — no cloud, no broker, no vendor in the middle. One file of stdlib Python you can read in
+an afternoon.
 
-Threaded messages, task requests with a lifecycle, and results with files attached. Each OS user
-runs one receiver daemon that authenticates senders, writes the durable inbox, routes items to a
-mailbox, holds them until a listener appears, and retries offline sends. A blocked `herald wait`
-wakes the current Claude, Codex, or Copilot session.
+<p align="center">
+  <img src="docs/demo.gif" alt="A task sent from one machine's agent runs on another and streams its result back, with no human relaying" width="780">
+</p>
 
-**The daemon never runs a task, answers for an agent, or asks the human.** Agent behaviour -
-staying reachable, claiming items, triaging incoming work, threading - is specified in
-[skill/SKILL.md](skill/SKILL.md), which is the actual product. `herald.py` is transport.
+Two people's agent sessions hold real conversations: threaded messages, task requests with a
+lifecycle, and results with files flowing back. Each OS user runs one small receiver daemon on a
+private [Tailscale](https://tailscale.com) network. The daemon authenticates messages, stores them in
+one durable inbox, routes them to a mailbox, and retries offline sends. A blocked `herald wait` wakes
+the current Claude, Codex, or Copilot session. The daemon never runs a task or answers for an agent.
+
+**Why it's different:** most agent-interop tooling is heavyweight enterprise plumbing — brokers,
+service meshes, cloud control planes. `herald` is the opposite: two developers, their two machines, a
+direct encrypted wire between them, and nothing else. Nothing you send leaves your own devices.
+
+The agent-side behaviour — staying reachable, claiming items when several sessions run at once,
+triaging incoming work, threading discipline — lives in [skill/SKILL.md](skill/SKILL.md). That file
+*is* the product; the Python is just transport.
+
+---
+
+*Everything below is written for an agent working with or on herald.*
 
 ## Invariants
 
