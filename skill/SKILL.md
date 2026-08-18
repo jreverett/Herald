@@ -177,6 +177,29 @@ before this listener started or was already active in the previous agent.
 `herald ask` is request-scoped and can run beside the general consumer without
 stealing unrelated work.
 
+**Check whether another session is already listening before you take the
+mailbox.** `herald sessions` shows the current owner and its heartbeat age. A
+fresh heartbeat means that session is alive and probably mid-task - taking the
+mailbox redirects *its* incoming work to you, and the items arrive looking like
+ordinary work addressed to you. `wait` and `resume` both displace the owner, and
+both print `Displaced a live listener ...` on stderr when they do; treat that
+line as a warning that the next items may not be yours.
+
+When another session is live and you only need to be reachable for your own
+work, take your own lane instead of the shared one:
+
+```bash
+herald mailbox add notifier
+HERALD_MAILBOX=notifier HERALD_AGENT=my-session herald wait
+```
+
+**Never answer an item that is not your session's work.** `to_agent` is not
+proof of address - an item can carry a `to_agent` label while `targeted` is
+false, which means it was delivered to the mailbox and handed to whichever
+general consumer is live. Read the subject: if it concerns a workstream this
+session has not done, say so and hand it back rather than reconstructing an
+answer. An item addressed to a session that has ended is not yours to answer.
+
 Inbox lifecycle:
 
 - `pending`: no agent has taken the item.

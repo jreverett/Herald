@@ -2,6 +2,21 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.8.5
+
+- Taking a mailbox off a listener that is still alive now says so on stderr,
+  naming the displaced agent and its heartbeat age. Takeover itself is unchanged
+  and still the mechanism behind a provider handoff - the problem was that it was
+  silent. A session that displaced a live one then received that session's mail
+  with no indication, and mailbox-delivered items carry a `to_agent` label while
+  `targeted` is false, so they arrive looking like ordinary work addressed to the
+  new listener. Observed three times in one morning on a shared `main` mailbox;
+  each item concerned a workstream the receiving session had never touched, and
+  only the receiving agent declining to guess kept a fabricated answer out.
+- `SKILL.md`: check `herald sessions` for a live owner before taking a mailbox,
+  use a separate mailbox to stay reachable alongside another session, and never
+  answer an item that is not this session's work.
+
 ## 0.8.4
 
 - `ask` now writes the attachments on a progress item, not only on the final

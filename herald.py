@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.8.4"
+__version__ = "0.8.5"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -325,6 +325,7 @@ def register_listener(cfg, mode="general", takeover=False):
         "request_id": "",
     }
     if mode == "general":
+        warn_if_owner_was_live(listener["mailbox"], listener["agent"])
         with state_lock():
             path = consumer_path(listener["mailbox"])
             try:
@@ -344,6 +345,26 @@ def register_listener(cfg, mode="general", takeover=False):
             })
     write_session(listener)
     return listener
+
+
+def warn_if_owner_was_live(mailbox, agent):
+    """Say so when this listener displaces another session that was still alive.
+
+    Taking the mailbox is deliberate and supported - it is how a provider handoff
+    works. What causes trouble is doing it silently: the new listener then
+    receives work addressed to the displaced session and cannot tell it apart
+    from its own, which invites answering for a session it is not.
+    """
+    owner = current_consumer(mailbox)
+    if not owner or owner.get("agent") == agent:
+        return
+    age = time.time() - owner.get("heartbeat", 0)
+    print(f"Displaced a live listener on mailbox '{mailbox}': agent "
+          f"'{owner.get('agent')}' ({owner.get('session_id')}), heartbeat {age:.0f}s ago. "
+          f"Items meant for that session will now arrive here - check an item is your "
+          f"work before acting on it. To listen without displacing it, use your own "
+          f"mailbox (herald mailbox add <name>, then HERALD_MAILBOX=<name>).",
+          file=sys.stderr, flush=True)
 
 
 def consumer_is_current(listener):

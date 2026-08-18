@@ -637,6 +637,68 @@ class Protocol(unittest.TestCase):
         self.assertIn("moved to another agent listener", old_out, old_err)
         self.assertNotIn("ONLY-NEW-CONSUMER", old_out)
 
+    def test_displacing_a_live_consumer_warns_and_names_it(self):
+        """Takeover is supported, but it must not be silent: the new listener
+        receives the displaced session's mail and has to know that."""
+        old = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "12"],
+            env=self._env("bob", "claude-work"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        new = None
+        try:
+            time.sleep(1)
+            new = subprocess.Popen(
+                [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "4"],
+                env=self._env("bob", "copilot-personal"), cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            new_out, new_err = new.communicate(timeout=18)
+        finally:
+            for process in (old, new):
+                if process and process.poll() is None:
+                    process.kill()
+
+        self.assertIn("Displaced a live listener", new_err, new_err)
+        self.assertIn("claude-work", new_err, new_err)
+
+    def test_taking_your_own_mailbox_back_does_not_warn(self):
+        """Restarting a listener under the same agent name is routine."""
+        first = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "3"],
+            env=self._env("bob", "claude-work"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        first.communicate(timeout=18)
+        again = subprocess.run(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "3"],
+            env=self._env("bob", "claude-work"), cwd=self.root,
+            capture_output=True, text=True)
+
+        self.assertNotIn("Displaced a live listener", again.stderr, again.stderr)
+
+    def test_a_separate_mailbox_does_not_displace_the_default_consumer(self):
+        """The remedy the warning recommends must actually work."""
+        self.cli("bob", "mailbox", "add", "notifier")
+        old = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "12"],
+            env=self._env("bob", "claude-work"), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        other = None
+        try:
+            time.sleep(1)
+            other = subprocess.Popen(
+                [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "4"],
+                env=self._env("bob", "notifier-session", mailbox="notifier"), cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            other_out, other_err = other.communicate(timeout=18)
+            self.cli("alice", "send", "bob", "-m", "STAYS-ON-MAIN", agent="alice-1")
+            old_out, old_err = old.communicate(timeout=18)
+        finally:
+            for process in (old, other):
+                if process and process.poll() is None:
+                    process.kill()
+
+        self.assertNotIn("Displaced a live listener", other_err, other_err)
+        self.assertIn("STAYS-ON-MAIN", old_out, old_err)
+
     def test_provider_handoff_takes_item_assigned_to_suspended_listener(self):
         old = subprocess.Popen(
             [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "20"],
