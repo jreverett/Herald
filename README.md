@@ -1,22 +1,28 @@
-# herald — your agents, talking directly
+# herald — your agent, talking to someone else's
 
-Your coding agents (Claude Code, Codex, Copilot, …) talking to each other **directly over your own
-network** — no cloud, no broker, no vendor in the middle. One file of stdlib Python you can read in
-an afternoon.
+Your coding agent (Claude Code, Codex, Copilot, …) and another person's, on their machine, talking
+to each other **directly over a private network between your two devices** — no cloud, no broker, no
+vendor in the middle. One file of stdlib Python you can read in an afternoon.
 
 <p align="center">
   <img src="docs/demo.gif" alt="A task sent from one machine's agent runs on another and streams its result back, with no human relaying" width="780">
 </p>
 
 Two people's agent sessions hold real conversations: threaded messages, task requests with a
-lifecycle, and results with files flowing back. Each OS user runs one small receiver daemon on a
-private [Tailscale](https://tailscale.com) network. The daemon authenticates messages, stores them in
-one durable inbox, routes them to a mailbox, and retries offline sends. A blocked `herald wait` wakes
+lifecycle, and results with files flowing back. Each person runs one small receiver daemon on their
+own machine, joined to a private [Tailscale](https://tailscale.com) network. The daemon
+authenticates messages, stores them in one durable inbox, routes them to a mailbox, and retries
+offline sends. A blocked `herald wait` wakes
 the current Claude, Codex, or Copilot session. The daemon never runs a task or answers for an agent.
 
 **Why it's different:** most agent-interop tooling is heavyweight enterprise plumbing — brokers,
 service meshes, cloud control planes. `herald` is the opposite: two developers, their two machines, a
 direct encrypted wire between them, and nothing else. Nothing you send leaves your own devices.
+
+**What it is not:** a way to fan work out across several agent sessions on your own machine. The
+peer at the other end of every herald command is a different person on a different device. Sessions
+and mailboxes exist so an incoming message finds the right session on *your* side — they are not a
+channel between your own local sessions.
 
 The agent-side behaviour — staying reachable, claiming items when several sessions run at once,
 triaging incoming work, threading discipline — lives in [skill/SKILL.md](skill/SKILL.md). That file
@@ -119,6 +125,9 @@ introduce <name>`.
 **A peer name must be exactly the other person's `--me`** - replies and results route back by it.
 
 ## Identity
+
+Peers are people. Sessions and mailboxes are addressing *within* one person's machine, so a peer's
+message, reply, or result reaches the right place.
 
 `HERALD_AGENT` names one temporary agent session; use one value for every command in that session.
 `HERALD_MAILBOX` names durable work that survives a tab, product, or account switch.
