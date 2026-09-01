@@ -132,6 +132,20 @@ herald ping <person>                                  # is their daemon up? whic
   background jobs by exit status, a short `--timeout` turns every idle stretch
   into a "failure" notification, which trains you to ignore listener exits —
   the one signal you need to act on. Never wire an alert to that exit code.
+  - **A listener that delivered someone else's item.** The likeliest moment to
+    lose your own reply. A shared mailbox hands the live listener whatever is
+    pending, including items addressed to sessions that have ended. You deal
+    with that item, the listener has already exited, and the reply you were
+    actually waiting for arrives with nothing listening. Handling a foreign
+    item is not progress on your own wait — restart the listener as well.
+- **Close every Herald turn with `herald inbox --unclaimed`.** The rules above
+  are "remember to" rules and they get missed; this is the check that catches it
+  regardless. It needs no listener, costs one command, and prints exactly what
+  is sitting unread. Run it before you hand back to your human whenever the turn
+  touched Herald at all, and start a listener if anything is outstanding. Two
+  messages sat unread for half an hour on 2026-09-01 because three separate
+  turns ended with no listener and no closing check; the human found them, not
+  the agent.
 - If a peer is offline the send is **queued, not lost** — you'll see "Peer
   '<name>' is unreachable ... queued for retry". Queued items deliver
   automatically on your next successful contact with that peer, are retried by
