@@ -2,6 +2,23 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.1
+
+- **A second tab joining a mailbox that already had work in flight crashed on its
+  first poll.** `herald wait` printed "Listening alongside ..." and then died with
+  `KeyError: 'generation'`. Only a mailbox owner is given a generation, and the
+  re-presentation check read it with a bare subscript, so a co-listener reached it
+  with no key. The check is only reachable when an item is already active, which is
+  why 0.9.0's tests did not see it. A listener now starts at generation 0, meaning
+  it holds no mailbox generation, and only ownership raises it (owners count from
+  1). Skipping the check for a co-listener was the other candidate and is wrong:
+  the check is also what stops an item the listener already holds coming back on
+  its next wait, so skipping it re-presents the same work on every poll.
+- The test suite no longer rings the terminal bell. `ring_bell` walks up the
+  process tree for the human's terminal, which it found from every test
+  subprocess, so a run beeped whoever started it once per delivery. The harness
+  now points `HERALD_BELL_TTY` at a file under the test's own directory.
+
 ## 0.9.0
 
 - **Several tabs can now listen on one mailbox at the same time.** Herald assumed
