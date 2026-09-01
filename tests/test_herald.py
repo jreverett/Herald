@@ -237,6 +237,29 @@ class Protocol(unittest.TestCase):
             return []
         return [self._load(os.path.join(d, f)) for f in sorted(os.listdir(d)) if f.endswith(".json")]
 
+    def wait_for_listener(self, name, agent, timeout=10):
+        """Block until a listener has actually registered its session.
+
+        Sleeping a fixed second and assuming the process is up races its startup:
+        on a loaded machine the send lands before the listener exists, and the
+        test fails for reasons that have nothing to do with the behaviour under
+        test. Poll for the real thing instead.
+        """
+        path = os.path.join(self.homes[name], "sessions")
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                for entry in os.listdir(path):
+                    if not entry.endswith(".json"):
+                        continue
+                    record = self._load(os.path.join(path, entry))
+                    if record.get("agent") == agent:
+                        return record
+            except (OSError, json.JSONDecodeError):
+                pass
+            time.sleep(0.05)
+        raise AssertionError(f"listener {agent!r} never registered for {name!r}")
+
     def wait_for_inbox(self, name, predicate, timeout=10):
         end = time.time() + timeout
         while time.time() < end:
@@ -337,7 +360,7 @@ class Protocol(unittest.TestCase):
             env=self._env("bob", "bob-other"), cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            time.sleep(1)
+            self.wait_for_listener("bob", "bob-other")
             self.cli("alice", "send", "bob", "-t", "EXACT-TARGET",
                      "--agent", "bob-target", agent="alice-1")
             time.sleep(1)
@@ -415,18 +438,38 @@ class Protocol(unittest.TestCase):
 
     def test_ack_restarts_the_ask_timeout_instead_of_counting_against_it(self):
         long_ack = "Received. " + "I will review it and reply with findings. " * 6
+        # The invariant under test: the final reply lands after the ORIGINAL
+        # deadline but within one idle window of the acknowledgement.
+        #
+        # The usable window for that final reply is (acked - started - 1), which
+        # does NOT widen with a longer idle timeout - so raising `idle` alone does
+        # nothing. What widens it is acknowledging later in the original window.
+        # Both sleeps are therefore computed from a measured start, and the ack is
+        # deliberately left until near the end of the first window. Each self.cli()
+        # spawns a Python process, which on a loaded machine costs seconds.
+        idle = 20
+        ack_at = idle * 0.75            # ack near the end of the original window
+        final_at = idle + 1             # just past the original deadline
         p = subprocess.Popen(
-            [sys.executable, HERALD_PY, "ask", "bob", "-t", "review please", "--timeout", "8"],
+            [sys.executable, HERALD_PY, "ask", "bob", "-t", "review please",
+             "--timeout", str(idle)],
             env=self._env("alice", "alice-ask"), cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             task = self.wait_for_inbox("bob", lambda i: i["kind"] == "task")
             self.assertIsNotNone(task)
-            time.sleep(4)
+            started = time.time()
+            time.sleep(max(0, (started + ack_at) - time.time()))
             self.cli("bob", "result", task["id"], "--status", "working", "-m", long_ack,
                      agent="bob-w")
-            # Past the original 8s deadline, but within 8s of the acknowledgement.
-            time.sleep(6)
+            acked = time.time()
+            self.assertLess(acked - started, idle,
+                            "ack must land inside the original window for this test to mean anything")
+            # Past the original deadline, and with room to spare inside the window
+            # the acknowledgement restarted.
+            time.sleep(max(0, (started + final_at) - time.time()))
+            self.assertLess(time.time() - acked, idle - 3,
+                            "final reply must have room left in the restarted window")
             self.cli("bob", "result", task["id"], "--status", "done", "-m", "FINAL-ANSWER",
                      agent="bob-w")
             out, err = p.communicate(timeout=25)
@@ -472,7 +515,7 @@ class Protocol(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         ask = None
         try:
-            time.sleep(1)
+            self.wait_for_listener("alice", "codex-general")
             ask = subprocess.Popen(
                 [sys.executable, HERALD_PY, "ask", "bob", "-t", "SCOPED-REQUEST",
                  "--timeout", "15"],
@@ -501,7 +544,7 @@ class Protocol(unittest.TestCase):
             env=self._env("bob", "bob-wr"), cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            time.sleep(1)   # let the listener register before the send
+            self.wait_for_listener("bob", "bob-wr")
             self.cli("alice", "send", "bob", "-m", "HELLO-WR", agent="alice-1")
             out, err = p.communicate(timeout=18)
         finally:
@@ -561,7 +604,7 @@ class Protocol(unittest.TestCase):
             env=self._env("bob", "bob-live-target"), cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            time.sleep(1)
+            self.wait_for_listener("bob", "bob-live-target")
             self.cli("alice", "send", "bob", "-t", "PINNED-LIVE",
                      "--agent", "bob-live-target", agent="alice-1")
             item = self.wait_for_inbox("bob", lambda i: i.get("text") == "PINNED-LIVE")
@@ -620,12 +663,12 @@ class Protocol(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         new = None
         try:
-            time.sleep(1)
+            self.wait_for_listener("bob", "claude-work")
             new = subprocess.Popen(
                 [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "15"],
                 env=self._env("bob", "copilot-personal"), cwd=self.root,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            time.sleep(1)
+            self.wait_for_listener("bob", "copilot-personal")
             self.cli("alice", "send", "bob", "-m", "ONLY-NEW-CONSUMER", agent="alice-1")
             new_out, new_err = new.communicate(timeout=18)
             old_out, old_err = old.communicate(timeout=18)
@@ -646,7 +689,7 @@ class Protocol(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         new = None
         try:
-            time.sleep(1)
+            self.wait_for_listener("bob", "claude-work")
             new = subprocess.Popen(
                 [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "4"],
                 env=self._env("bob", "copilot-personal"), cwd=self.root,
@@ -683,7 +726,7 @@ class Protocol(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         other = None
         try:
-            time.sleep(1)
+            self.wait_for_listener("bob", "claude-work")
             other = subprocess.Popen(
                 [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "4"],
                 env=self._env("bob", "notifier-session", mailbox="notifier"), cwd=self.root,
@@ -705,7 +748,7 @@ class Protocol(unittest.TestCase):
             env=self._env("bob", "claude-work"), cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            time.sleep(1)
+            self.wait_for_listener("bob", "claude-work")
             os.kill(old.pid, signal.SIGSTOP)
             self.cli("alice", "send", "bob", "-m", "ASSIGNED-BEFORE-SWITCH",
                      agent="alice-1")
