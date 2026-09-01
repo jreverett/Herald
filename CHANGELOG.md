@@ -2,6 +2,29 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.0
+
+- **Several tabs can now listen on one mailbox at the same time.** Herald assumed
+  one person runs one agent session at a time. Two tabs on different topics broke
+  that in two ways: an item addressed to a specific agent was handed to whichever
+  session owned the mailbox, so each tab kept receiving the other's work; and
+  starting a listener evicted the existing one, so they could not both listen
+  anyway. An agent name is now an address - a live listener under that name gets
+  the item wherever it is listening, and only untargeted work goes to the mailbox
+  owner. A different name coexists and is told so on stderr; the same name
+  returning reclaims its mailbox, as a restarted tab should; `herald resume`
+  remains the explicit takeover. A single listener is unaffected.
+- The ownership decision and claim happen inside one lock. Reading the owner
+  first and writing after left a window where two tabs starting together both saw
+  no owner and both claimed the mailbox.
+- The test suite is deterministic. It previously failed about one run in three on
+  untouched code, so a red run said nothing. Three races were fixed: eight places
+  slept a fixed second and assumed a listener had started; the daemon startup
+  budget was 8s, too tight under load and failing tests in `setUp`; and
+  `wait_for_inbox` returned when an item file existed, which is before the daemon
+  had routed it. Eight tests were added for the listener lifecycle, covering all
+  four practical transitions between one listener and several.
+
 ## 0.8.5
 
 - Taking a mailbox off a listener that is still alive now says so on stderr,

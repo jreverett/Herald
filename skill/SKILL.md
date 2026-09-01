@@ -94,9 +94,11 @@ herald ping <person>                                  # is their daemon up? whic
   is gone, they remain in the originating durable mailbox for `herald resume`.
 - **Exact live-session targeting:** use `--agent <name>` only when the work must
   reach one named live session. This is less durable than mailbox routing.
-- **Delivery is single-copy per mailbox:** one general listener owns a mailbox.
-  A new listener from a different agent supersedes the old one. `--all` creates
-  one item in every registered recipient mailbox. It does not wake every tab.
+- **An agent name is an address; a mailbox is only a fallback.** An item
+  addressed to an agent reaches a live listener under that name wherever it is
+  listening. Only untargeted work goes to whichever listener owns the mailbox.
+  `--all` creates one item in every registered recipient mailbox. It does not
+  wake every tab.
 - **If an exact target never appears**, `--fallback hold` keeps it pinned. Use
   `broadcast` to move it to the default mailbox after the give-up period, or
   `bounce` to return an undeliverable notice. `hold` is the default.
@@ -191,16 +193,27 @@ before this listener started or was already active in the previous agent.
 `herald ask` is request-scoped and can run beside the general consumer without
 stealing unrelated work.
 
-**Check whether another session is already listening before you take the
-mailbox.** `herald sessions` shows the current owner and its heartbeat age. A
-fresh heartbeat means that session is alive and probably mid-task - taking the
-mailbox redirects *its* incoming work to you, and the items arrive looking like
-ordinary work addressed to you. `wait` and `resume` both displace the owner, and
-both print `Displaced a live listener ...` on stderr when they do; treat that
-line as a warning that the next items may not be yours.
+**Several tabs can listen on one mailbox at the same time.** Working two topics
+in two tabs is normal and needs no special setup - each `herald wait` receives
+the items addressed to its own `HERALD_AGENT`. The first listener owns the
+mailbox and additionally receives anything sent without a named agent; a later
+listener under a different name coexists and prints `Listening alongside ...` so
+it knows it is not the owner. Running a single listener behaves exactly as
+before: it owns the mailbox and gets everything.
 
-When another session is live and you only need to be reachable for your own
-work, take your own lane instead of the shared one:
+Taking the mailbox is a separate, explicit act:
+
+- `herald wait` under the **same** agent name reclaims the mailbox - a restarted
+  tab is the same worker, not a second one.
+- `herald resume` takes it from a different agent, for a genuine handoff, and
+  prints `Displaced a live listener ...` naming who it displaced. Treat that as
+  a warning that the next items may not be yours.
+
+`herald sessions` shows who currently owns the mailbox and its heartbeat age.
+
+A separate mailbox is still worth having when work should be routed by lane
+rather than by session - for example a notifications lane that any tab may pick
+up:
 
 ```bash
 herald mailbox add notifier
