@@ -547,6 +547,55 @@ class Protocol(unittest.TestCase):
         self.assertIn("STILL-THE-OWNERS", owner_out, owner_err)
         self.assertIn("THE-NEW-TABS", co_out, co_err)
 
+    def test_co_listener_starts_while_the_owner_holds_an_active_item(self):
+        """Jamie's crash: a second tab joining a mailbox that already has work in
+        flight. An active item is the only thing that makes _claim_next reach the
+        mailbox-generation check, and a co-listener owns no mailbox, so it has no
+        generation - the bare subscript killed the tab on its first poll."""
+        first = self._listener("bob", "bob-owner", timeout="20")
+        self.cli("alice", "send", "bob", "-m", "OWNERS-ACTIVE-WORK", agent="alice-1")
+        first_out, first_err = first.communicate(timeout=30)
+        self.assertIn("OWNERS-ACTIVE-WORK", first_out, first_err)
+
+        owner = self._listener("bob", "bob-owner", timeout="25")
+        co = self._listener("bob", "bob-co", timeout="25")
+        try:
+            self.cli("alice", "send", "bob", "-m", "FOR-THE-SECOND-TAB",
+                     "--agent", "bob-co", agent="alice-1")
+            co_out, co_err = co.communicate(timeout=35)
+            self.cli("alice", "send", "bob", "-m", "FOR-THE-OWNER", agent="alice-1")
+            owner_out, owner_err = owner.communicate(timeout=35)
+        finally:
+            for proc in (owner, co):
+                if proc.poll() is None:
+                    proc.kill()
+
+        self.assertNotIn("Traceback", co_err, co_err)
+        self.assertIn("FOR-THE-SECOND-TAB", co_out, co_err)
+        self.assertNotIn("FOR-THE-OWNER", co_out)
+        self.assertIn("FOR-THE-OWNER", owner_out, owner_err)
+        self.assertNotIn("FOR-THE-SECOND-TAB", owner_out)
+
+    def test_co_listener_is_not_handed_its_own_active_item_again(self):
+        """Why a co-listener takes generation 0 rather than skipping the check.
+        The check is also what stops an item the listener already has coming back
+        on its next wait. Skipping it for a co-listener re-presents the same work
+        on every poll."""
+        owner = self._listener("bob", "bob-owner", timeout="25")
+        co = self._listener("bob", "bob-co", timeout="20")
+        try:
+            self.cli("alice", "send", "bob", "-m", "ALREADY-MINE",
+                     "--agent", "bob-co", agent="alice-1")
+            co_out, co_err = co.communicate(timeout=30)
+            self.assertIn("ALREADY-MINE", co_out, co_err)
+
+            again = self.cli("bob", "wait", "--read", "--timeout", "5", agent="bob-co")
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+        self.assertEqual(again.returncode, 2, again.stdout)
+        self.assertNotIn("ALREADY-MINE", again.stdout)
+
     def test_claim_stolen_from_dead_session(self):
         self.cli("alice", "send", "bob", "-m", "orphaned", agent="alice-1")
         item = self.wait_for_inbox("bob", lambda i: i["text"] == "orphaned")

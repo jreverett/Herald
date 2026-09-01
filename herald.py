@@ -323,6 +323,9 @@ def register_listener(cfg, mode="general", takeover=False):
         "mode": mode,
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "request_id": "",
+        # Only a mailbox owner is given a generation, counting from 1. Zero means
+        # this listener holds none, so a later owner re-presents what it left open.
+        "generation": 0,
     }
     if mode == "general":
         # Two tabs working different topics share a mailbox routinely. Only take
