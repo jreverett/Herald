@@ -175,7 +175,11 @@ class Protocol(unittest.TestCase):
             json.dump(cfg, f)
 
     def _env(self, name, agent=None, mailbox=None):
-        env = dict(os.environ, HERALD_DIR=self.homes[name])
+        # Send the bell to a file. ring_bell walks up the process tree for the
+        # human's terminal, so without this the suite beeps the terminal that
+        # started it, once per delivery. The bell test sets its own path.
+        env = dict(os.environ, HERALD_DIR=self.homes[name],
+                   HERALD_BELL_TTY=os.path.join(self.root, "bell-sink"))
         env.pop("HERALD_AGENT", None)
         env.pop("HERALD_MAILBOX", None)
         if agent:
