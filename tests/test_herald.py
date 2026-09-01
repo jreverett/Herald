@@ -210,7 +210,7 @@ class Protocol(unittest.TestCase):
         with open(path, "w") as f:
             json.dump(cfg, f)
 
-    def _wait_port(self, port, timeout=8):
+    def _wait_port(self, port, timeout=30):
         end = time.time() + timeout
         while time.time() < end:
             try:
@@ -236,6 +236,23 @@ class Protocol(unittest.TestCase):
         if not os.path.isdir(d):
             return []
         return [self._load(os.path.join(d, f)) for f in sorted(os.listdir(d)) if f.endswith(".json")]
+
+    def wait_for_assignment(self, name, predicate, timeout=15):
+        """Wait until the daemon has ROUTED a matching item to a session, not
+        merely written it. wait_for_inbox returns as soon as the file exists,
+        which is before assignment - a test that acts on the item in that gap
+        sees it as belonging to nobody."""
+        end = time.time() + timeout
+        latest = None
+        while time.time() < end:
+            for item in self.inbox(name):
+                if predicate(item):
+                    latest = item
+                    if item.get("assigned_session"):
+                        return item
+            time.sleep(0.05)
+        raise AssertionError(
+            f"item never got an assigned_session within {timeout}s (last seen: {latest})")
 
     def wait_for_listener(self, name, agent, timeout=10):
         """Block until a listener has actually registered its session.
@@ -376,6 +393,159 @@ class Protocol(unittest.TestCase):
         self.assertEqual(target.returncode, 0, target.stderr)
         self.assertIn("EXACT-TARGET", target.stdout)
         self.assertNotIn("EXACT-TARGET", other_out, other_err)
+
+    def _listener(self, name, agent, timeout="20", mailbox=None):
+        """Start a listener and return only once it has registered, so ownership
+        is decided by the order the test intends rather than by process startup."""
+        proc = subprocess.Popen(
+            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", timeout],
+            env=self._env(name, agent, mailbox), cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.wait_for_listener(name, agent)
+        return proc
+
+    def test_two_listeners_on_one_mailbox_each_get_their_own_item(self):
+        """Jamie's setup: two tabs, two topics, one mailbox. Each must receive the
+        item addressed to it. Previously only the mailbox owner could be selected,
+        so the second tab's work was handed to the first."""
+        one = self._listener("bob", "bob-topic-one")
+        two = self._listener("bob", "bob-topic-two")
+        try:
+            self.cli("alice", "send", "bob", "-m", "FOR-TOPIC-ONE",
+                     "--agent", "bob-topic-one", agent="alice-1")
+            self.cli("alice", "send", "bob", "-m", "FOR-TOPIC-TWO",
+                     "--agent", "bob-topic-two", agent="alice-1")
+            one_out, one_err = one.communicate(timeout=30)
+            two_out, two_err = two.communicate(timeout=30)
+        finally:
+            for proc in (one, two):
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertIn("FOR-TOPIC-ONE", one_out, one_err)
+        self.assertNotIn("FOR-TOPIC-TWO", one_out)
+        self.assertIn("FOR-TOPIC-TWO", two_out, two_err)
+        self.assertNotIn("FOR-TOPIC-ONE", two_out)
+
+    def test_untargeted_item_goes_to_the_mailbox_owner_not_the_co_listener(self):
+        """A co-listener is addressable but does not own the mailbox: work with no
+        named agent stays with the incumbent."""
+        owner = self._listener("bob", "bob-owner")
+        co = self._listener("bob", "bob-co", timeout="8")
+        try:
+            self.cli("alice", "send", "bob", "-m", "NO-NAMED-AGENT", agent="alice-1")
+            owner_out, owner_err = owner.communicate(timeout=30)
+            co_out, co_err = co.communicate(timeout=30)
+        finally:
+            for proc in (owner, co):
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertIn("NO-NAMED-AGENT", owner_out, owner_err)
+        self.assertNotIn("NO-NAMED-AGENT", co_out)
+
+    def test_co_listener_is_told_it_is_not_the_owner(self):
+        """Silence is what invites a session to assume it owns the mailbox."""
+        owner = self._listener("bob", "bob-owner", timeout="12")
+        co = None
+        try:
+            co = subprocess.Popen(
+                [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "3"],
+                env=self._env("bob", "bob-co"), cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            co_out, co_err = co.communicate(timeout=20)
+        finally:
+            for proc in (owner, co):
+                if proc and proc.poll() is None:
+                    proc.kill()
+        self.assertIn("Listening alongside", co_err, co_err)
+        self.assertIn("bob-owner", co_err, co_err)
+
+    def test_same_agent_name_returning_takes_its_mailbox_back(self):
+        """A restarted tab is the same worker, not a second one - it reclaims the
+        mailbox without needing herald resume."""
+        first = self._listener("bob", "bob-tab", timeout="15")
+        second = None
+        try:
+            second = subprocess.Popen(
+                [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "15"],
+                env=self._env("bob", "bob-tab"), cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(1)     # same name: cannot distinguish the two by session record
+            self.cli("alice", "send", "bob", "-m", "AFTER-RESTART", agent="alice-1")
+            second_out, second_err = second.communicate(timeout=25)
+            first_out, first_err = first.communicate(timeout=25)
+        finally:
+            for proc in (first, second):
+                if proc and proc.poll() is None:
+                    proc.kill()
+        self.assertIn("AFTER-RESTART", second_out, second_err)
+        self.assertIn("moved to another agent listener", first_out, first_err)
+
+    def test_item_for_a_departed_co_listener_stays_pinned_not_reassigned(self):
+        """Exact --agent targeting holds. The owner must not inherit work addressed
+        to a co-listener that has gone, or a handoff answers for a session that
+        never saw the request. Released only after TARGET_GIVEUP."""
+        co = self._listener("bob", "bob-co", timeout="3")
+        co.kill()
+        co.communicate()
+        self.cli("alice", "send", "bob", "-m", "PINNED-TO-CO",
+                 "--agent", "bob-co", agent="alice-1")
+        item = self.wait_for_inbox("bob", lambda i: i.get("text") == "PINNED-TO-CO")
+        self.assertEqual(item.get("to_agent"), "bob-co")
+        owner = self.cli("bob", "wait", "--read", "--timeout", "6", agent="bob-owner")
+        self.assertEqual(owner.returncode, 2, owner.stdout)
+        self.assertNotIn("PINNED-TO-CO", owner.stdout)
+
+    def test_switching_to_one_listener_by_closing_the_co_listener(self):
+        """Closing the second tab. The mailbox owner is the survivor, so it simply
+        carries on."""
+        owner = self._listener("bob", "bob-owner", timeout="20")
+        co = self._listener("bob", "bob-co", timeout="20")
+        try:
+            co.kill()
+            co.communicate()
+            self.cli("alice", "send", "bob", "-m", "AFTER-COLLAPSE", agent="alice-1")
+            owner_out, owner_err = owner.communicate(timeout=30)
+        finally:
+            for proc in (owner, co):
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertIn("AFTER-COLLAPSE", owner_out, owner_err)
+
+    def test_switching_to_one_listener_by_closing_the_owner(self):
+        """The other half, and the one that can strand work: closing the tab that
+        OWNS the mailbox and leaving a co-listener that never took ownership.
+        Untargeted mail must fall to the survivor rather than sitting unclaimed."""
+        owner = self._listener("bob", "bob-owner", timeout="20")
+        co = self._listener("bob", "bob-co", timeout="30")
+        try:
+            owner.kill()
+            owner.communicate()
+            self.cli("alice", "send", "bob", "-m", "OWNER-TAB-CLOSED", agent="alice-1")
+            co_out, co_err = co.communicate(timeout=40)
+        finally:
+            for proc in (owner, co):
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertIn("OWNER-TAB-CLOSED", co_out, co_err)
+
+    def test_switching_from_one_listener_to_many(self):
+        """Simon moving to Jamie's setup: a second tab joins an established single
+        listener. The incumbent must keep both the mailbox and its own work."""
+        owner = self._listener("bob", "bob-owner", timeout="25")
+        co = self._listener("bob", "bob-co", timeout="25")
+        try:
+            self.cli("alice", "send", "bob", "-m", "STILL-THE-OWNERS",
+                     "--agent", "bob-owner", agent="alice-1")
+            self.cli("alice", "send", "bob", "-m", "THE-NEW-TABS",
+                     "--agent", "bob-co", agent="alice-1")
+            owner_out, owner_err = owner.communicate(timeout=35)
+            co_out, co_err = co.communicate(timeout=35)
+        finally:
+            for proc in (owner, co):
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertIn("STILL-THE-OWNERS", owner_out, owner_err)
+        self.assertIn("THE-NEW-TABS", co_out, co_err)
 
     def test_claim_stolen_from_dead_session(self):
         self.cli("alice", "send", "bob", "-m", "orphaned", agent="alice-1")
@@ -607,7 +777,7 @@ class Protocol(unittest.TestCase):
             self.wait_for_listener("bob", "bob-live-target")
             self.cli("alice", "send", "bob", "-t", "PINNED-LIVE",
                      "--agent", "bob-live-target", agent="alice-1")
-            item = self.wait_for_inbox("bob", lambda i: i.get("text") == "PINNED-LIVE")
+            item = self.wait_for_assignment("bob", lambda i: i.get("text") == "PINNED-LIVE")
 
             r = self.cli("bob", "close", item["id"], agent="bob-other")
 
@@ -657,6 +827,9 @@ class Protocol(unittest.TestCase):
         self.assertIn("resume same identity", resumed.stdout)
 
     def test_new_provider_listener_supersedes_old_consumer(self):
+        """A handoff is an explicit act. herald resume takes the mailbox and the
+        incumbent stands down; a plain wait under a different agent name now
+        coexists instead - see the co-listener tests."""
         old = subprocess.Popen(
             [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "15"],
             env=self._env("bob", "claude-work"), cwd=self.root,
@@ -665,7 +838,7 @@ class Protocol(unittest.TestCase):
         try:
             self.wait_for_listener("bob", "claude-work")
             new = subprocess.Popen(
-                [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "15"],
+                [sys.executable, HERALD_PY, "resume", "--timeout", "15"],
                 env=self._env("bob", "copilot-personal"), cwd=self.root,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             self.wait_for_listener("bob", "copilot-personal")
@@ -691,7 +864,7 @@ class Protocol(unittest.TestCase):
         try:
             self.wait_for_listener("bob", "claude-work")
             new = subprocess.Popen(
-                [sys.executable, HERALD_PY, "wait", "--read", "--timeout", "4"],
+                [sys.executable, HERALD_PY, "resume", "--timeout", "4"],
                 env=self._env("bob", "copilot-personal"), cwd=self.root,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             new_out, new_err = new.communicate(timeout=18)

@@ -325,24 +325,52 @@ def register_listener(cfg, mode="general", takeover=False):
         "request_id": "",
     }
     if mode == "general":
-        warn_if_owner_was_live(listener["mailbox"], listener["agent"])
+        # Two tabs working different topics share a mailbox routinely. Only take
+        # ownership from a live listener when it is the same agent name coming
+        # back (a tab restart) or the caller asked to take over (herald resume).
+        # Otherwise register as a co-listener: still live, still eligible for
+        # items addressed to this agent, but the incumbent keeps the mailbox and
+        # the untargeted work that goes with it.
+        # Decide and claim inside one lock. Reading the owner first and writing
+        # after leaves a window where two tabs starting together both see no
+        # owner and both claim the mailbox.
         with state_lock():
-            path = consumer_path(listener["mailbox"])
-            try:
-                current = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
-                current = {}
-            generation = int(current.get("generation", 0))
-            if takeover or current.get("agent") != listener["agent"]:
-                generation += 1
-            listener["generation"] = max(1, generation)
-            atomic_write_json(path, {
-                "mailbox": listener["mailbox"],
-                "agent": listener["agent"],
-                "session_id": listener["session_id"],
-                "generation": listener["generation"],
-                "updated_at": time.time(),
-            })
+            owner = current_consumer(listener["mailbox"])
+            coexist = bool(owner) and owner.get("agent") != listener["agent"] and not takeover
+            listener["owns_mailbox"] = not coexist
+            displaced = owner if (owner and not coexist
+                                  and owner.get("agent") != listener["agent"]) else None
+            if not coexist:
+                path = consumer_path(listener["mailbox"])
+                try:
+                    current = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    current = {}
+                generation = int(current.get("generation", 0))
+                if takeover or current.get("agent") != listener["agent"]:
+                    generation += 1
+                listener["generation"] = max(1, generation)
+                atomic_write_json(path, {
+                    "mailbox": listener["mailbox"],
+                    "agent": listener["agent"],
+                    "session_id": listener["session_id"],
+                    "generation": listener["generation"],
+                    "updated_at": time.time(),
+                })
+        if coexist:
+            print(f"Listening alongside '{owner.get('agent')}' on mailbox "
+                  f"'{listener['mailbox']}'. Items addressed to '{listener['agent']}' "
+                  f"come here; untargeted items stay with the mailbox owner. Use "
+                  f"herald resume to take the mailbox instead.",
+                  file=sys.stderr, flush=True)
+        elif displaced:
+            age = time.time() - displaced.get("heartbeat", 0)
+            print(f"Displaced a live listener on mailbox '{listener['mailbox']}': agent "
+                  f"'{displaced.get('agent')}' ({displaced.get('session_id')}), heartbeat "
+                  f"{age:.0f}s ago. Items meant for that session will now arrive here - "
+                  f"check an item is your work before acting on it. To listen without "
+                  f"displacing it, use your own mailbox (herald mailbox add <name>, then "
+                  f"HERALD_MAILBOX=<name>).", file=sys.stderr, flush=True)
     write_session(listener)
     return listener
 
@@ -370,6 +398,8 @@ def warn_if_owner_was_live(mailbox, agent):
 def consumer_is_current(listener):
     if listener["mode"] != "general":
         return True
+    if not listener.get("owns_mailbox", True):
+        return True          # co-listener: never owned the mailbox, so cannot lose it
     try:
         current = json.loads(consumer_path(listener["mailbox"]).read_text())
     except (OSError, json.JSONDecodeError):
@@ -396,7 +426,12 @@ def active_assignment(item, sessions=None):
     if session.get("mode", "general") == "general":
         consumer = current_consumer(item.get("to_mailbox") or "main", sessions)
         if not consumer or consumer.get("session_id") != session_id:
-            return None
+            # A co-listener does not own the mailbox but is still the right home
+            # for items addressed to its agent name. This escape is only for a
+            # session that never owned the mailbox - an owner that has since been
+            # superseded must release its items so a handoff can pick them up.
+            if session.get("owns_mailbox", True) or item.get("to_agent") != session.get("agent"):
+                return None
     return session
 
 
@@ -591,11 +626,12 @@ class Handler(BaseHTTPRequestHandler):
                             if preferred_session and session_alive(preferred_session, sessions)
                             else None)
                 target_agent = str(item.get("to_agent", ""))[:64]
-                target_listener = _pick_live(sessions, agent=target_agent) if target_agent else None
-                if target_listener and item.get("to_mailbox"):
-                    consumer = current_consumer(destination, sessions)
-                    if not consumer or consumer.get("session_id") != target_listener.get("session_id"):
-                        target_listener = None
+                # An agent name is an address. A live listener under that name gets
+                # the item wherever it is listening, even when another session owns
+                # the mailbox - otherwise two tabs sharing a mailbox each receive the
+                # other's work and neither can tell it apart from its own.
+                target_listener = (_pick_live(sessions, mailbox=destination, agent=target_agent)
+                                   or _pick_live(sessions, agent=target_agent)) if target_agent else None
                 selected = selected or target_listener
                 if not selected and (not item.get("targeted") or item.get("to_mailbox")):
                     selected = current_consumer(destination, sessions) or _pick_live(
@@ -761,11 +797,9 @@ def _route(cfg):
                     atomic_write_json(path, item)
                 continue
             if item.get("targeted") and item.get("to_agent"):
-                chosen = _pick_live(sessions, agent=item["to_agent"])
-                if chosen and item.get("mailbox_targeted"):
-                    consumer = current_consumer(item.get("to_mailbox") or "main", sessions)
-                    if not consumer or consumer.get("session_id") != chosen.get("session_id"):
-                        chosen = None
+                destination = item.get("to_mailbox") or "main"
+                chosen = (_pick_live(sessions, mailbox=destination, agent=item["to_agent"])
+                          or _pick_live(sessions, agent=item["to_agent"]))
                 if chosen:
                     next_session = chosen["session_id"]
                     if item.get("assigned_session") != next_session:
