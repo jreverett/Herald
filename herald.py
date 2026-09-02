@@ -38,6 +38,7 @@ import fcntl
 import json
 import os
 import secrets
+import select
 import signal
 import socket
 import subprocess
@@ -50,7 +51,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -59,6 +60,7 @@ OUTBOX_DIR = HERALD_DIR / "outbox"
 FILES_DIR = HERALD_DIR / "files"
 QUEUE_DIR = HERALD_DIR / "queue"
 ACTIVITY_DIR = HERALD_DIR / "activity"
+WORKING_DIR = HERALD_DIR / "working"
 SESSIONS_DIR = HERALD_DIR / "sessions"
 CONSUMERS_DIR = HERALD_DIR / "consumers"
 FAILED_DIR = HERALD_DIR / "failed"
@@ -71,6 +73,9 @@ FALLBACKS = ("broadcast", "hold", "bounce")
 RETRY_INTERVAL = 45
 HEARTBEAT_INTERVAL = 5
 SESSION_LEASE = 75          # a session with no heartbeat in this long is treated as gone
+WORKING_LEASE = 90          # a working marker with no live session behind it goes stale this fast
+WORKING_ALIVE_LEASE = 600   # its session is alive, so a long stretch between tool calls is not staleness
+HARNESS_COMMS_SKIP = ("sh", "bash", "dash", "zsh", "fish", "env", "python", "python3", "herald")
 TARGET_GIVEUP = 300         # release a targeted item whose target never reappears after this
 SUSPEND_GAP = HEARTBEAT_INTERVAL * 6   # a maintenance tick later than this means the host slept
 TTY_SEARCH_DEPTH = 12
@@ -85,7 +90,7 @@ def load_config():
 
 def ensure_dirs():
     for d in (INBOX_DIR, OUTBOX_DIR, FILES_DIR, QUEUE_DIR, ACTIVITY_DIR,
-              SESSIONS_DIR, CONSUMERS_DIR, FAILED_DIR):
+              WORKING_DIR, SESSIONS_DIR, CONSUMERS_DIR, FAILED_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -142,6 +147,126 @@ def touch_activity(kind):
         (ACTIVITY_DIR / kind).write_text(str(time.time()))
     except OSError:
         pass
+
+
+def harness_pid():
+    """Pid of the agent process that ran this hook, so a marker can be dropped
+    when that session dies rather than only when its lease expires. The hook's
+    own ancestors are an interpreter and the shell that ran it; the first thing
+    above those is the harness."""
+    pid = os.getppid()
+    for _ in range(TTY_SEARCH_DEPTH):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            comm = stat[stat.index("(") + 1:stat.rindex(")")]
+            ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        if comm not in HARNESS_COMMS_SKIP:
+            return pid
+        if ppid <= 1:
+            return None
+        pid = ppid
+    return None
+
+
+def _start_ticks_from_stat(line):
+    """Field 22 of a /proc/<pid>/stat line. Field 2 is the executable name in
+    parentheses, unescaped, and may itself contain spaces and closing parens, so
+    the fields after it can only be found from the last one."""
+    return int(line[line.rindex(")") + 2:].split()[19])
+
+
+def process_start_ticks(pid):
+    """The process's start time in clock ticks since boot, or None. Pids are
+    reused, so this is what makes a recorded pid a stable identity."""
+    try:
+        return _start_ticks_from_stat(Path(f"/proc/{pid}/stat").read_text())
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def boot_id():
+    """This boot's identifier. Start times are counted from boot, so they only
+    compare within one."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def mark_working(key, label="", pid=None):
+    """Record that an agent turn is running right now."""
+    try:
+        ensure_dirs()
+        atomic_write_json(WORKING_DIR / f"{sanitize_filename(key)}.json",
+                          {"key": key, "label": label, "pid": pid,
+                           "pid_started": process_start_ticks(pid) if pid else None,
+                           "boot": boot_id(), "heartbeat": time.time()})
+    except OSError:
+        pass
+
+
+def clear_working(key):
+    try:
+        (WORKING_DIR / f"{sanitize_filename(key)}.json").unlink()
+    except OSError:
+        pass
+
+
+def working_alive(rec, now=None):
+    """Whether a marker still represents a running turn.
+
+    A dead session's clear will never arrive, so its marker goes immediately.
+    A live one gets the long lease: only a tool call refreshes the marker, and a
+    turn can think for minutes without making one. The lease is still bounded so
+    that a clear lost to a broken hook cannot pin the signal on for a session's
+    whole life. The session is identified by pid and start time together, and a
+    pid whose start time has moved is a different process on a reused number."""
+    now = time.time() if now is None else now
+    pid, started = rec.get("pid"), rec.get("pid_started")
+    lease = WORKING_LEASE
+    if isinstance(pid, int):
+        if not is_pid_alive(pid):
+            return False
+        if isinstance(started, int) and rec.get("boot") == boot_id():
+            if process_start_ticks(pid) != started:
+                return False        # a reused number, running something else
+            lease = WORKING_ALIVE_LEASE
+    return now - rec.get("heartbeat", 0) <= lease
+
+
+def working_labels():
+    """Labels of the agent turns still running, most recent first.
+
+    A marker is cleared when its turn ends, so a surviving one means the agent
+    is spending tokens now - not that it holds a claimed item and is waiting on
+    its human. Spent markers are pruned here because a harness that crashes
+    mid-turn never sends its clear."""
+    now = time.time()
+    live = []
+    for path in WORKING_DIR.glob("*.json"):
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not working_alive(rec, now):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        live.append((rec.get("heartbeat", 0), rec.get("label") or rec.get("key") or "?"))
+    return [label for _, label in sorted(live, reverse=True)]
+
+
+def working_summary(labels):
+    """Collapse repeated labels for a status line: several tabs open on one repo
+    share a working directory, and would otherwise read as the same name twice."""
+    counts = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    return [name if n == 1 else f"{name} x{n}" for name, n in counts.items()]
 
 
 def write_status(fields):
@@ -744,9 +869,12 @@ def _maintenance_loop(me, listen, started):
         if now - last > SUSPEND_GAP:
             skip_reap_until = now + SESSION_LEASE   # host likely slept; let sessions re-check in
         last = now
+        working = working_labels()
         write_status({"pid": os.getpid(), "version": __version__, "me": me,
                       "listen": listen, "started": started, "heartbeat": now,
-                      "queued": sum(1 for _ in QUEUE_DIR.glob("*/*.json"))})
+                      "queued": sum(1 for _ in QUEUE_DIR.glob("*/*.json")),
+                      "working": len(working),
+                      "working_agents": working_summary(working)[:4]})
         try:
             cfg = load_config()
         except (SystemExit, OSError, json.JSONDecodeError):
@@ -1157,6 +1285,65 @@ def cmd_result(cfg, args):
     print(f"Sent {args.status} result to {orig['from']} in thread {orig['thread']} (id {result['id']})")
 
 
+def _hook_payload(timeout=0.5):
+    """An editor hook's JSON payload from stdin, or {} when there is none.
+
+    A hook writes its JSON and closes, so anything still open and silent is not
+    a hook - waiting on it would hang the caller instead of stamping."""
+    if sys.stdin.isatty():
+        return {}
+    try:
+        if not select.select([sys.stdin], [], [], timeout)[0]:
+            return {}
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _repo_label(cwd):
+    """Name the repository rather than the directory the hook happened to fire
+    in - an agent's cwd is often a folder deep inside the tree, whose basename
+    says nothing about which work it is."""
+    path = Path(cwd)
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate.name
+    return path.name
+
+
+def _hook_identity(args):
+    """Marker identity for one agent turn, preferring an editor hook's JSON
+    payload on stdin over the environment - a hook runs with neither
+    HERALD_AGENT nor a herald session of its own."""
+    payload = {} if (args.key and args.label) else _hook_payload()
+    key = args.key or payload.get("session_id") or os.environ.get("HERALD_AGENT") or "default"
+    label = args.label or os.environ.get("HERALD_AGENT") or ""
+    if not label:
+        cwd = str(payload.get("cwd") or "")
+        label = _repo_label(cwd) if cwd else str(key)[:8]
+    return str(key), str(label)
+
+
+def cmd_activity(cfg, args):
+    """Record that this agent turn is running, or that it has handed back.
+
+    Prints nothing when it sets a state: Claude Code feeds hook stdout back to
+    the model on some events, so anything written here would cost tokens on
+    every tool call."""
+    if not args.state:
+        labels = working_labels()
+        summary = ", ".join(working_summary(labels))
+        print(f"{len(labels)} working" + (f": {summary}" if labels else ""))
+        return
+    key, label = _hook_identity(args)
+    if args.state == "working":
+        mark_working(key, label, harness_pid())
+    else:
+        clear_working(key)
+
+
 def cmd_status(cfg, args):
     if not STATUS_PATH.exists():
         print("herald daemon: not running (no status file). Start it with: herald daemon")
@@ -1170,8 +1357,10 @@ def cmd_status(cfg, args):
         print(f"herald daemon: STALE - last heartbeat {age:.0f}s ago "
               f"(pid {s.get('pid')} likely dead). Restart with: herald daemon")
         sys.exit(1)
+    working = s.get("working_agents") or []
+    busy = f", working: {', '.join(working)}" if working else ""
     print(f"herald v{s.get('version', '?')} daemon: running - {s.get('me')} on {s.get('listen')} "
-          f"(pid {s.get('pid')}, up since {s.get('started')}, {s.get('queued', 0)} queued)")
+          f"(pid {s.get('pid')}, up since {s.get('started')}, {s.get('queued', 0)} queued{busy})")
 
 
 def queued_count(peer_name):
@@ -1879,6 +2068,12 @@ def main():
 
     sub.add_parser("sessions", help="list agent sessions currently listening")
 
+    sp = sub.add_parser("activity", help="record whether this agent turn is running (editor hook)")
+    sp.add_argument("state", nargs="?", choices=("working", "idle"),
+                    help="omit to report which agent turns are running now")
+    sp.add_argument("--key", default="", help="marker identity (default: the hook's session id)")
+    sp.add_argument("--label", default="", help="name shown in the tray tooltip")
+
     args = p.parse_args()
     identity_commands = {"send", "reply", "result", "read", "close", "reopen",
                          "rm", "wait", "resume", "ask"}
@@ -1907,7 +2102,8 @@ def main():
      "bell": cmd_bell,
      "access": cmd_access, "thread": cmd_thread, "wait": cmd_wait,
      "resume": cmd_resume, "flush": cmd_flush,
-     "status": cmd_status, "sessions": cmd_sessions}[args.cmd](cfg, args)
+     "status": cmd_status, "sessions": cmd_sessions,
+     "activity": cmd_activity}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

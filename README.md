@@ -88,11 +88,51 @@ herald mailbox list|add|remove|default
 herald peer issue|add|list|remove           # issue mints a peer their inbound token
 herald access                               # audit who can reach whom
 herald bell                                 # ring the human's terminal
+herald activity working|idle                # an agent turn started / handed back (harness hook)
+herald activity                             # which turns are running now
 ```
 
 `--timeout` on `ask` is an **idle** timeout: each progress item restarts it. On expiry it exits 2
 and tells the caller to run `herald resume`. Never wire an alert to that exit code - a short timeout
 otherwise reports every idle stretch as a failure.
+
+## Showing when an agent is actually working
+
+The tray icon breathes while an agent turn is running. That signal cannot come from the inbox: an
+item stays `active` from `herald read` until its reply, which includes all the time an agent sits
+waiting for its human to answer a question, so it would report work that is not happening. It comes
+from the harness instead, which knows when a turn starts and ends whether or not the model thinks
+about it.
+
+For Claude Code, in `~/.claude/settings.json`:
+
+| Hook | Command |
+|------|---------|
+| `PostToolUse`, `UserPromptSubmit` | `herald activity working` |
+| `Stop`, `Notification`, `SessionEnd` | `herald activity idle` |
+
+Do not wire `SubagentStop`: a subagent finishing does not end the parent turn.
+
+`Stop` firing as the agent hands back is what makes "waiting on the human" read as idle. The marker
+is keyed by the hook payload's `session_id` and labelled with the repository the agent is in, so
+several tabs count separately and the tooltip can name them; two tabs on one repo collapse to
+`name x2` rather than printing it twice.
+
+Only a tool call refreshes the stamp, and a turn can think for minutes without making one, so the
+marker is held against the session's liveness rather than a short timer. It records the harness that
+ran the hook as its pid and start time together, because a pid alone is reused and an unrelated
+process on a recycled number would read as the original session. A dead session's marker is dropped
+at once, since the clear it owes will never come; a live one whose start time still matches holds for
+10 minutes. That bound matters - it is what stops a clear lost to a broken hook from pinning the
+signal on for a whole session. Where the identity cannot be proved - no pid resolved, or a marker
+left over from an earlier boot - it falls back to a 90-second lease.
+
+Setting a state prints nothing, deliberately: Claude Code feeds hook stdout back to the model on
+`PostToolUse` and `UserPromptSubmit`, so output here would cost tokens on every tool call.
+
+Harnesses without hooks have no automatic signal. There the honest substitute is the statuses herald
+already carries - `herald result --status working` for work in progress, `--status accepted` for
+blocked on the human - and the icon simply never breathes.
 
 ## Setup
 

@@ -2,6 +2,45 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.3
+
+- **The tray icon now shows when an agent is actually working**, as a slow amber
+  breath on the idle shape. With several tabs listening there was no way to tell
+  a session that was mid-turn from one that had finished and gone quiet, so the
+  only signals were the send and receive arrows, each a 4-second flash.
+- The signal is deliberately *not* a claimed inbox item. An item stays `active`
+  from `herald read` until its reply, which includes the whole time an agent sits
+  waiting for its human to answer a question - lighting the icon for that would
+  report work that is not happening. `herald activity working|idle` records a
+  running turn instead, `herald activity` reports what is running, and the daemon
+  republishes the count and the tab names in `status.json` as `working` and
+  `working_agents`.
+- Setting a state prints nothing. Claude Code feeds hook stdout back to the model
+  on `PostToolUse` and `UserPromptSubmit`, so anything written there would cost
+  tokens on every tool call.
+- Wire it to the harness rather than to the agent: `PostToolUse` and
+  `UserPromptSubmit` stamp `working`, and `Stop`, `Notification` and `SessionEnd`
+  clear it. `Stop` firing as the agent hands back is what makes "waiting on the
+  human" read as idle. `SubagentStop` must not clear it - a subagent finishing
+  does not end the parent turn.
+- **A marker is held against the session's own liveness, not a short timer.** Only
+  a tool call refreshes the stamp, so a turn that thought for more than 90 seconds
+  without calling one used to decay and read as idle mid-work. The stamp now
+  records the harness that ran the hook, as its pid **and** its start time, since a
+  pid on its own is reused and an unrelated process on a recycled number would
+  otherwise read as the original session. A dead session's marker goes immediately,
+  because the clear it owes will never arrive; a live one whose start time still
+  matches holds for 10 minutes. Start times count from boot, so the boot id is
+  recorded too and a marker from an earlier boot gets only the short lease. The long lease is still bounded so that a clear lost to a broken
+  hook cannot pin the signal on for a whole session.
+- Rejected, with the measurement: driving the signal from the transcript file's
+  mtime. A peer session reasoned for over two minutes with no tool call and its
+  `.jsonl` took no model output at all in that window - the only writes were queue
+  bookkeeping - so mtime tracks message boundaries, which is the granularity the
+  stamps already have. It also fails in the wrong direction: a session that
+  crashed seconds ago has a fresh mtime and would read as alive.
+- Traffic still wins over the breath: an arrow is a moment, the breath is a state.
+
 ## 0.9.2
 
 - **The tray icon's right-click menu now lists the inbox**, with **Close

@@ -8,7 +8,14 @@ heartbeat and activity markers the daemon writes to `~/.herald`.
 | up-chevrons `⌃⌃` (foreground colour) | running, idle |
 | right-chevrons `››` (blue) | sending to a peer |
 | left-chevrons `‹‹` (green) | receiving from a peer |
+| up-chevrons breathing (amber) | an agent turn is running |
 | down-chevrons (grey) | daemon down / heartbeat stale |
+
+The breath keeps idle's shape because a running turn is a state, not a
+direction, and traffic takes precedence over it. It reflects an agent actually
+spending tokens, not a claimed inbox item - a session waiting on a human answer
+reads as idle. See the `activity` section of the main README for the hooks that
+drive it; without them the icon simply never breathes.
 
 Direction is the primary signal, colour secondary, so the states stay
 distinguishable in greyscale (colour-blind safe). Design: `icons/src/DESIGN.md`

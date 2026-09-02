@@ -134,6 +134,164 @@ class PureFunctions(unittest.TestCase):
                 os.environ["HERALD_MAILBOX"] = saved
 
 
+class WorkingMarkers(unittest.TestCase):
+    """The tray's "an agent is working" signal. It must mean a turn is running,
+    not that an item is claimed - a claimed item waiting on its human is idle."""
+
+    def tearDown(self):
+        for path in herald.WORKING_DIR.glob("*.json"):
+            path.unlink()
+
+    def test_mark_and_clear_a_turn(self):
+        herald.mark_working("session-a", "studio")
+        herald.mark_working("session-b", "azuredevops")
+
+        self.assertEqual(sorted(herald.working_labels()), ["azuredevops", "studio"])
+
+        herald.clear_working("session-a")
+
+        self.assertEqual(herald.working_labels(), ["azuredevops"])
+
+    def test_a_dead_session_drops_its_marker_even_when_freshly_stamped(self):
+        # The clear comes from a Stop hook, which a crashed harness never runs.
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        herald.mark_working("crashed-tab", "studio", pid=dead.pid)
+
+        self.assertEqual(herald.working_labels(), [])
+        self.assertFalse((herald.WORKING_DIR / "crashed-tab.json").exists())
+
+    def test_a_live_session_keeps_its_marker_between_tool_calls(self):
+        # Only a tool call refreshes the stamp, and a turn can think for minutes
+        # without making one, so the short lease must not apply to a live session.
+        herald.mark_working("thinking-tab", "studio", pid=os.getpid())
+        path = herald.WORKING_DIR / "thinking-tab.json"
+        rec = json.loads(path.read_text())
+        rec["heartbeat"] = time.time() - herald.WORKING_LEASE - 30
+        path.write_text(json.dumps(rec))
+
+        self.assertEqual(herald.working_labels(), ["studio"])
+
+        rec["heartbeat"] = time.time() - herald.WORKING_ALIVE_LEASE - 1
+        path.write_text(json.dumps(rec))
+
+        self.assertEqual(herald.working_labels(), [],
+                         "the long lease is still bounded, so a lost clear cannot pin the signal on")
+
+    def test_start_ticks_survive_a_process_name_with_spaces_and_parens(self):
+        # comm is unescaped, so a forward scan for ")" shifts every later field
+        # and yields a number that will never match again - the marker would then
+        # be dropped for a live session, and flap for no visible reason.
+        tail = " ".join(["S"] + [str(n) for n in range(1, 19)] + ["987654"])
+
+        self.assertEqual(herald._start_ticks_from_stat(f"1234 (node (worker)) {tail}"), 987654)
+        self.assertEqual(herald._start_ticks_from_stat(f"1234 (claude) {tail}"), 987654)
+        self.assertEqual(herald._start_ticks_from_stat(f"1234 (my app) {tail}"), 987654)
+
+    def test_a_recycled_pid_is_not_mistaken_for_the_session(self):
+        # A pid alone is reused, so "the pid still exists" would report an
+        # unrelated process as the original session - the failure direction that
+        # ruled out driving this from transcript mtime.
+        herald.mark_working("recycled-tab", "studio", pid=os.getpid())
+        path = herald.WORKING_DIR / "recycled-tab.json"
+        rec = json.loads(path.read_text())
+        self.assertIsInstance(rec["pid_started"], int)
+        rec["pid_started"] += 1                       # same pid, different process
+        rec["heartbeat"] = time.time() - herald.WORKING_LEASE - 30
+        path.write_text(json.dumps(rec))
+
+        self.assertEqual(herald.working_labels(), [])
+
+    def test_a_marker_from_a_previous_boot_is_not_trusted(self):
+        # Start times count from boot, so they only compare within one.
+        herald.mark_working("rebooted-tab", "studio", pid=os.getpid())
+        path = herald.WORKING_DIR / "rebooted-tab.json"
+        rec = json.loads(path.read_text())
+        rec["boot"] = "00000000-0000-0000-0000-000000000000"
+        rec["heartbeat"] = time.time() - herald.WORKING_LEASE - 30
+        path.write_text(json.dumps(rec))
+
+        self.assertEqual(herald.working_labels(), [])
+
+    def test_harness_pid_skips_the_hooks_own_interpreter_and_shell(self):
+        pid = herald.harness_pid()
+        if pid is None:
+            self.skipTest("no non-shell ancestor to attribute the turn to")
+        self.assertTrue(herald.is_pid_alive(pid))
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        comm = stat[stat.index("(") + 1:stat.rindex(")")]
+        self.assertNotIn(comm, herald.HARNESS_COMMS_SKIP)
+
+    def test_a_marker_older_than_the_lease_is_pruned(self):
+        herald.mark_working("crashed", "gone")
+        path = herald.WORKING_DIR / "crashed.json"
+        rec = json.loads(path.read_text())
+        rec["heartbeat"] = time.time() - herald.WORKING_LEASE - 1
+        path.write_text(json.dumps(rec))
+
+        self.assertEqual(herald.working_labels(), [])
+        self.assertFalse(path.exists(), "a stale marker must not survive the read that ignored it")
+
+    def test_clearing_an_unknown_key_is_not_an_error(self):
+        herald.clear_working("never-stamped")
+
+    def test_label_names_the_repository_not_the_subfolder(self):
+        root = tempfile.mkdtemp(prefix="herald-repo-")
+        repo = os.path.join(root, "azuredevops")
+        deep = os.path.join(repo, "OSS-Vault", "People")
+        os.makedirs(os.path.join(repo, ".git"))
+        os.makedirs(deep)
+
+        self.assertEqual(herald._repo_label(deep), "azuredevops")
+        # outside a repository the directory's own name is all there is
+        self.assertEqual(herald._repo_label(root), os.path.basename(root))
+
+    def test_repeated_labels_collapse_with_a_count(self):
+        # Two tabs on one repo share a working directory; the tooltip must not
+        # print the same name twice as though they were different places.
+        self.assertEqual(herald.working_summary(["studio", "azuredevops", "studio"]),
+                         ["studio x2", "azuredevops"])
+        self.assertEqual(herald.working_summary([]), [])
+
+    def test_activity_does_not_wait_on_an_open_but_silent_stdin(self):
+        # A hook writes its JSON and closes. Anything else - a harness that
+        # leaves the pipe open, a shell wiring - must not hang the stamp.
+        home = tempfile.mkdtemp(prefix="herald-activity-")
+        with open(os.path.join(home, "config.json"), "w") as f:
+            json.dump({"me": "tester", "listen": {"host": "127.0.0.1", "port": free_port()}}, f)
+        env = dict(os.environ, HERALD_DIR=home)
+        proc = subprocess.Popen([sys.executable, HERALD_PY, "activity", "working"], env=env,
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        try:
+            self.assertEqual(proc.wait(timeout=10), 0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.fail("herald activity blocked on stdin")
+
+    def test_activity_takes_its_identity_from_a_hook_payload(self):
+        home = tempfile.mkdtemp(prefix="herald-activity-")
+        with open(os.path.join(home, "config.json"), "w") as f:
+            json.dump({"me": "tester", "listen": {"host": "127.0.0.1", "port": free_port()}}, f)
+        env = dict(os.environ, HERALD_DIR=home)
+        env.pop("HERALD_AGENT", None)
+
+        def run(*args, payload=""):
+            return subprocess.run([sys.executable, HERALD_PY, "activity", *args], env=env,
+                                  input=payload, capture_output=True, text=True, timeout=20)
+
+        stamp = run("working", payload=json.dumps(
+            {"session_id": "abc123", "cwd": "/mnt/c/code/azuredevops"}))
+        self.assertEqual(stamp.returncode, 0, stamp.stderr)
+        # Claude Code feeds hook stdout back to the model, so silence is the contract.
+        self.assertEqual(stamp.stdout, "")
+        self.assertEqual(run().stdout.strip(), "1 working: azuredevops")
+
+        run("idle", payload=json.dumps({"session_id": "abc123"}))
+
+        self.assertEqual(run().stdout.strip(), "0 working")
+
+
 class Protocol(unittest.TestCase):
     """Two loopback daemons (alice + bob) driven through the CLI."""
 
@@ -1225,6 +1383,35 @@ class Protocol(unittest.TestCase):
         self.assertIsNotNone(item)
         self.assertFalse(item.get("broadcast"))
         self.assertEqual(item.get("to_agent"), "bob-tab")   # handed to the one live session
+
+    def test_daemon_publishes_working_turns_in_status(self):
+        # The tray reads status.json only, so a marker the daemon never republishes
+        # is invisible however correct the store is.
+        self.cli("alice", "activity", "working", "--key", "tab-1", "--label", "studio")
+        deadline = time.time() + herald.HEARTBEAT_INTERVAL * 3
+        status = {}
+        while time.time() < deadline:
+            try:
+                status = self._load(os.path.join(self.homes["alice"], "status.json"))
+            except (OSError, ValueError):
+                status = {}
+            if status.get("working"):
+                break
+            time.sleep(0.2)
+
+        self.assertEqual(status.get("working"), 1)
+        self.assertEqual(status.get("working_agents"), ["studio"])
+
+        self.cli("alice", "activity", "idle", "--key", "tab-1")
+        deadline = time.time() + herald.HEARTBEAT_INTERVAL * 3
+        while time.time() < deadline:
+            status = self._load(os.path.join(self.homes["alice"], "status.json"))
+            if not status.get("working"):
+                break
+            time.sleep(0.2)
+
+        self.assertEqual(status.get("working"), 0)
+        self.assertEqual(status.get("working_agents"), [])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ is the primary signal; colour is secondary and differs per taskbar theme, so we
 emit a full set for a dark taskbar and a light one. NotifyIcon can't shell-tint,
 so the tray picks the matching set at runtime.
 """
+import math
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -18,6 +19,7 @@ MASTER = 256
 ICO_SIZES = [(16, 16), (20, 20), (24, 24), (32, 32), (48, 48), (256, 256)]
 FRAME_SIZES = [(16, 16), (20, 20), (24, 24), (32, 32), (48, 48)]
 FRAMES = 8           # animation frames for the send/recv flow
+PULSE_FLOOR = 0.3    # dimmest point of the working breath, as a fraction of full alpha
 FLOW_PERIOD = 15.0   # unit spacing between marching chevrons
 FLOW_FADE = 8.0      # unit width of the edge fade
 
@@ -27,12 +29,17 @@ STATES = {
     "send":    ([[(4, 10), (11, 16), (4, 22)], [(19, 10), (26, 16), (19, 22)]], 4.0),
     "recv":    ([[(13, 10), (6, 16), (13, 22)], [(28, 10), (21, 16), (28, 22)]], 4.0),
     "offline": ([[(2, 13), (8, 20), (14, 13)], [(18, 13), (24, 20), (30, 13)]], 3.5),
+    # working keeps idle's geometry and only breathes: an agent turn is running,
+    # which is not a direction and must not read as traffic.
+    "work":    ([[(2, 20), (8, 13), (14, 20)], [(18, 20), (24, 13), (30, 20)]], 4.0),
 }
 
 # per taskbar theme: idle uses the bar's foreground; the rest per DESIGN.md.
 COLOURS = {
-    "dark":  {"idle": "#FFFFFF", "send": "#5B96EA", "recv": "#5FB383", "offline": "#7D838B"},
-    "light": {"idle": "#1A1A1A", "send": "#2F6FD0", "recv": "#2F7D4F", "offline": "#8A8376"},
+    "dark":  {"idle": "#FFFFFF", "send": "#5B96EA", "recv": "#5FB383", "offline": "#7D838B",
+              "work": "#E8A33D"},
+    "light": {"idle": "#1A1A1A", "send": "#2F6FD0", "recv": "#2F7D4F", "offline": "#8A8376",
+              "work": "#A85F00"},
 }
 
 
@@ -86,6 +93,14 @@ def draw_flow_frame(pointing_right, colour, phase):
     return img.resize((MASTER, MASTER), Image.LANCZOS)
 
 
+def draw_pulse_frame(paths, stroke_units, colour, phase):
+    """One frame of the working breath: idle's shape fading in and out."""
+    img = draw_state(paths, stroke_units, colour)
+    alpha = PULSE_FLOOR + (1 - PULSE_FLOOR) * (0.5 - 0.5 * math.cos(2 * math.pi * phase))
+    img.putalpha(img.getchannel("A").point(lambda v: int(v * alpha)))
+    return img
+
+
 def main():
     for theme, palette in COLOURS.items():
         outdir = OUT / theme
@@ -97,8 +112,12 @@ def main():
             for i in range(FRAMES):
                 frame = draw_flow_frame(right, palette[state], i / FRAMES)
                 frame.save(outdir / f"{state}_{i}.ico", sizes=FRAME_SIZES)
+        paths, stroke = STATES["work"]
+        for i in range(FRAMES):
+            frame = draw_pulse_frame(paths, stroke, palette["work"], i / FRAMES)
+            frame.save(outdir / f"work_{i}.ico", sizes=FRAME_SIZES)
     print(f"wrote dark/ and light/ sets ({', '.join(STATES)}) "
-          f"plus {FRAMES}-frame send/recv flows to", OUT)
+          f"plus {FRAMES}-frame send/recv flows and the working breath to", OUT)
 
 
 if __name__ == "__main__":

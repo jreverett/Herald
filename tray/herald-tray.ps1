@@ -1,7 +1,7 @@
 # herald tray icon - shows daemon state in the Windows notification area, and
 # lists the inbox so an item can be closed or deleted without a terminal.
 #   green  = running (idle)   blue up-arrow = sending   purple down-arrow = receiving
-#   grey X = daemon down / heartbeat stale
+#   amber breathing = an agent turn is running   grey X = daemon down / heartbeat stale
 # Reads ~/.herald/status.json and ~/.herald/activity/{send,recv} from WSL over \\wsl$.
 # Run hidden:  powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File herald-tray.ps1
 
@@ -10,6 +10,7 @@ param(
     [string]$DaemonCmd = "if systemctl --user cat herald-daemon.service >/dev/null 2>&1; then systemctl --user restart herald-daemon; else pkill -f '[h]erald.py daemon' 2>/dev/null; setsid `"`$HOME/.local/bin/herald`" daemon >/dev/null 2>&1 </dev/null & disown; fi",  # systemd if present, else the PATH wrapper - machine-agnostic
     [int]$HeartbeatTimeout = 15,         # seconds without a heartbeat => daemon considered down
     [double]$ActiveWindow = 4.0,         # seconds an arrow lingers after a send/recv event
+    [int]$PulseEvery = 4,                # ticks per working-breath frame; slower than the arrows
     [string]$MenuAgent = "herald-tray",  # HERALD_AGENT for close/rm issued from this menu
     [int]$MaxInboxItems = 15             # menu entries before the list is truncated
 )
@@ -57,12 +58,12 @@ Set-HeraldPaths $HeraldDir
 
 $script:FrameCount = 8
 $script:icons = @{ dark = @{}; light = @{} }
-$script:frames = @{ dark = @{ send = @(); recv = @() }; light = @{ send = @(); recv = @() } }
+$script:frames = @{ dark = @{ send = @(); recv = @(); work = @() }; light = @{ send = @(); recv = @(); work = @() } }
 foreach ($theme in 'dark', 'light') {
-    foreach ($s in 'idle', 'send', 'recv', 'offline') {
+    foreach ($s in 'idle', 'send', 'recv', 'offline', 'work') {
         $script:icons[$theme][$s] = New-Object System.Drawing.Icon (Join-Path $iconDir "$theme\$s.ico")
     }
-    foreach ($s in 'send', 'recv') {
+    foreach ($s in 'send', 'recv', 'work') {
         $script:frames[$theme][$s] = 0..($script:FrameCount - 1) | ForEach-Object {
             New-Object System.Drawing.Icon (Join-Path $iconDir "$theme\${s}_$_.ico")
         }
@@ -104,13 +105,15 @@ function Poll-State {
     }
     $send = Read-Marker $script:sendMarker
     $recv = Read-Marker $script:recvMarker
-    $script:state = 'idle'
+    # Traffic wins over the working breath: an arrow is a moment, the breath is a state.
+    $script:state = if ($status.working -gt 0) { 'work' } else { 'idle' }
     if (($now - $send) -lt $ActiveWindow -and $send -ge $recv) { $script:state = 'send' }
     elseif (($now - $recv) -lt $ActiveWindow) { $script:state = 'recv' }
 
-    $verb = @{ idle = 'running'; send = 'sending'; recv = 'receiving' }[$script:state]
+    $verb = @{ idle = 'running'; send = 'sending'; recv = 'receiving'; work = 'working' }[$script:state]
     $q = if ($status.queued) { " | $($status.queued) queued" } else { "" }
-    $text = "herald v$($status.version): $verb - $($status.me) on $($status.listen)$q"
+    $who = if ($status.working -gt 0) { " | working: $($status.working_agents -join ', ')" } else { "" }
+    $text = "herald v$($status.version): $verb - $($status.me) on $($status.listen)$q$who"
     if ($text.Length -gt 127) { $text = $text.Substring(0, 127) }
     $script:ni.Text = $text
 }
@@ -125,6 +128,11 @@ function Update-Tray {
     if ($script:state -eq 'send' -or $script:state -eq 'recv') {
         $frames = $script:frames[(Get-BarTheme)][$script:state]
         $script:ni.Icon = $frames[$script:animIdx % $script:FrameCount]
+        $script:animIdx++
+    }
+    elseif ($script:state -eq 'work') {
+        $frames = $script:frames[(Get-BarTheme)]['work']
+        $script:ni.Icon = $frames[[math]::Floor($script:animIdx / $PulseEvery) % $script:FrameCount]
         $script:animIdx++
     }
     else {
