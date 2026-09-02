@@ -2,6 +2,21 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.7
+
+- **The tray said something was waiting on you but never which item.** The
+  tooltip carries a count ("1 unread") and the Inbox menu listed every open item
+  in the same colour, so with four sessions running the only way to find the one
+  holding the icon red was to read the inbox by hand. `herald inbox --json` now
+  returns `blocked` and `blocked_reason` per item, the menu paints those rows red
+  and puts the reason on hover, and the parent entry reads "Inbox (N waiting on
+  you)". Blocked rows sort first so the menu's fifteen-item truncation cannot cut
+  the one being counted.
+- The rule behind the red state is now one function, `blocking_reason`, shared by
+  the daemon's count and the listing. A second copy in the PowerShell menu would
+  have drifted and then lied during exactly the debugging the menu is for.
+  `herald inbox` prints the same reason under a blocked row.
+
 ## 0.9.6
 
 - **Fixed: a progress reply erased the flag that says a human is holding an item**,

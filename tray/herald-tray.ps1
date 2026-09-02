@@ -3,6 +3,7 @@
 #   green  = running (idle)   blue up-arrow = sending   purple down-arrow = receiving
 #   amber breathing = an agent turn is running   red converging = a session needs you
 #   grey X = daemon down / heartbeat stale
+# The Inbox menu paints the items behind a red icon red, with the reason on hover.
 # Reads ~/.herald/status.json and ~/.herald/activity/{send,recv} from WSL over \\wsl$.
 # Run hidden:  powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File herald-tray.ps1
 
@@ -168,6 +169,11 @@ function Update-Tray {
 
 $script:idPattern = '^[0-9a-zA-Z._-]+$'
 
+# WinForms menus render in the system light colours whatever the taskbar theme
+# is, so one dark red serves both. Color.Empty puts a row back on the default.
+$script:BlockedColour = [System.Drawing.Color]::FromArgb(176, 0, 32)
+$script:NormalColour = [System.Drawing.Color]::Empty
+
 function Invoke-Herald($heraldArgs) {
     # Returns @{ ok = bool; out = string }. Runs through a login shell so herald
     # is on PATH the same way it is for a human.
@@ -228,8 +234,14 @@ function Format-InboxLabel($item) {
     return $label.Replace("&", "&&")
 }
 
+# The red icon says something is waiting on the human but not which item, and
+# with fifteen rows in the menu the count alone does not answer that. herald
+# decides which rows are the reason - see blocking_reason in herald.py - and
+# the menu only paints what it is told, so the two can never disagree.
 function Build-InboxMenu {
     $script:miInbox.DropDownItems.Clear()
+    $script:miInbox.Text = "Inbox"
+    $script:miInbox.ForeColor = $script:NormalColour
     $listing = Get-Inbox
     if (-not $listing.ok) {
         $miErr = $script:miInbox.DropDownItems.Add("Could not read the inbox")
@@ -241,9 +253,23 @@ function Build-InboxMenu {
         $script:miInbox.DropDownItems.Add("(nothing open)").Enabled = $false
         return
     }
-    foreach ($item in ($listing.items | Select-Object -First $MaxInboxItems)) {
+    $blocked = @($listing.items | Where-Object { $_.blocked }).Count
+    if ($blocked -gt 0) {
+        $script:miInbox.Text = "Inbox ($blocked waiting on you)"
+        $script:miInbox.ForeColor = $script:BlockedColour
+    }
+    # Blocked rows come first: the menu truncates at $MaxInboxItems, and an item
+    # the parent is counting must not be one of the rows that got cut. Two Where
+    # passes rather than Sort-Object, which is not stable on Windows PowerShell.
+    $ordered = @($listing.items | Where-Object { $_.blocked }) +
+               @($listing.items | Where-Object { -not $_.blocked })
+    foreach ($item in ($ordered | Select-Object -First $MaxInboxItems)) {
         $entry = $script:miInbox.DropDownItems.Add((Format-InboxLabel $item))
         $entry.ToolTipText = "$($item.id)`nthread $($item.thread)`nreceived $($item.received)"
+        if ($item.blocked) {
+            $entry.ForeColor = $script:BlockedColour
+            $entry.ToolTipText = "$($entry.ToolTipText)`n`nwaiting on you: $($item.blocked_reason)"
+        }
 
         $miClose = $entry.DropDownItems.Add("Close (reversible)")
         $miClose.Tag = $item

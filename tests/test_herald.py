@@ -1490,6 +1490,34 @@ class Protocol(unittest.TestCase):
 
         self.assertEqual(status.get("blocked_agents"), ["1 unread"])
 
+    def test_the_inbox_listing_marks_which_items_hold_the_tray_red(self):
+        # The tooltip counts them but names none, so with a menu full of items the
+        # human still cannot see which one is waiting. herald marks the rows; the
+        # tray only paints them, so the count and the marks cannot disagree.
+        self.cli("alice", "send", "bob", "-m", "unattended", agent="alice-1")
+        self.assertIsNotNone(self.wait_for_inbox("bob", lambda i: i["text"] == "unattended"))
+        self.cli("alice", "send", "bob", "-t", "restart the service", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i["text"] == "restart the service")
+        self.cli("bob", "read", task["id"], agent="bob-w")
+
+        def listed(text):
+            r = self.cli("bob", "inbox", "--json", agent="bob-w")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return [i for i in json.loads(r.stdout) if i["preview"].startswith(text)][0]
+
+        unread = listed("unattended")
+        self.assertTrue(unread["blocked"], "nothing is listening for it")
+        self.assertIn("listening", unread["blocked_reason"])
+
+        self.assertFalse(listed("restart the service")["blocked"],
+                         "a claimed task is the agent's work, not the human's")
+
+        self.cli("bob", "result", task["id"], "--status", "accepted",
+                 "-m", "Asking my human.", agent="bob-w")
+        held = listed("restart the service")
+        self.assertTrue(held["blocked"], "accepted promises an answer from the human")
+        self.assertIn("accepted", held["blocked_reason"])
+
     def test_daemon_publishes_working_turns_in_status(self):
         # The tray reads status.json only, so a marker the daemon never republishes
         # is invisible however correct the store is. A turn counts as herald's work

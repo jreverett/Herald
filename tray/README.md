@@ -49,6 +49,15 @@ status balloon.
 The **Inbox** submenu lists open items and offers two actions on each, which is
 usually quicker than a terminal when you are debugging routing.
 
+When the icon is red, the items that are the reason are red too, the parent
+entry reads **Inbox (N waiting on you)**, and hovering a red row gives the
+reason - an `accepted` task that owes an answer, or an item on a mailbox nothing
+is listening to. They are listed first, so the 15-item cap cannot hide one that
+the count includes. Which rows those are is decided by herald itself
+(`blocking_reason`, returned as `blocked` and `blocked_reason` by
+`herald inbox --json`); the menu only paints what it is told, so the tooltip
+count and the marked rows cannot disagree.
+
 - **Close (reversible)** runs `herald close`. The item leaves the list, the
   record is kept as history, and `herald reopen` puts it back.
 - **Delete permanently...** runs `herald rm` behind a confirmation box. The

@@ -51,7 +51,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -280,6 +280,32 @@ def herald_working_pids():
     return pids
 
 
+BLOCK_ACCEPTED = "accepted"
+BLOCK_UNREAD = "unread"
+BLOCK_REASONS = {
+    BLOCK_ACCEPTED: "you accepted this task and it still owes an answer",
+    BLOCK_UNREAD: "nothing is listening on this mailbox, so it sits unread",
+}
+
+
+def listening_mailboxes():
+    return {s.get("mailbox", "main") for s in live_sessions()}
+
+
+def blocking_reason(item, listening):
+    """Which of the two red-state cases this item is, or "" if it is neither.
+
+    The count in the tooltip and the rows a listing marks have to agree, so the
+    rule lives here once and both read it. A second copy in the menu would drift
+    and then lie during exactly the debugging the menu is for."""
+    state = item_state(item)
+    if item.get("acked_status") == "accepted" and state == "active":
+        return BLOCK_ACCEPTED
+    if state == "pending" and item.get("to_mailbox", "main") not in listening:
+        return BLOCK_UNREAD
+    return ""
+
+
 def awaiting_human():
     """Herald work that needs the human, for the tray's red state.
 
@@ -287,17 +313,17 @@ def awaiting_human():
     session is doing: a task this side answered 'accepted', which promises an
     answer once the human decides, and an item on a mailbox nothing is listening
     to, which will sit unread until someone looks."""
-    listening = {s.get("mailbox", "main") for s in live_sessions()}
+    listening = listening_mailboxes()
     accepted, unread = [], 0
     for path in INBOX_DIR.glob("*.json"):
         try:
             item = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        state = item_state(item)
-        if item.get("acked_status") == "accepted" and state == "active":
+        reason = blocking_reason(item, listening)
+        if reason == BLOCK_ACCEPTED:
             accepted.append(f"{item.get('from') or '?'}'s task")
-        elif state == "pending" and item.get("to_mailbox", "main") not in listening:
+        elif reason == BLOCK_UNREAD:
             unread += 1
     return accepted + ([f"{unread} unread"] if unread else [])
 
@@ -1580,10 +1606,17 @@ def _show_item(item, out_dir=None):
     _write_files(item, out_dir)
 
 
-def inbox_summary(item):
+def inbox_summary(item, listening=None):
     """The fields a listing needs, without the text body or file contents - so a
     caller rendering a menu does not have to reimplement item_state or carry
-    megabytes of attachment through a pipe."""
+    megabytes of attachment through a pipe.
+
+    `blocked` says this item is one of the reasons the tray is red, and
+    `blocked_reason` says which, so a menu can mark the row instead of leaving
+    the human to work out which of several items the count meant."""
+    if listening is None:
+        listening = listening_mailboxes()
+    reason = blocking_reason(item, listening)
     return {
         "id": item["id"],
         "kind": item.get("kind", ""),
@@ -1598,6 +1631,8 @@ def inbox_summary(item):
         "claimed_by": item.get("claimed_by", ""),
         "files": len(item.get("files", [])),
         "preview": item.get("text", "")[:120].replace("\n", " "),
+        "blocked": bool(reason),
+        "blocked_reason": BLOCK_REASONS.get(reason, ""),
     }
 
 
@@ -1614,14 +1649,18 @@ def cmd_inbox(cfg, args):
         items = [i for i in items if _item_matches_mailbox(
             i, mailbox_name(cfg), agent_name())]
     if args.json:
-        print(json.dumps([inbox_summary(i) for i in items]))
+        listening = listening_mailboxes()
+        print(json.dumps([inbox_summary(i, listening) for i in items]))
         return
     if not items:
         print("No matching inbox items")
         return
+    listening = listening_mailboxes()
     for i in items:
         flag = " " if i.get("claimed_by") else "*"
-        print(f"{flag} {summarise(i, 'in')}")
+        reason = blocking_reason(i, listening)
+        why = f"\n    waiting on you: {BLOCK_REASONS[reason]}" if reason else ""
+        print(f"{flag} {summarise(i, 'in')}{why}")
 
 
 def cmd_read(cfg, args):
