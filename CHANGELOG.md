@@ -2,6 +2,30 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.5
+
+- **The installer now wires the tray's activity hooks itself**, for every Claude
+  Code and Codex profile it finds, so a fresh install gets the amber state
+  without anyone reading the README and editing JSON. Codex uses the same event
+  names and the same payload fields as Claude Code, so `herald activity` needed
+  no change to work there; only the wiring was missing.
+- Merged, never overwritten: `~/.claude/settings.json` and `~/.codex/hooks.json`
+  are shared with whatever else the user has hooked up, and on one machine here
+  the Codex file already held three Hindsight hooks. Entries are matched by their
+  command, so re-running the installer adds nothing and changes nothing.
+- Codex only reads `hooks.json` when `[features] hooks = true`, so the installer
+  sets that in `config.toml` if it is missing. Codex then skips any hook it has
+  not been trusted with, silently, recording the trust as a hash per hook in
+  `config.toml` - observed here, where a `codex exec` run executed the three
+  already-trusted hooks and ignored the four new ones without a word. The
+  installer says to start Codex once and approve the prompt; nothing pre-trusts a
+  hook on the user's behalf.
+- `Notification` is deliberately not wired. It fires for a session sitting at an
+  empty prompt as well as for a permission prompt, and neither is herald's work.
+  Codex does not emit it at all.
+- The hook command is the absolute path to the `herald` wrapper where one exists,
+  because a hook does not run through a login shell and cannot assume PATH.
+
 ## 0.9.4
 
 - **The tray icon turns red when herald itself is waiting on you**, drawn as

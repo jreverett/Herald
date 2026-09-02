@@ -62,7 +62,8 @@ banner "herald setup - agent-to-agent messaging" \
        "This installer will:" \
        "  1. Install Tailscale (private mesh VPN) and join your tailnet" \
        "  2. Write ~/.herald/config.json and put 'herald' on your PATH" \
-       "  3. Teach your agents the herald protocol (skill / instructions)" \
+       "  3. Teach your agents the herald protocol (skill / instructions)," \
+       "     and wire the tray's activity hooks into Claude Code and Codex" \
        "  4. Start the herald receiver daemon" \
        "  5. (On Windows) Add a system-tray status icon" \
        "" \
@@ -182,6 +183,11 @@ for d in $skill_dirs; do
   ln -sfn "$REPO_DIR/skill" "$d/herald"
   echo "Skill installed: $d/herald"
 done
+# The tray shows amber while an agent works on herald's own work, which needs a
+# turn-start signal. Both editors emit one as a hook, so it does not depend on
+# the agent reporting anything. Existing hooks from other tools are kept.
+python3 "$REPO_DIR/install_hooks.py" || echo "Could not wire the tray activity hooks - see install_hooks.py"
+
 for f in "$HOME/.codex/AGENTS.md" "$HOME/.copilot/copilot-instructions.md"; do
   if [ -f "$f" ] && ! grep -q "herald agent protocol pointer" "$f"; then
     printf '\n# herald agent protocol pointer\nFor messaging other people'"'"'s agents (herald), follow %s/skill/SKILL.md\n' "$REPO_DIR" >> "$f"

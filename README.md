@@ -104,14 +104,24 @@ waiting for its human to answer a question, so it would report work that is not 
 from the harness instead, which knows when a turn starts and ends whether or not the model thinks
 about it.
 
-For Claude Code, in `~/.claude/settings.json`:
+The installer wires this for every Claude Code and Codex profile it finds, merging into
+`~/.claude/settings.json` and `~/.codex/hooks.json` rather than replacing them, so nothing needs
+doing by hand. `python3 install_hooks.py` re-runs just that step. Codex additionally needs
+`[features] hooks = true` in its `config.toml`, which the installer sets. Codex then **skips any
+hook it has not been trusted with**, recording the trust as a hash per hook in `config.toml`, so
+start Codex once and approve the prompt - until then a Codex turn raises nothing and the skip is
+silent.
+
+Both editors use the same event names and the same payload fields:
 
 | Hook | Command |
 |------|---------|
 | `PostToolUse`, `UserPromptSubmit` | `herald activity working` |
-| `Stop`, `Notification`, `SessionEnd` | `herald activity idle` |
+| `Stop`, `SessionEnd` | `herald activity idle` |
 
-Do not wire `SubagentStop`: a subagent finishing does not end the parent turn.
+`Notification` is not wired: it fires for a session sitting at an empty prompt as well as for a
+permission prompt, and neither is herald's work. Nor is `SubagentStop` - a subagent finishing does
+not end the parent turn.
 
 `Stop` firing as the agent hands back is what makes "waiting on the human" read as idle. The marker
 is keyed by the hook payload's `session_id` and labelled with the repository the agent is in, so
