@@ -1324,6 +1324,27 @@ def _show_item(item, out_dir=None):
     _write_files(item, out_dir)
 
 
+def inbox_summary(item):
+    """The fields a listing needs, without the text body or file contents - so a
+    caller rendering a menu does not have to reimplement item_state or carry
+    megabytes of attachment through a pipe."""
+    return {
+        "id": item["id"],
+        "kind": item.get("kind", ""),
+        "state": item_state(item),
+        "status": item.get("status", ""),
+        "from": item.get("from", ""),
+        "from_agent": item.get("from_agent", ""),
+        "to_agent": item.get("to_agent", ""),
+        "to_mailbox": item.get("to_mailbox") or "main",
+        "thread": item.get("thread", ""),
+        "received": item.get("received", ""),
+        "claimed_by": item.get("claimed_by", ""),
+        "files": len(item.get("files", [])),
+        "preview": item.get("text", "")[:120].replace("\n", " "),
+    }
+
+
 def cmd_inbox(cfg, args):
     ensure_dirs()
     items = [json.loads(p.read_text()) for p in sorted(INBOX_DIR.glob("*.json"))]
@@ -1336,6 +1357,9 @@ def cmd_inbox(cfg, args):
     if args.mine:
         items = [i for i in items if _item_matches_mailbox(
             i, mailbox_name(cfg), agent_name())]
+    if args.json:
+        print(json.dumps([inbox_summary(i) for i in items]))
+        return
     if not items:
         print("No matching inbox items")
         return
@@ -1353,6 +1377,30 @@ def cmd_close(cfg, args):
     item = _claim_item(args.id, agent_name(), mailbox_name(cfg), allow_orphan=True)
     update_inbox_item(item["id"], state="handled", handled_at=time.time())
     print(f"Closed inbox item {item['id']}")
+
+
+def cmd_rm(cfg, args):
+    """Delete an inbox record outright, for clearing debris while debugging.
+
+    Unlike close this keeps no history, so the item leaves `herald thread` and
+    `herald reply <id>` can no longer answer it. The delivery-id record goes with
+    it, so a delivery the sender is still retrying can arrive again as a new item.
+    """
+    with state_lock():
+        item = find_inbox_item(args.id)
+        assignment = active_assignment(item)
+        if assignment and not args.force and assignment.get("agent") != agent_name():
+            sys.exit(f"Item {args.id} is assigned to live agent "
+                     f"'{assignment.get('agent')}'. Use --force to delete it anyway.")
+        files = 0
+        for attached in item.get("files", []):
+            stored = Path(attached.get("stored_path", ""))
+            if stored.parent == FILES_DIR and stored.exists():
+                stored.unlink()
+                files += 1
+        (INBOX_DIR / f"{item['id']}.json").unlink()
+    note = f" and {files} file{'s' if files != 1 else ''}" if files else ""
+    print(f"Deleted inbox item {item['id']}{note}")
 
 
 def cmd_reopen(cfg, args):
@@ -1756,6 +1804,8 @@ def main():
     sp.add_argument("--history", action="store_true", help="show handled items instead of open work")
     sp.add_argument("--mine", action="store_true",
                     help="only items for this mailbox and exact agent targets")
+    sp.add_argument("--json", action="store_true",
+                    help="machine-readable listing, one object per item, [] when empty")
 
     sp = sub.add_parser("read", help="show an item (writes files to cwd), claim it for this agent")
     sp.add_argument("id")
@@ -1767,6 +1817,11 @@ def main():
 
     sp = sub.add_parser("reopen", help="return a handled inbox item to pending")
     sp.add_argument("id")
+
+    sp = sub.add_parser("rm", help="delete an inbox item and its files, keeping no history")
+    sp.add_argument("id")
+    sp.add_argument("--force", action="store_true",
+                    help="delete even when a live session other than this one holds it")
 
     sp = sub.add_parser("introduce", help="send a peer my address+token so they can add me")
     sp.add_argument("peer")
@@ -1826,7 +1881,7 @@ def main():
 
     args = p.parse_args()
     identity_commands = {"send", "reply", "result", "read", "close", "reopen",
-                         "wait", "resume", "ask"}
+                         "rm", "wait", "resume", "ask"}
     if args.cmd in identity_commands and not os.environ.get("HERALD_AGENT"):
         sys.exit(
             f"HERALD_AGENT is required for `herald {args.cmd}`. Set one stable session name "
@@ -1846,7 +1901,7 @@ def main():
                  f"herald mailbox add {selected_mailbox}")
     {"init": cmd_init, "daemon": cmd_daemon, "send": cmd_send, "reply": cmd_reply,
      "result": cmd_result, "inbox": cmd_inbox, "read": cmd_read,
-     "close": cmd_close, "reopen": cmd_reopen, "peer": cmd_peer,
+     "close": cmd_close, "reopen": cmd_reopen, "rm": cmd_rm, "peer": cmd_peer,
      "mailbox": cmd_mailbox,
      "introduce": cmd_introduce, "accept": cmd_accept, "ask": cmd_ask, "ping": cmd_ping,
      "bell": cmd_bell,

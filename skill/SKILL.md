@@ -172,9 +172,16 @@ keeps the item until one starts.
 ## Receiving
 
 `herald inbox` shows open work. `--unclaimed` shows only pending items.
-`--history` shows handled items. `herald read <id>` claims an item and changes it
-from `pending` to `active`. Use `herald close <id>` when no reply is required.
-Use `herald reopen <id>` to return handled work to pending. Herald keeps handled
+`--history` shows handled items. `--json` prints the listing as one object per
+item (and `[]` when empty) for a script or a menu to read, so nothing has to
+reimplement herald's rules about what counts as open. `herald read <id>` claims an
+item and changes it from `pending` to `active`. Use `herald close <id>` when no
+reply is required. Use `herald reopen <id>` to return handled work to pending.
+`herald rm <id>` deletes an item and its files outright, for clearing debris while
+debugging - it keeps no history, so the item leaves `herald thread`, `herald reply`
+can no longer answer it, and a delivery still being retried can arrive again as a
+new item. It refuses an item held by another live session unless you pass
+`--force`. Prefer `close`. Herald keeps handled
 JSON records as history and does not delete them automatically. `close` and
 `reopen` also work on an item left behind by a session that has ended, so open
 work is never stranded under a name nobody uses any more; `reopen` releases it

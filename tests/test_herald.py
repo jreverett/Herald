@@ -600,6 +600,89 @@ class Protocol(unittest.TestCase):
         self.assertEqual(again.returncode, 2, again.stdout)
         self.assertNotIn("ALREADY-MINE", again.stdout)
 
+    def test_inbox_json_lists_items_without_bodies_and_is_empty_array(self):
+        """The tray reads this instead of parsing text or reimplementing
+        item_state, so it must stay machine-readable even with nothing in it."""
+        empty = self.cli("bob", "inbox", "--json")
+        self.assertEqual(json.loads(empty.stdout), [], empty.stderr)
+
+        self.cli("alice", "send", "bob", "-m", "JSON-LISTING", agent="alice-1")
+        self.wait_for_inbox("bob", lambda i: i["text"] == "JSON-LISTING")
+
+        listed = self.cli("bob", "inbox", "--json")
+        rows = json.loads(listed.stdout)
+
+        self.assertEqual(len(rows), 1, listed.stdout)
+        self.assertEqual(rows[0]["state"], "pending")
+        self.assertEqual(rows[0]["from"], "alice")
+        self.assertEqual(rows[0]["to_mailbox"], "main")
+        self.assertEqual(rows[0]["preview"], "JSON-LISTING")
+        self.assertNotIn("text", rows[0])
+
+    def test_rm_deletes_the_item_and_its_files(self):
+        attached = os.path.join(self.root, "attached.txt")
+        with open(attached, "w") as f:
+            f.write("payload")
+        self.cli("alice", "send", "bob", "-m", "DELETE-ME", "-f", attached, agent="alice-1")
+        item = self.wait_for_inbox("bob", lambda i: i["text"] == "DELETE-ME")
+        stored = item["files"][0]["stored_path"]
+        self.assertTrue(os.path.exists(stored))
+
+        r = self.cli("bob", "rm", item["id"], agent="bob-tray")
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Deleted inbox item", r.stdout)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.homes["bob"], "inbox", item["id"] + ".json")))
+        self.assertFalse(os.path.exists(stored), "attachment left behind")
+        self.assertEqual(json.loads(self.cli("bob", "inbox", "--json").stdout), [])
+
+    def test_rm_refuses_an_item_held_by_another_live_session(self):
+        """Deleting from a tray menu must not pull work out from under a tab that
+        is in the middle of it."""
+        holder = self._listener("bob", "bob-holder", timeout="20")
+        try:
+            self.cli("alice", "send", "bob", "-m", "HELD-WORK",
+                     "--agent", "bob-holder", agent="alice-1")
+            holder.communicate(timeout=30)
+            item = self.wait_for_inbox("bob", lambda i: i.get("text") == "HELD-WORK")
+            self.assertIsNotNone(item)
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+        # The first listener exited when it took the item, so its session is dead and
+        # the item is assigned to nobody. Re-register the same name and wait for the
+        # daemon to route the item to the new session - running rm before that races
+        # the router and the guard has nothing live to refuse for.
+        again = self._listener("bob", "bob-holder", timeout="20")
+        try:
+            live = self.wait_for_listener("bob", "bob-holder")["session_id"]
+            self.wait_for_assignment("bob", lambda i: i["id"] == item["id"]
+                                     and i.get("assigned_session") == live)
+            refused = self.cli("bob", "rm", item["id"], agent="bob-tray")
+            self.assertNotEqual(refused.returncode, 0, refused.stdout)
+            self.assertIn("bob-holder", refused.stderr)
+            self.assertTrue(os.path.exists(
+                os.path.join(self.homes["bob"], "inbox", item["id"] + ".json")))
+
+            forced = self.cli("bob", "rm", item["id"], "--force", agent="bob-tray")
+            self.assertEqual(forced.returncode, 0, forced.stderr)
+            self.assertFalse(os.path.exists(
+                os.path.join(self.homes["bob"], "inbox", item["id"] + ".json")))
+        finally:
+            if again.poll() is None:
+                again.kill()
+            again.communicate()
+
+    def test_rm_requires_an_agent_name(self):
+        self.cli("alice", "send", "bob", "-m", "NEEDS-AGENT", agent="alice-1")
+        item = self.wait_for_inbox("bob", lambda i: i["text"] == "NEEDS-AGENT")
+
+        r = self.cli("bob", "rm", item["id"])
+
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("HERALD_AGENT is required", r.stderr)
+
     def test_claim_stolen_from_dead_session(self):
         self.cli("alice", "send", "bob", "-m", "orphaned", agent="alice-1")
         item = self.wait_for_inbox("bob", lambda i: i["text"] == "orphaned")
