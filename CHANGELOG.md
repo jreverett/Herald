@@ -2,6 +2,22 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.6
+
+- **Fixed: a progress reply erased the flag that says a human is holding an item**,
+  so the tray stopped reporting red while the person was still deciding. Observed
+  live - a task answered `--status accepted` and then followed by an ordinary
+  `herald reply` came back with `acked_status` blank, because a reply carries no
+  status of its own and the write was unconditional. Only a response that carries
+  a status now sets it, and only a final response clears it. The red state
+  survived the bug here by coincidence, raised instead by an unrelated unread
+  item, which is exactly how a signal like this goes unnoticed.
+- The installer no longer sets a tool matcher on the `PostToolUse` hook. Every
+  tool call means the turn is live, so filtering by tool was never the point, and
+  an editor that does not understand the key would drop the whole entry rather
+  than widen it. An unmatched `PostToolUse` hook is confirmed firing in Claude
+  Code on two machines. Existing installs keep working either way.
+
 ## 0.9.5
 
 - **The installer now wires the tray's activity hooks itself**, for every Claude

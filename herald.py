@@ -51,7 +51,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.5"
+__version__ = "0.9.6"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -639,8 +639,13 @@ def _apply_source_delivery(payload, delivery_state, error=""):
     effect = payload.get("_source_effect")
     if not item_id or not effect:
         return
-    changes = {"response_delivery_id": payload.get("delivery_id", ""),
-               "acked_status": payload.get("status", "") if effect == "ack" else ""}
+    changes = {"response_delivery_id": payload.get("delivery_id", "")}
+    # A later progress reply carries no status of its own, and must not erase the
+    # 'accepted' that says a human is holding this item.
+    if effect != "ack":
+        changes["acked_status"] = ""
+    elif payload.get("status"):
+        changes["acked_status"] = payload["status"]
     if delivery_state == "delivered":
         if effect == "ack":
             changes.update(state="active", acknowledged_at=time.time(), delivery_error="")
@@ -1356,7 +1361,12 @@ def _hook_payload(timeout=0.5):
 def _repo_label(cwd):
     """Name the repository rather than the directory the hook happened to fire
     in - an agent's cwd is often a folder deep inside the tree, whose basename
-    says nothing about which work it is."""
+    says nothing about which work it is.
+
+    The walk is deliberate rather than a call to git: `git rev-parse
+    --show-toplevel` refuses to cross a filesystem boundary without
+    GIT_DISCOVERY_ACROSS_FILESYSTEM, so it fails on a repo under /mnt/c and
+    would leave every WSL turn unlabelled."""
     path = Path(cwd)
     for candidate in (path, *path.parents):
         if (candidate / ".git").exists():

@@ -24,7 +24,6 @@ EVENTS = {
     "Stop": "idle",
     "SessionEnd": "idle",
 }
-MATCHER_EVENTS = ("PostToolUse", "PreToolUse")
 MARKER = "herald activity"
 
 
@@ -37,14 +36,13 @@ def herald_command():
     return "herald"
 
 
-def hook_entry(event, state, command):
+def hook_entry(state, command):
     # Output is discarded because an editor can feed hook stdout back to the
     # model, and a non-zero exit must never fail the tool call that ran it.
-    entry = {"hooks": [{"type": "command",
-                        "command": f"{command} activity {state} >/dev/null 2>&1 || true"}]}
-    if event in MATCHER_EVENTS:
-        return {"matcher": "*", **entry}
-    return entry
+    # No tool matcher: every tool call means the turn is live, and an editor that
+    # does not understand the key would drop the entry.
+    return {"hooks": [{"type": "command",
+                       "command": f"{command} activity {state} >/dev/null 2>&1 || true"}]}
 
 
 def merge_hooks(path, command):
@@ -65,7 +63,7 @@ def merge_hooks(path, command):
             continue
         if any(MARKER in json.dumps(group) for group in existing):
             continue
-        existing.append(hook_entry(event, state, command))
+        existing.append(hook_entry(state, command))
         added.append(event)
     if not added:
         return []

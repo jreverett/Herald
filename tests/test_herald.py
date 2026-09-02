@@ -1449,6 +1449,28 @@ class Protocol(unittest.TestCase):
         self.assertEqual(status.get("blocked"), 0,
                          "the final answer means the human is no longer holding it")
 
+    def test_a_progress_reply_does_not_clear_the_accepted_flag(self):
+        # Observed live: after 'result --status accepted', an ordinary reply on the
+        # same item wiped acked_status, so the tray stopped reporting that a human
+        # was holding it. A reply carries no status of its own.
+        self.cli("alice", "send", "bob", "-t", "needs a decision", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i["text"] == "needs a decision")
+        self.cli("bob", "result", task["id"], "--status", "accepted",
+                 "-m", "Asking my human.", agent="bob-w")
+        path = os.path.join(self.homes["bob"], "inbox", f"{task['id']}.json")
+        self.assertEqual(self._load(path).get("acked_status"), "accepted")
+
+        self.cli("bob", "reply", task["id"], "-m", "still waiting on him",
+                 "--meta", "herald_intent=ack", agent="bob-w")
+
+        self.assertEqual(self._load(path).get("acked_status"), "accepted",
+                         "a progress reply must not erase what the accepted said")
+
+        self.cli("bob", "result", task["id"], "--status", "done", "-m", "he said yes",
+                 agent="bob-w")
+
+        self.assertEqual(self._load(path).get("acked_status"), "")
+
     def test_an_item_nobody_is_listening_for_reports_as_waiting_on_the_human(self):
         # Nothing will pick it up on its own, so it sits unread until the human
         # looks - the failure the tray is meant to make visible.
