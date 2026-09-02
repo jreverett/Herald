@@ -8,11 +8,22 @@ heartbeat and activity markers the daemon writes to `~/.herald`.
 | up-chevrons `⌃⌃` (foreground colour) | running, idle |
 | right-chevrons `››` (blue) | sending to a peer |
 | left-chevrons `‹‹` (green) | receiving from a peer |
-| up-chevrons breathing (amber) | an agent turn is running |
+| up-chevrons breathing (amber) | an agent is working on herald work |
+| converging chevrons `› ‹` (red) | herald is waiting on you |
 | down-chevrons (grey) | daemon down / heartbeat stale |
 
 The breath keeps idle's shape because a running turn is a state, not a
-direction, and traffic takes precedence over it. It reflects an agent actually
+direction, and traffic takes precedence over both resting states - an arrow is a
+four-second flash over whatever was showing. Red converges the chevron pair, a
+direction neither send nor receive uses, so it stays distinguishable in
+greyscale; the tooltip names what is waiting even while an arrow covers the
+icon. Red is read from the inbox - an `accepted` task, or an item nothing is
+listening for - not from the harness, so an unrelated permission prompt in a
+session that also does herald work does not raise it.
+
+The tooltip must stay within 63 characters: `NotifyIcon.Text` throws above that,
+and the throw would leave the tooltip frozen on whatever it last said. It is
+built in priority order and the parts that do not fit are dropped. It reflects an agent actually
 spending tokens, not a claimed inbox item - a session waiting on a human answer
 reads as idle. See the `activity` section of the main README for the hooks that
 drive it; without them the icon simply never breathes.

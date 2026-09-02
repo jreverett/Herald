@@ -1,7 +1,8 @@
 # herald tray icon - shows daemon state in the Windows notification area, and
 # lists the inbox so an item can be closed or deleted without a terminal.
 #   green  = running (idle)   blue up-arrow = sending   purple down-arrow = receiving
-#   amber breathing = an agent turn is running   grey X = daemon down / heartbeat stale
+#   amber breathing = an agent turn is running   red converging = a session needs you
+#   grey X = daemon down / heartbeat stale
 # Reads ~/.herald/status.json and ~/.herald/activity/{send,recv} from WSL over \\wsl$.
 # Run hidden:  powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File herald-tray.ps1
 
@@ -60,7 +61,7 @@ $script:FrameCount = 8
 $script:icons = @{ dark = @{}; light = @{} }
 $script:frames = @{ dark = @{ send = @(); recv = @(); work = @() }; light = @{ send = @(); recv = @(); work = @() } }
 foreach ($theme in 'dark', 'light') {
-    foreach ($s in 'idle', 'send', 'recv', 'offline', 'work') {
+    foreach ($s in 'idle', 'send', 'recv', 'offline', 'work', 'blocked') {
         $script:icons[$theme][$s] = New-Object System.Drawing.Icon (Join-Path $iconDir "$theme\$s.ico")
     }
     foreach ($s in 'send', 'recv', 'work') {
@@ -105,17 +106,35 @@ function Poll-State {
     }
     $send = Read-Marker $script:sendMarker
     $recv = Read-Marker $script:recvMarker
-    # Traffic wins over the working breath: an arrow is a moment, the breath is a state.
-    $script:state = if ($status.working -gt 0) { 'work' } else { 'idle' }
+    # Traffic is always shown: an arrow is a four-second flash over whatever the
+    # resting state is, and the resting state returns as soon as it passes.
+    $script:state = if ($status.blocked -gt 0) { 'blocked' }
+                    elseif ($status.working -gt 0) { 'work' }
+                    else { 'idle' }
     if (($now - $send) -lt $ActiveWindow -and $send -ge $recv) { $script:state = 'send' }
     elseif (($now - $recv) -lt $ActiveWindow) { $script:state = 'recv' }
 
-    $verb = @{ idle = 'running'; send = 'sending'; recv = 'receiving'; work = 'working' }[$script:state]
-    $q = if ($status.queued) { " | $($status.queued) queued" } else { "" }
-    $who = if ($status.working -gt 0) { " | working: $($status.working_agents -join ', ')" } else { "" }
-    $text = "herald v$($status.version): $verb - $($status.me) on $($status.listen)$q$who"
-    if ($text.Length -gt 127) { $text = $text.Substring(0, 127) }
-    $script:ni.Text = $text
+    Set-Tip $status
+}
+
+# NotifyIcon.Text throws above 63 characters (verified on Windows PowerShell
+# 5.1: 63 assigns, 64 throws), and the throw used to leave the tooltip frozen on
+# whatever it last said. So the parts are added in priority order and the ones
+# that do not fit are dropped, with the assignment guarded either way.
+function Set-Tip($status) {
+    $verb = @{ idle = 'running'; send = 'sending'; recv = 'receiving'
+               work = 'working'; blocked = 'waiting on you' }[$script:state]
+    $parts = @()
+    if ($status.blocked -gt 0) { $parts += "needs you: $($status.blocked_agents -join ', ')" }
+    if ($status.working -gt 0) { $parts += "working: $($status.working_agents -join ', ')" }
+    if ($status.queued)        { $parts += "$($status.queued) queued" }
+    $parts += "$($status.me) on $($status.listen)"
+    $parts += "v$($status.version)"
+    $tip = "herald: $verb"
+    foreach ($p in $parts) {
+        if (($tip.Length + 3 + $p.Length) -le 63) { $tip = "$tip | $p" }
+    }
+    try { $script:ni.Text = $tip } catch { $script:ni.Text = "herald: $verb" }
 }
 
 # Fast tick: refresh state periodically, animate send/recv, stay static otherwise.

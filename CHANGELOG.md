@@ -2,6 +2,45 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.4
+
+- **The tray icon turns red when herald itself is waiting on you**, drawn as
+  converging chevrons so the state does not rest on colour alone. With several
+  tabs listening, an approval a peer's agent is waiting on was invisible until
+  you happened to look at the right one.
+- Red is read from the inbox, never from the harness. A session is reused for all
+  sorts of work, so a permission prompt in an unrelated turn is not herald
+  waiting on you, and Claude Code's `Notification` hook cannot tell the two
+  apart. Two inbox conditions raise it: a task this side answered
+  `--status accepted`, which promises an answer once the human decides, and an
+  item on a mailbox no listener is attached to, which will sit unread until
+  someone looks. Both work for Codex and Copilot too, since neither needs a hook.
+- `herald result --status accepted` now records that status on the source item, so
+  the daemon can tell an acknowledgement that is waiting on a human from one that
+  is merely work in progress.
+- Traffic overrides both resting states: an arrow is a four-second flash over
+  whatever the icon was showing, and the resting state returns when it passes.
+- **Fixed: the tooltip froze on "herald: starting..." as soon as any state added
+  detail to it.** `NotifyIcon.Text` throws above 63 characters - verified on
+  Windows PowerShell 5.1, where 63 assigns and 64 throws - and the script's own
+  guard allowed 127. The throw aborted the poll before the text was set, on every
+  sixth tick, while the icon kept updating from the other five, so the icon was
+  right and the tooltip was stale. It is now assembled in priority order within
+  the limit, dropping what does not fit, and the assignment is guarded.
+- **Amber is scoped to herald work too.** The hooks fire in every session, so it
+  used to light up whenever any tab took a tool call, whatever that tab was doing.
+  A turn now counts only while its harness also holds a claimed inbox item it has
+  not answered. Neither half is sufficient on its own: a marker alone reports any
+  busy session, and a claim alone stays lit while the agent waits on its human.
+- The two signals are keyed differently - a hook knows the editor's session id, a
+  claim knows `HERALD_AGENT` - so they are joined on the harness pid, which both
+  find by the same walk up from their own process. The listener records it,
+  because the listener exits after one item while the harness above it stays and
+  does the work. The remaining false positive is bounded: while a tab owes herald
+  a reply, any turn in that tab reads as herald's work, since a turn cannot be
+  attributed to a topic.
+- `herald status` and `herald activity` report all three states.
+
 ## 0.9.3
 
 - **The tray icon now shows when an agent is actually working**, as a slow amber

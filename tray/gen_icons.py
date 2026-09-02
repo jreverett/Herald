@@ -32,14 +32,17 @@ STATES = {
     # working keeps idle's geometry and only breathes: an agent turn is running,
     # which is not a direction and must not read as traffic.
     "work":    ([[(2, 20), (8, 13), (14, 20)], [(18, 20), (24, 13), (30, 20)]], 4.0),
+    # blocked converges the pair, a direction neither send nor recv uses, so the
+    # state survives greyscale rather than resting on red alone.
+    "blocked": ([[(4, 10), (11, 16), (4, 22)], [(28, 10), (21, 16), (28, 22)]], 4.0),
 }
 
 # per taskbar theme: idle uses the bar's foreground; the rest per DESIGN.md.
 COLOURS = {
     "dark":  {"idle": "#FFFFFF", "send": "#5B96EA", "recv": "#5FB383", "offline": "#7D838B",
-              "work": "#E8A33D"},
+              "work": "#E8A33D", "blocked": "#E5484D"},
     "light": {"idle": "#1A1A1A", "send": "#2F6FD0", "recv": "#2F7D4F", "offline": "#8A8376",
-              "work": "#A85F00"},
+              "work": "#A85F00", "blocked": "#C0292E"},
 }
 
 

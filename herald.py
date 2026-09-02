@@ -51,7 +51,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -236,7 +236,7 @@ def working_alive(rec, now=None):
     return now - rec.get("heartbeat", 0) <= lease
 
 
-def working_labels():
+def working_labels(only_pids=None):
     """Labels of the agent turns still running, most recent first.
 
     A marker is cleared when its turn ends, so a surviving one means the agent
@@ -256,8 +256,50 @@ def working_labels():
             except OSError:
                 pass
             continue
+        if only_pids is not None and rec.get("pid") not in only_pids:
+            continue
         live.append((rec.get("heartbeat", 0), rec.get("label") or rec.get("key") or "?"))
     return [label for _, label in sorted(live, reverse=True)]
+
+
+def herald_working_pids():
+    """Harnesses holding a claimed inbox item they have not answered.
+
+    A tab is reused for anything, so a turn is only herald's work if that tab
+    also owes herald a reply. Neither half is enough: a marker alone reports any
+    session that is busy, and a claim alone stays lit while the agent waits on
+    its human."""
+    pids = set()
+    for path in INBOX_DIR.glob("*.json"):
+        try:
+            item = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if item_state(item) == "active" and isinstance(item.get("claimed_pid"), int):
+            pids.add(item["claimed_pid"])
+    return pids
+
+
+def awaiting_human():
+    """Herald work that needs the human, for the tray's red state.
+
+    Two cases, both about herald itself rather than about whatever else the
+    session is doing: a task this side answered 'accepted', which promises an
+    answer once the human decides, and an item on a mailbox nothing is listening
+    to, which will sit unread until someone looks."""
+    listening = {s.get("mailbox", "main") for s in live_sessions()}
+    accepted, unread = [], 0
+    for path in INBOX_DIR.glob("*.json"):
+        try:
+            item = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        state = item_state(item)
+        if item.get("acked_status") == "accepted" and state == "active":
+            accepted.append(f"{item.get('from') or '?'}'s task")
+        elif state == "pending" and item.get("to_mailbox", "main") not in listening:
+            unread += 1
+    return accepted + ([f"{unread} unread"] if unread else [])
 
 
 def working_summary(labels):
@@ -418,6 +460,7 @@ def write_session(listener, waiting_on="inbox"):
             "generation": listener.get("generation", 0),
             "request_id": listener.get("request_id", ""),
             "pid": os.getpid(),
+            "harness_pid": listener.get("harness_pid"),
             "host": socket.gethostname(),
             "started": listener["started"],
             "heartbeat": time.time(),
@@ -446,6 +489,9 @@ def register_listener(cfg, mode="general", takeover=False):
         "agent": agent_name(),
         "mailbox": mailbox_name(cfg),
         "mode": mode,
+        # The listener process is short-lived; the harness above it is the thing
+        # that stays and does the work, so that is what a claim is attributed to.
+        "harness_pid": harness_pid(),
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "request_id": "",
         # Only a mailbox owner is given a generation, counting from 1. Zero means
@@ -593,7 +639,8 @@ def _apply_source_delivery(payload, delivery_state, error=""):
     effect = payload.get("_source_effect")
     if not item_id or not effect:
         return
-    changes = {"response_delivery_id": payload.get("delivery_id", "")}
+    changes = {"response_delivery_id": payload.get("delivery_id", ""),
+               "acked_status": payload.get("status", "") if effect == "ack" else ""}
     if delivery_state == "delivered":
         if effect == "ack":
             changes.update(state="active", acknowledged_at=time.time(), delivery_error="")
@@ -869,12 +916,16 @@ def _maintenance_loop(me, listen, started):
         if now - last > SUSPEND_GAP:
             skip_reap_until = now + SESSION_LEASE   # host likely slept; let sessions re-check in
         last = now
-        working = working_labels()
+        working_labels()                      # prune spent markers before filtering
+        working = working_labels(herald_working_pids())
+        blocked = awaiting_human()
         write_status({"pid": os.getpid(), "version": __version__, "me": me,
                       "listen": listen, "started": started, "heartbeat": now,
                       "queued": sum(1 for _ in QUEUE_DIR.glob("*/*.json")),
                       "working": len(working),
-                      "working_agents": working_summary(working)[:4]})
+                      "working_agents": working_summary(working)[:4],
+                      "blocked": len(blocked),
+                      "blocked_agents": working_summary(blocked)[:4]})
         try:
             cfg = load_config()
         except (SystemExit, OSError, json.JSONDecodeError):
@@ -1333,9 +1384,11 @@ def cmd_activity(cfg, args):
     the model on some events, so anything written here would cost tokens on
     every tool call."""
     if not args.state:
-        labels = working_labels()
-        summary = ", ".join(working_summary(labels))
-        print(f"{len(labels)} working" + (f": {summary}" if labels else ""))
+        for name, labels in (("turns running", working_labels()),
+                             ("on herald work", working_labels(herald_working_pids())),
+                             ("waiting on you", awaiting_human())):
+            summary = ", ".join(working_summary(labels))
+            print(f"{len(labels)} {name}" + (f": {summary}" if labels else ""))
         return
     key, label = _hook_identity(args)
     if args.state == "working":
@@ -1358,7 +1411,9 @@ def cmd_status(cfg, args):
               f"(pid {s.get('pid')} likely dead). Restart with: herald daemon")
         sys.exit(1)
     working = s.get("working_agents") or []
+    blocked = s.get("blocked_agents") or []
     busy = f", working: {', '.join(working)}" if working else ""
+    busy += f", waiting on you: {', '.join(blocked)}" if blocked else ""
     print(f"herald v{s.get('version', '?')} daemon: running - {s.get('me')} on {s.get('listen')} "
           f"(pid {s.get('pid')}, up since {s.get('started')}, {s.get('queued', 0)} queued{busy})")
 
@@ -1444,6 +1499,7 @@ def _claim_item(item_id, agent, mailbox, listener=None, force=False, allow_orpha
         if not force:
             item["claimed_by"] = agent
             item["claimed_mailbox"] = mailbox
+            item["claimed_pid"] = harness_pid()
             item["claimed_at"] = item.get("claimed_at") or time.time()
             if item_state(item) == "pending":
                 item["state"] = "handled" if _is_progress_item(item) else "active"
@@ -1488,6 +1544,7 @@ def _claim_next(listener):
         _, _, path, item = min(candidates)
         item["claimed_by"] = listener["agent"]
         item["claimed_mailbox"] = listener["mailbox"]
+        item["claimed_pid"] = listener.get("harness_pid")
         item["claimed_at"] = item.get("claimed_at") or time.time()
         item["assigned_session"] = listener["session_id"]
         item["presented_generation"] = listener.get("generation", 0)
@@ -1602,7 +1659,7 @@ def cmd_reopen(cfg, args):
     released = ({"unpinned": True, "targeted": False, "to_agent": ""}
                 if orphan and item.get("to_agent") and item["to_agent"] != agent_name() else {})
     update_inbox_item(item["id"], state="pending", claimed_by="", claimed_mailbox="",
-                      claimed_at=0, handled_at=0, assigned_session="",
+                      claimed_pid=None, claimed_at=0, handled_at=0, assigned_session="",
                       presented_generation=0, **released)
     print(f"Reopened inbox item {item['id']}"
           + (f", released from the gone session '{item['to_agent']}'" if released else ""))

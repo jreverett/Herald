@@ -178,6 +178,29 @@ class WorkingMarkers(unittest.TestCase):
         self.assertEqual(herald.working_labels(), [],
                          "the long lease is still bounded, so a lost clear cannot pin the signal on")
 
+    def test_only_turns_in_a_harness_holding_herald_work_count(self):
+        # A tab is reused for anything, so a busy session is not herald's work
+        # unless that same tab also owes herald a reply.
+        herald.mark_working("herald-tab", "studio", pid=os.getpid())
+        herald.mark_working("other-tab", "azuredevops", pid=os.getppid())
+
+        self.assertEqual(sorted(herald.working_labels()), ["azuredevops", "studio"])
+        self.assertEqual(herald.working_labels({os.getpid()}), ["studio"])
+        self.assertEqual(herald.working_labels(set()), [])
+
+    def test_herald_work_needs_a_claimed_item_that_is_unanswered(self):
+        def write_item(item_id, **fields):
+            path = herald.INBOX_DIR / f"{item_id}.json"
+            path.write_text(json.dumps(dict({"id": item_id, "from": "simon",
+                                             "kind": "task"}, **fields)))
+            self.addCleanup(path.unlink)
+
+        write_item("claimed", state="active", claimed_by="tab", claimed_pid=4242)
+        write_item("answered", state="handled", claimed_by="tab", claimed_pid=4343)
+        write_item("unclaimed", state="pending")
+
+        self.assertEqual(herald.herald_working_pids(), {4242})
+
     def test_start_ticks_survive_a_process_name_with_spaces_and_parens(self):
         # comm is unescaped, so a forward scan for ")" shifts every later field
         # and yields a number that will never match again - the marker would then
@@ -285,11 +308,11 @@ class WorkingMarkers(unittest.TestCase):
         self.assertEqual(stamp.returncode, 0, stamp.stderr)
         # Claude Code feeds hook stdout back to the model, so silence is the contract.
         self.assertEqual(stamp.stdout, "")
-        self.assertEqual(run().stdout.strip(), "1 working: azuredevops")
+        self.assertEqual(run().stdout.split("\n")[0], "1 turns running: azuredevops")
 
         run("idle", payload=json.dumps({"session_id": "abc123"}))
 
-        self.assertEqual(run().stdout.strip(), "0 working")
+        self.assertEqual(run().stdout.split("\n")[0], "0 turns running")
 
 
 class Protocol(unittest.TestCase):
@@ -1384,34 +1407,109 @@ class Protocol(unittest.TestCase):
         self.assertFalse(item.get("broadcast"))
         self.assertEqual(item.get("to_agent"), "bob-tab")   # handed to the one live session
 
-    def test_daemon_publishes_working_turns_in_status(self):
-        # The tray reads status.json only, so a marker the daemon never republishes
-        # is invisible however correct the store is.
-        self.cli("alice", "activity", "working", "--key", "tab-1", "--label", "studio")
+    def test_an_accepted_task_reports_as_waiting_on_the_human(self):
+        # A harness with no hooks raises nothing else, so 'accepted' - which
+        # promises an answer once the human decides - is the only signal Codex
+        # and Copilot can give that someone is waiting on them.
+        self.cli("alice", "send", "bob", "-t", "restart the service", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i["text"] == "restart the service")
+        self.assertIsNotNone(task)
+        # the claim records the harness above the listener, since that is what
+        # stays and does the work while the listener process comes and goes
+        claimed = self.cli("bob", "read", task["id"], agent="bob-w")
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        self.assertIsInstance(self._load(os.path.join(
+            self.homes["bob"], "inbox", f"{task['id']}.json")).get("claimed_pid"), int)
+        self.cli("bob", "result", task["id"], "--status", "accepted",
+                 "-m", "Received. Asking my human.", agent="bob-w")
+
         deadline = time.time() + herald.HEARTBEAT_INTERVAL * 3
         status = {}
         while time.time() < deadline:
             try:
-                status = self._load(os.path.join(self.homes["alice"], "status.json"))
+                status = self._load(os.path.join(self.homes["bob"], "status.json"))
+            except (OSError, ValueError):
+                status = {}
+            if status.get("blocked"):
+                break
+            time.sleep(0.2)
+
+        self.assertEqual(status.get("blocked"), 1)
+        self.assertEqual(status.get("blocked_agents"), ["alice's task"])
+
+        self.cli("bob", "result", task["id"], "--status", "done", "-m", "restarted",
+                 agent="bob-w")
+        deadline = time.time() + herald.HEARTBEAT_INTERVAL * 3
+        while time.time() < deadline:
+            status = self._load(os.path.join(self.homes["bob"], "status.json"))
+            if not status.get("blocked"):
+                break
+            time.sleep(0.2)
+
+        self.assertEqual(status.get("blocked"), 0,
+                         "the final answer means the human is no longer holding it")
+
+    def test_an_item_nobody_is_listening_for_reports_as_waiting_on_the_human(self):
+        # Nothing will pick it up on its own, so it sits unread until the human
+        # looks - the failure the tray is meant to make visible.
+        self.cli("alice", "send", "bob", "-m", "unattended", agent="alice-1")
+        self.assertIsNotNone(self.wait_for_inbox("bob", lambda i: i["text"] == "unattended"))
+
+        deadline = time.time() + herald.HEARTBEAT_INTERVAL * 3
+        status = {}
+        while time.time() < deadline:
+            try:
+                status = self._load(os.path.join(self.homes["bob"], "status.json"))
+            except (OSError, ValueError):
+                status = {}
+            if status.get("blocked"):
+                break
+            time.sleep(0.2)
+
+        self.assertEqual(status.get("blocked_agents"), ["1 unread"])
+
+    def test_daemon_publishes_working_turns_in_status(self):
+        # The tray reads status.json only, so a marker the daemon never republishes
+        # is invisible however correct the store is. A turn counts as herald's work
+        # only while its harness holds a claimed item it has not answered.
+        self.cli("alice", "send", "bob", "-t", "run the tests", agent="alice-1")
+        task = self.wait_for_inbox("bob", lambda i: i["text"] == "run the tests")
+        self.cli("bob", "read", task["id"], agent="bob-w")
+        item = self._load(os.path.join(self.homes["bob"], "inbox", f"{task['id']}.json"))
+        self.cli("bob", "activity", "working", "--label", "studio")
+        # a second tab, busy on something else entirely
+        stranger = os.path.join(self.homes["bob"], "working", "stranger.json")
+        with open(stranger, "w") as f:
+            json.dump({"key": "stranger", "label": "elsewhere", "pid": None,
+                       "heartbeat": time.time()}, f)
+
+        deadline = time.time() + herald.HEARTBEAT_INTERVAL * 3
+        status = {}
+        while time.time() < deadline:
+            try:
+                status = self._load(os.path.join(self.homes["bob"], "status.json"))
             except (OSError, ValueError):
                 status = {}
             if status.get("working"):
                 break
             time.sleep(0.2)
 
+        self.assertIsInstance(item.get("claimed_pid"), int)
         self.assertEqual(status.get("working"), 1)
-        self.assertEqual(status.get("working_agents"), ["studio"])
+        self.assertEqual(status.get("working_agents"), ["studio"],
+                         "a tab with no herald work of its own must not appear")
 
-        self.cli("alice", "activity", "idle", "--key", "tab-1")
+        self.cli("bob", "result", task["id"], "--status", "done", "-m", "42 passed",
+                 agent="bob-w")
         deadline = time.time() + herald.HEARTBEAT_INTERVAL * 3
         while time.time() < deadline:
-            status = self._load(os.path.join(self.homes["alice"], "status.json"))
+            status = self._load(os.path.join(self.homes["bob"], "status.json"))
             if not status.get("working"):
                 break
             time.sleep(0.2)
 
-        self.assertEqual(status.get("working"), 0)
-        self.assertEqual(status.get("working_agents"), [])
+        self.assertEqual(status.get("working"), 0,
+                         "the reply is sent, so the tab owes herald nothing")
 
 
 if __name__ == "__main__":

@@ -118,6 +118,18 @@ is keyed by the hook payload's `session_id` and labelled with the repository the
 several tabs count separately and the tooltip can name them; two tabs on one repo collapse to
 `name x2` rather than printing it twice.
 
+A turn counts as herald's work only while its harness also holds a claimed inbox item it has not
+answered - the hooks fire in every session, and a tab is reused for anything. The two signals are
+keyed differently, a hook by the editor's session id and a claim by `HERALD_AGENT`, so they are
+joined on the harness pid that both find by walking up from their own process. While a tab owes
+herald a reply, any turn in it counts, since a turn cannot be attributed to a topic.
+
+The red state is a separate question and is read from the inbox, never from the harness. A session is
+reused for all sorts of work, so a permission prompt in an unrelated turn is not herald waiting on
+you. Two inbox conditions raise it: a task this side answered `herald result --status accepted`,
+which promises an answer once the human decides, and an item on a mailbox no listener is attached to,
+which will sit unread until someone looks. Neither needs a hook, so both work under Codex and Copilot.
+
 Only a tool call refreshes the stamp, and a turn can think for minutes without making one, so the
 marker is held against the session's liveness rather than a short timer. It records the harness that
 ran the hook as its pid and start time together, because a pid alone is reused and an unrelated
