@@ -2,6 +2,25 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.2
+
+- **The tray icon's right-click menu now lists the inbox**, with **Close
+  (reversible)** and **Delete permanently...** on each item, so clearing debris
+  while debugging routing no longer needs a terminal. The list is built when the
+  menu opens rather than on the animation tick, so it costs one call per
+  right-click. Each action passes the item's own mailbox, because the default lane
+  does not match an item that arrived on another one.
+- `herald inbox --json` prints one object per item, and `[]` when empty. The tray
+  reads this rather than the inbox directory: whether an item is open, and which
+  mailbox and agent it belongs to, are herald's rules, and a second copy of them
+  in the menu would drift and then mislead during exactly the debugging the menu
+  is for.
+- `herald rm <id>` deletes an item and its attachments outright. Unlike `close` it
+  keeps no history, so the item leaves `herald thread`, `herald reply` can no
+  longer answer it, and a delivery the sender is still retrying can arrive again
+  as a new item. It refuses an item held by another live session unless `--force`
+  is passed, so a menu click cannot pull work out from under a tab mid-task.
+
 ## 0.9.1
 
 - **A second tab joining a mailbox that already had work in flight crashed on its
