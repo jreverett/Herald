@@ -1,4 +1,5 @@
-# herald tray icon - shows daemon state in the Windows notification area.
+# herald tray icon - shows daemon state in the Windows notification area, and
+# lists the inbox so an item can be closed or deleted without a terminal.
 #   green  = running (idle)   blue up-arrow = sending   purple down-arrow = receiving
 #   grey X = daemon down / heartbeat stale
 # Reads ~/.herald/status.json and ~/.herald/activity/{send,recv} from WSL over \\wsl$.
@@ -8,7 +9,9 @@ param(
     [string]$HeraldDir,                     # Windows path to the WSL ~/.herald dir; auto-detected if omitted
     [string]$DaemonCmd = "if systemctl --user cat herald-daemon.service >/dev/null 2>&1; then systemctl --user restart herald-daemon; else pkill -f '[h]erald.py daemon' 2>/dev/null; setsid `"`$HOME/.local/bin/herald`" daemon >/dev/null 2>&1 </dev/null & disown; fi",  # systemd if present, else the PATH wrapper - machine-agnostic
     [int]$HeartbeatTimeout = 15,         # seconds without a heartbeat => daemon considered down
-    [double]$ActiveWindow = 4.0          # seconds an arrow lingers after a send/recv event
+    [double]$ActiveWindow = 4.0,         # seconds an arrow lingers after a send/recv event
+    [string]$MenuAgent = "herald-tray",  # HERALD_AGENT for close/rm issued from this menu
+    [int]$MaxInboxItems = 15             # menu entries before the list is truncated
 )
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -130,8 +133,128 @@ function Update-Tray {
     }
 }
 
-# Context menu: Status balloon, Restart daemon, Exit.
+# --- inbox menu -------------------------------------------------------------
+# The listing comes from `herald inbox --json` rather than by reading
+# ~/.herald/inbox over \\wsl$: whether an item is open, and which mailbox and
+# agent it belongs to, are herald's rules, and a second copy of them here would
+# drift and then lie during exactly the debugging this menu is for.
+
+$script:idPattern = '^[0-9a-zA-Z._-]+$'
+
+function Invoke-Herald($heraldArgs) {
+    # Returns @{ ok = bool; out = string }. Runs through a login shell so herald
+    # is on PATH the same way it is for a human.
+    try {
+        $prev = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        # ToString() each record rather than Out-String: herald reports failures on
+        # stderr, and Out-String renders those as PowerShell NativeCommandError
+        # blocks, so the balloon would show the wrapper instead of herald's message.
+        $lines = & wsl.exe -e bash -lc $heraldArgs 2>&1 | ForEach-Object { $_.ToString() }
+        $code = $LASTEXITCODE
+        [Console]::OutputEncoding = $prev
+        return @{ ok = ($code -eq 0); out = (($lines -join "`n").Trim()) }
+    } catch {
+        return @{ ok = $false; out = "$_" }
+    }
+}
+
+function Get-Inbox {
+    $r = Invoke-Herald "herald inbox --json"
+    if (-not $r.ok) { return @{ ok = $false; items = @(); error = $r.out } }
+    try {
+        # Assign before wrapping. ConvertFrom-Json emits a JSON array as ONE object
+        # down the pipeline, so @($json | ConvertFrom-Json) is a single element
+        # holding the whole array - verified on Windows PowerShell 5.1. Assigning
+        # first and wrapping that gives the item count.
+        $parsed = $r.out | ConvertFrom-Json
+        return @{ ok = $true; items = @($parsed); error = "" }
+    } catch {
+        return @{ ok = $false; items = @(); error = "unreadable listing: $($r.out)" }
+    }
+}
+
+function Show-Balloon($title, $text) {
+    $script:ni.ShowBalloonTip(4000, $title, $text, [System.Windows.Forms.ToolTipIcon]::Info)
+}
+
+function Invoke-ItemAction($item, $verb) {
+    # Both close and rm need HERALD_AGENT, and close needs the item's own mailbox -
+    # the default lane will not match an item that arrived on another one.
+    if ($item.id -notmatch $script:idPattern -or $item.to_mailbox -notmatch $script:idPattern) {
+        Show-Balloon "herald" "Refusing to act on an item with an unexpected id or mailbox."
+        return
+    }
+    $cmd = "HERALD_AGENT='$MenuAgent' HERALD_MAILBOX='$($item.to_mailbox)' herald $verb '$($item.id)'"
+    $r = Invoke-Herald $cmd
+    if ($r.ok) { Show-Balloon "herald" $r.out } else { Show-Balloon "herald - failed" $r.out }
+}
+
+function Format-InboxLabel($item) {
+    $who = $item.from
+    if ($item.from_agent) { $who = "$($item.from) / $($item.from_agent)" }
+    $lane = if ($item.to_agent) { " ->$($item.to_agent)" } else { " ->$($item.to_mailbox)" }
+    $preview = $item.preview
+    if ($preview.Length -gt 60) { $preview = $preview.Substring(0, 57) + "..." }
+    $label = "[$($item.state)] $who$lane  $preview"
+    # WinForms eats a single & as a mnemonic marker.
+    return $label.Replace("&", "&&")
+}
+
+function Build-InboxMenu {
+    $script:miInbox.DropDownItems.Clear()
+    $listing = Get-Inbox
+    if (-not $listing.ok) {
+        $miErr = $script:miInbox.DropDownItems.Add("Could not read the inbox")
+        $miErr.Enabled = $false
+        $miErr.ToolTipText = $listing.error
+        return
+    }
+    if ($listing.items.Count -eq 0) {
+        $script:miInbox.DropDownItems.Add("(nothing open)").Enabled = $false
+        return
+    }
+    foreach ($item in ($listing.items | Select-Object -First $MaxInboxItems)) {
+        $entry = $script:miInbox.DropDownItems.Add((Format-InboxLabel $item))
+        $entry.ToolTipText = "$($item.id)`nthread $($item.thread)`nreceived $($item.received)"
+
+        $miClose = $entry.DropDownItems.Add("Close (reversible)")
+        $miClose.Tag = $item
+        $miClose.add_Click({ Invoke-ItemAction $this.Tag "close" }.GetNewClosure())
+
+        $miDelete = $entry.DropDownItems.Add("Delete permanently...")
+        $miDelete.Tag = $item
+        $miDelete.add_Click({
+            $it = $this.Tag
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "Delete $($it.id) permanently?`n`nFrom $($it.from): $($it.preview)`n`n" +
+                "The record is not kept as history. It leaves herald thread, herald reply " +
+                "can no longer answer it, and a delivery the sender is still retrying could " +
+                "arrive again as a new item.`n`nClose instead if you only want it out of the way.",
+                "herald - delete inbox item",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning,
+                [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+            if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+                Invoke-ItemAction $it "rm"
+            }
+        }.GetNewClosure())
+    }
+    if ($listing.items.Count -gt $MaxInboxItems) {
+        $more = $listing.items.Count - $MaxInboxItems
+        $script:miInbox.DropDownItems.Add("... and $more more").Enabled = $false
+    }
+}
+
+# Context menu: Inbox, Status balloon, Restart daemon, Exit.
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
+
+# Built when the menu opens, not on the animation tick - one WSL call per
+# right-click rather than eleven a second.
+$script:miInbox = New-Object System.Windows.Forms.ToolStripMenuItem "Inbox"
+[void]$menu.Items.Add($script:miInbox)
+$menu.add_Opening({ Build-InboxMenu })
+[void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
 $miStatus = $menu.Items.Add("Show status")
 $miStatus.add_Click({

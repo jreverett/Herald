@@ -23,8 +23,27 @@ powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File herald-tray.ps1
 ```
 
 The script auto-detects the WSL `~/.herald` path via `wslpath`. Right-click the
-icon for **Show status / Restart daemon / Exit**; double-click shows a status
-balloon.
+icon for **Inbox / Show status / Restart daemon / Exit**; double-click shows a
+status balloon.
+
+## The Inbox menu
+
+The **Inbox** submenu lists open items and offers two actions on each, which is
+usually quicker than a terminal when you are debugging routing.
+
+- **Close (reversible)** runs `herald close`. The item leaves the list, the
+  record is kept as history, and `herald reopen` puts it back.
+- **Delete permanently...** runs `herald rm` behind a confirmation box. The
+  record is not kept: the item leaves `herald thread`, `herald reply` can no
+  longer answer it, and a delivery the sender is still retrying could arrive
+  again as a new item.
+
+The list is built when the menu opens, not on the animation tick, so it costs one
+`herald inbox --json` call per right-click. Actions run as `HERALD_AGENT`
+`herald-tray` and pass each item's own mailbox, because the default lane does not
+match an item that arrived on another one. Results and failures appear as a
+balloon. Pass `-MenuAgent` or `-MaxInboxItems` to change the agent name or the
+15-item cap.
 
 ## Auto-start on login
 
