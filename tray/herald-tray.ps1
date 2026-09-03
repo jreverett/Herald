@@ -317,7 +317,13 @@ $miStatus.add_Click({
 
 $miRestart = $menu.Items.Add("Restart daemon")
 $miRestart.add_Click({
-    try { Start-Process -WindowStyle Hidden wsl.exe -ArgumentList @('-e', 'bash', '-lc', $DaemonCmd) } catch {}
+    # Through Invoke-Herald rather than Start-Process: an -ArgumentList array is
+    # joined with spaces and never quoted, so bash -lc got the single word 'if'
+    # and died on a syntax error behind a hidden window. Menu items that do
+    # nothing and say nothing are worse than no menu item.
+    $r = Invoke-Herald $DaemonCmd
+    if ($r.ok) { Show-Balloon "herald" "Daemon restarted." }
+    else { Show-Balloon "herald - restart failed" $r.out }
 })
 
 $miExit = $menu.Items.Add("Exit")

@@ -2,6 +2,19 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.9.8
+
+- **Fixed: the tray's "Restart daemon" menu item never restarted anything, and
+  said nothing about it.** It launched the command with
+  `Start-Process -ArgumentList @('-e','bash','-lc', $DaemonCmd)`, and PowerShell
+  joins an argument array with spaces without quoting it, so `bash -lc` received
+  the single word `if` and exited on a syntax error behind a hidden window.
+  Observed live: a daemon clicked twice was still the same pid on the same
+  version 23 hours later, with no error anywhere. It now goes through
+  `Invoke-Herald`, which quotes the argument the same way the Inbox menu already
+  did, and reports the outcome in a balloon - a menu item that silently does
+  nothing is worse than no menu item.
+
 ## 0.9.7
 
 - **The tray said something was waiting on you but never which item.** The
