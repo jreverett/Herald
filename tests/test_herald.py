@@ -379,8 +379,10 @@ class Protocol(unittest.TestCase):
         return env
 
     def start_daemon(self, name):
+        launch = ("import faulthandler,runpy,sys; faulthandler.dump_traceback_later(15); "
+                  "sys.argv=[sys.argv[1], 'daemon']; runpy.run_path(sys.argv[0], run_name='__main__')")
         with open(os.path.join(self.root, f"{name}.log"), "a") as log:
-            p = subprocess.Popen([sys.executable, HERALD_PY, "daemon"], env=self._env(name),
+            p = subprocess.Popen([sys.executable, "-c", launch, HERALD_PY], env=self._env(name),
                                  stdout=log, stderr=subprocess.STDOUT)
         self.daemons[name] = p
 
