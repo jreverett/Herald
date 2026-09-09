@@ -41,6 +41,13 @@ def free_port():
 
 
 class PureFunctions(unittest.TestCase):
+    def test_receiver_startup_does_not_need_reverse_dns(self):
+        server_type = getattr(herald, "ReceiverServer", herald.ThreadingHTTPServer)
+
+        with patch.object(socket, "getfqdn", side_effect=AssertionError("Reverse DNS must not block startup")):
+            with server_type(("127.0.0.1", 0), herald.Handler) as server:
+                self.assertGreater(server.server_address[1], 0)
+
     def test_sanitize_filename_strips_paths_and_dotdot(self):
         self.assertEqual(herald.sanitize_filename("../../etc/passwd"), "passwd")
         self.assertEqual(herald.sanitize_filename("a\\b\\c.txt"), "c.txt")
@@ -163,6 +170,7 @@ class WorkingMarkers(unittest.TestCase):
         self.assertEqual(herald.working_labels(), [])
         self.assertFalse((herald.WORKING_DIR / "crashed-tab.json").exists())
 
+    @patch.object(herald, "process_start_ticks", lambda pid: 123)
     def test_a_live_session_keeps_its_marker_between_tool_calls(self):
         # Only a tool call refreshes the stamp, and a turn can think for minutes
         # without making one, so the short lease must not apply to a live session.
@@ -213,6 +221,7 @@ class WorkingMarkers(unittest.TestCase):
         self.assertEqual(herald._start_ticks_from_stat(f"1234 (claude) {tail}"), 987654)
         self.assertEqual(herald._start_ticks_from_stat(f"1234 (my app) {tail}"), 987654)
 
+    @patch.object(herald, "process_start_ticks", lambda pid: 123)
     def test_a_recycled_pid_is_not_mistaken_for_the_session(self):
         # A pid alone is reused, so "the pid still exists" would report an
         # unrelated process as the original session - the failure direction that
@@ -226,6 +235,17 @@ class WorkingMarkers(unittest.TestCase):
         path.write_text(json.dumps(rec))
 
         self.assertEqual(herald.working_labels(), [])
+
+    @patch.object(herald, "process_start_ticks", lambda pid: None)
+    def test_process_without_start_time_uses_short_lease(self):
+        herald.mark_working("unknown-start", "studio", pid=os.getpid())
+        path = herald.WORKING_DIR / "unknown-start.json"
+        item = json.loads(path.read_text())
+        self.assertTrue(herald.working_alive(item))
+
+        item["heartbeat"] = time.time() - herald.WORKING_LEASE - 1
+
+        self.assertFalse(herald.working_alive(item))
 
     def test_a_marker_from_a_previous_boot_is_not_trusted(self):
         # Start times count from boot, so they only compare within one.
@@ -1520,8 +1540,12 @@ class Protocol(unittest.TestCase):
         # stays and does the work while the listener process comes and goes
         claimed = self.cli("bob", "read", task["id"], agent="bob-w")
         self.assertEqual(claimed.returncode, 0, claimed.stderr)
-        self.assertIsInstance(self._load(os.path.join(
-            self.homes["bob"], "inbox", f"{task['id']}.json")).get("claimed_pid"), int)
+        claimed_pid = self._load(os.path.join(
+            self.homes["bob"], "inbox", f"{task['id']}.json")).get("claimed_pid")
+        if sys.platform.startswith("linux"):
+            self.assertIsInstance(claimed_pid, int)
+        else:
+            self.assertIsNone(claimed_pid)
         self.cli("bob", "result", task["id"], "--status", "accepted",
                  "-m", "Received. Asking my human.", agent="bob-w")
 
@@ -1620,6 +1644,7 @@ class Protocol(unittest.TestCase):
         self.assertTrue(held["blocked"], "accepted promises an answer from the human")
         self.assertIn("accepted", held["blocked_reason"])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Harness activity attribution requires Linux /proc")
     def test_daemon_publishes_working_turns_in_status(self):
         # The tray reads status.json only, so a marker the daemon never republishes
         # is invisible however correct the store is. A turn counts as herald's work

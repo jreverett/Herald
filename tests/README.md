@@ -18,6 +18,8 @@ are isolated and don't touch a real install.
 
 `python3 tests/run_tests.py` also rejects a run where no tests execute. GitHub
 Actions runs it on Linux and macOS for pushes and pull requests.
+The two tests for real harness-process attribution require Linux `/proc` and
+skip on macOS. Ownership, delivery, queue, and portable lease tests run on both.
 
 `tests/test_ownership.py` covers absent recipients, cross-mailbox listeners,
 inspection without file writes, explicit takeover, returned work, stale queued

@@ -50,6 +50,7 @@ import urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
 __version__ = "0.10.0"
 
@@ -931,6 +932,12 @@ def resolve_listen_host(host):
     return ip
 
 
+class ReceiverServer(ThreadingHTTPServer):
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def cmd_daemon(cfg, args):
     ensure_dirs()
     listen = cfg.get("listen", {})
@@ -943,12 +950,14 @@ def cmd_daemon(cfg, args):
     Handler.peer_by_token = {p["issued_token"]: name
                              for name, p in cfg.get("peers", {}).items() if p.get("issued_token")}
     scope = "tailnet-only" if listen.get("host", "auto") == "auto" else "custom bind"
+    server = ReceiverServer((host, port), Handler)
     print(f"herald v{__version__} daemon: {cfg['me']} listening on {host}:{port} ({scope}), inbox {INBOX_DIR}",
           flush=True)
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     threading.Thread(target=_maintenance_loop, args=(cfg["me"], f"{host}:{port}", started),
                      daemon=True).start()
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    with server:
+        server.serve_forever()
 
 
 def _maintenance_loop(me, listen, started):

@@ -20,6 +20,9 @@ Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the runni
   records retain age, attempt count, last attempt, and connection error.
 - Regression tests cover routing, ownership, inspection, recovery, concurrent
   claims, outgoing lifecycle, and the actual Windows Forms menu functions.
+- A reverse DNS lookup could block daemon startup before it accepted requests.
+  Binding now uses the configured address directly, and the startup message is
+  printed only after the server has bound its listening socket.
 
 ## 0.9.8
 
