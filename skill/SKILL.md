@@ -19,7 +19,7 @@ profiles share that daemon unless they use a different `HERALD_DIR`.
 ## Required first step
 
 Before `send`, `reply`, `result`, `read`, `wait`, `resume`, `ask`, `close`,
-`reopen`, or `inbox --mine`, set `HERALD_AGENT` to a distinct name for the
+`reopen`, `takeover`, `accept`, or `inbox --mine`, set `HERALD_AGENT` to a distinct name for the
 current agent session. Use the same value for every Herald command in that
 session. The CLI rejects these commands when the value is missing.
 
@@ -59,6 +59,8 @@ herald send <person> -t "run the ImageGen tests"      # task request
 herald reply <inbox-id> -m "..."                      # continue a thread
 herald result <inbox-id> --status done -m "42 passed" -f out.txt
 herald thread <thread-id>                             # view whole conversation
+herald peek <inbox-id>                                # full message, no claim or file writes
+herald outgoing [--json]                              # queued, rejected, or awaiting reply
 herald flush [person]                                 # retry items queued for offline peers
 herald send <person> -t "..." --mailbox work          # address durable work
 herald send <person> -t "..." --agent laptop-ticket99 # address one live session
@@ -91,10 +93,11 @@ herald ping <person>                                  # is their daemon up? whic
   mailbox is rejected instead of becoming invisible work.
 - **Request targeting:** `herald ask` registers a private listener before it
   sends. `reply` and `result` return to that exact request listener first. If it
-  is gone, they remain in the originating durable mailbox for `herald resume`.
+  is gone, they remain reserved for the originating agent. That agent can use
+  `wait` or `resume` later. A different agent must use `takeover <id>` first.
 - **Exact live-session targeting:** use `--agent <name>` only when the work must
   reach one named live session. This is less durable than mailbox routing.
-- **An agent name is an address; a mailbox is only a fallback.** An item
+- **An agent name is an address; a mailbox does not override it.** An item
   addressed to an agent reaches a live listener under that name wherever it is
   listening. Only untargeted work goes to whichever listener owns the mailbox.
   `--all` creates one item in every registered recipient mailbox. It does not
@@ -102,6 +105,8 @@ herald ping <person>                                  # is their daemon up? whic
 - **If an exact target never appears**, `--fallback hold` keeps it pinned. Use
   `broadcast` to move it to the default mailbox after the give-up period, or
   `bounce` to return an undeliverable notice. `hold` is the default.
+  `broadcast` is explicit permission to release the item after the timeout.
+  Use the default `hold` for private work and replies.
 - Always attach `--meta` the receiving agent will need (repo, branch, ticket,
   paths). Attach files rather than pasting large content into text.
 - Keep text terse and information-dense — the reader is an agent.
@@ -128,18 +133,16 @@ herald ping <person>                                  # is their daemon up? whic
   expected reply, so it survives until the answer lands. The reply is never
   lost without a listener, it just sits unread until someone checks the inbox —
   which can be hours, and is invisible to your human.
-  If the account, tab, or product changed, use `herald resume` instead of
-  `wait`. It takes ownership of the mailbox and presents existing open work.
+  If the agent name is unchanged, use `herald resume` to recover existing work.
+  If the agent name changed, inspect with `peek` and use `takeover <id>` for
+  each named item that is part of the agreed handoff. `resume` transfers shared
+  mailbox work only.
   A `herald wait` that times out **exits 2**, not 0. In a harness that reports
   background jobs by exit status, a short `--timeout` turns every idle stretch
   into a "failure" notification, which trains you to ignore listener exits —
   the one signal you need to act on. Never wire an alert to that exit code.
-  - **A listener that delivered someone else's item.** The likeliest moment to
-    lose your own reply. A shared mailbox hands the live listener whatever is
-    pending, including items addressed to sessions that have ended. You deal
-    with that item, the listener has already exited, and the reply you were
-    actually waiting for arrives with nothing listening. Handling a foreign
-    item is not progress on your own wait — restart the listener as well.
+  - A listener can receive shared work while you wait for a named reply.
+    Restart it after handling that shared item if your reply is outstanding.
 - **Close every Herald turn with `herald inbox --unclaimed`.** The rules above
   are "remember to" rules and they get missed; this is the check that catches it
   regardless. It needs no listener, costs one command, and prints exactly what
@@ -155,6 +158,9 @@ herald ping <person>                                  # is their daemon up? whic
   pushed now with `herald flush`. A send the peer actively *rejects* (bad
   token/URL) is not queued — it errors so you fix it. Don't resend a queued
   message.
+  `herald outgoing --json` lists queued items, rejected deliveries, and
+  delivered requests awaiting replies. Queue rows include age, attempt count,
+  last attempt, last error, and retry status. Automatic retries need the daemon.
 
 ## Daemon role
 
@@ -174,29 +180,39 @@ keeps the item until one starts.
 `herald inbox` shows open work. `--unclaimed` shows only pending items.
 `--history` shows handled items. `--json` prints the listing as one object per
 item (and `[]` when empty) for a script or a menu to read, so nothing has to
-reimplement herald's rules about what counts as open. `herald read <id>` claims an
+reimplement herald's rules about what counts as open. Inspect with
+`herald peek <id>` before deciding whether to act. It shows the full body and
+attachment names without claiming, changing state, or extracting files.
+`herald read <id>` claims an
 item and changes it from `pending` to `active`. Use `herald close <id>` when no
 reply is required. Use `herald reopen <id>` to return handled work to pending.
 `herald rm <id>` deletes an item and its files outright, for clearing debris while
 debugging - it keeps no history, so the item leaves `herald thread`, `herald reply`
 can no longer answer it, and a delivery still being retried can arrive again as a
 new item. It refuses an item held by another live session unless you pass
-`--force`. Prefer `close`. Herald keeps handled
-JSON records as history and does not delete them automatically. `close` and
-`reopen` also work on an item left behind by a session that has ended, so open
-work is never stranded under a name nobody uses any more; `reopen` releases it
-back to the mailbox. An item whose target session is still live stays private
-to it.
+`--force`. Ordinary removal also checks the intended recipient. Prefer `close`.
+Herald keeps handled JSON records as history and does not delete them automatically.
+Named items remain reserved even when their listener is absent. `read`, `close`,
+`reply`, `result`, and `accept` check ownership before acting.
+
+`herald reopen <id>` preserves the recipient. A session that wrongly claimed
+the item can return it with `reopen`; it must not close it. A different session
+can take agreed work with `herald takeover <id>` from the item's mailbox.
+Takeover records the change and preserves the original recipient for inspection.
+It applies to that item only, not to future messages for the previous agent.
+Do not use takeover merely to read or clear another session's work.
 
 To stay reachable, run `herald wait` as a background process. It becomes the
 single general consumer for the current mailbox. It scans existing pending work
-as well as new files, prints one item, and exits. Add `--read` to print and claim
-the item in the same command. Restart it after each wake.
+as well as new files, claims one eligible item, prints a notification, and exits.
+Add `--read` to print the full claimed item and extract attachments.
+`wait` always claims; use `peek` for inspection. Restart the listener after each wake.
 
 Use `herald resume` after a Claude account switch, a Codex or Copilot takeover,
 a restarted tab, or any other handoff. It supersedes the previous general
 consumer and presents the oldest eligible open item, even if that item arrived
-before this listener started or was already active in the previous agent.
+before this listener started or was already active as shared mailbox work.
+It does not transfer items addressed to a different agent.
 `herald ask` is request-scoped and can run beside the general consumer without
 stealing unrelated work.
 
@@ -206,15 +222,15 @@ the items addressed to its own `HERALD_AGENT`. The first listener owns the
 mailbox and additionally receives anything sent without a named agent; a later
 listener under a different name coexists and prints `Listening alongside ...` so
 it knows it is not the owner. Running a single listener behaves exactly as
-before: it owns the mailbox and gets everything.
+before for shared work. Named work still requires the named agent.
 
 Taking the mailbox is a separate, explicit act:
 
 - `herald wait` under the **same** agent name reclaims the mailbox - a restarted
   tab is the same worker, not a second one.
 - `herald resume` takes it from a different agent, for a genuine handoff, and
-  prints `Displaced a live listener ...` naming who it displaced. Treat that as
-  a warning that the next items may not be yours.
+  prints `Displaced a live listener ...` naming who it displaced. This transfers
+  shared mailbox work, not named items.
 
 `herald sessions` shows who currently owns the mailbox and its heartbeat age.
 
@@ -227,12 +243,11 @@ herald mailbox add notifier
 HERALD_MAILBOX=notifier HERALD_AGENT=my-session herald wait
 ```
 
-**Never answer an item that is not your session's work.** `to_agent` is not
-proof of address - an item can carry a `to_agent` label while `targeted` is
-false, which means it was delivered to the mailbox and handed to whichever
-general consumer is live. Read the subject: if it concerns a workstream this
-session has not done, say so and hand it back rather than reconstructing an
-answer. An item addressed to a session that has ended is not yours to answer.
+**Never answer an item that is not your session's work.** Inbox JSON exposes
+`intended_agent` (the original address), `recipient_agent` (the current recipient),
+`assigned_agent`, and `claimed_by` separately. `recipient_label` says either
+`to <agent>` or `shared mailbox <name>`. Legacy untargeted `to_agent` values are
+assignment labels, not named recipients. Use `peek` for the context before acting.
 
 Inbox lifecycle:
 

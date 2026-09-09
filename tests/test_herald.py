@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -106,9 +107,10 @@ class PureFunctions(unittest.TestCase):
 
     def test_summarise_includes_key_fields(self):
         item = {"id": "X", "kind": "task", "from": "bob", "status": "pending",
-                "to_agent": "laptop-1", "files": [], "claimed_by": "", "text": "do the thing"}
+                "to_agent": "laptop-1", "targeted": True,
+                "files": [], "claimed_by": "", "text": "do the thing"}
         line = herald.summarise(item, "in")
-        for token in ("X", "task", "pending", "bob", "->laptop-1", "do the thing"):
+        for token in ("X", "task", "pending", "bob", "to laptop-1", "do the thing"):
             self.assertIn(token, line)
 
     def test_legacy_claimed_and_progress_items_are_history(self):
@@ -267,7 +269,8 @@ class WorkingMarkers(unittest.TestCase):
 
         self.assertEqual(herald._repo_label(deep), "azuredevops")
         # outside a repository the directory's own name is all there is
-        self.assertEqual(herald._repo_label(root), os.path.basename(root))
+        with patch.object(pathlib.Path, "exists", return_value=False):
+            self.assertEqual(herald._repo_label(root), os.path.basename(root))
 
     def test_repeated_labels_collapse_with_a_count(self):
         # Two tabs on one repo share a working directory; the tooltip must not
@@ -322,7 +325,10 @@ class Protocol(unittest.TestCase):
         self.root = tempfile.mkdtemp(prefix="herald-test-")
         self.homes = {"alice": os.path.join(self.root, "alice"),
                       "bob": os.path.join(self.root, "bob")}
-        self.ports = {"alice": free_port(), "bob": free_port()}
+        with socket.socket() as alice_socket, socket.socket() as bob_socket:
+            alice_socket.bind(("127.0.0.1", 0))
+            bob_socket.bind(("127.0.0.1", 0))
+            self.ports = {"alice": alice_socket.getsockname()[1], "bob": bob_socket.getsockname()[1]}
         # per-peer inbound tokens: TA is what bob presents to reach alice; TB what alice presents to reach bob
         self.TA, self.TB = "tok-alice-issues-bob", "tok-bob-issues-alice"
         self._write_config("alice", "bob", issued=self.TA, token=self.TB)
@@ -532,7 +538,7 @@ class Protocol(unittest.TestCase):
 
         duplicate = self.cli("bob", "read", item["id"], agent="bob-2")
         self.assertNotEqual(duplicate.returncode, 0)
-        self.assertIn("herald resume", duplicate.stderr)
+        self.assertIn("herald takeover", duplicate.stderr)
 
     def test_result_auto_targets_sending_session(self):
         # regression: a reply must route back to the exact session that sent the task.
@@ -588,6 +594,86 @@ class Protocol(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.wait_for_listener(name, agent)
         return proc
+
+    def test_reply_waits_for_its_absent_recipient_despite_mailbox_owner(self):
+        sent = self.cli("alice", "send", "bob", "-t", "RCA request", agent="alice-target")
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        task = self.wait_for_inbox("bob", lambda i: i["text"] == "RCA request")
+        other = self._listener("alice", "alice-other")
+        try:
+            result = self.cli("bob", "result", task["id"], "--status", "done",
+                              "-m", "PRIVATE-RESULT", agent="bob-worker")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            reply = self.wait_for_inbox("alice", lambda i: i["text"] == "PRIVATE-RESULT")
+            self.assertTrue(reply["targeted"])
+            self.assertTrue(reply["mailbox_targeted"])
+            self.assertEqual(reply["to_agent"], "alice-target")
+            self.assertFalse(reply["assigned_session"])
+            for verb in ("read", "close", "reopen"):
+                denied = self.cli("alice", verb, reply["id"], agent="alice-other")
+                self.assertNotEqual(denied.returncode, 0, denied.stdout)
+            resumed = self.cli("alice", "resume", "--timeout", "1", agent="alice-other")
+            self.assertEqual(resumed.returncode, 2, resumed.stdout)
+            held = next(i for i in self.inbox("alice") if i["id"] == reply["id"])
+            self.assertEqual(held["state"], "pending")
+            self.assertEqual(held["claimed_by"], "")
+            target = self.cli("alice", "wait", "--timeout", "3", agent="alice-target")
+            self.assertEqual(target.returncode, 0, target.stderr)
+            self.assertIn("NEW [to alice-target]", target.stdout)
+            taken = next(i for i in self.inbox("alice") if i["id"] == reply["id"])
+            self.assertEqual(taken["claimed_by"], "alice-target")
+        finally:
+            if other.poll() is None:
+                other.kill()
+            out, _ = other.communicate()
+        self.assertNotIn("PRIVATE-RESULT", out)
+
+    def test_outgoing_queue_becomes_waiting_then_disappears_after_result(self):
+        self.stop_daemon("bob")
+        result = self.cli("alice", "send", "bob", "-t", "QUEUED-REQUEST", agent="alice-target")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queued = json.loads(self.cli("alice", "outgoing", "--json").stdout)
+        self.assertEqual([row["state"] for row in queued], ["queued"])
+        self.assertTrue(queued[0]["last_error"])
+        self.start_daemon("bob")
+        self.assertTrue(self._wait_port(self.ports["bob"]))
+        self.assertEqual(self.cli("alice", "flush", "bob").returncode, 0)
+        waiting = json.loads(self.cli("alice", "outgoing", "--json").stdout)
+        self.assertEqual([row["state"] for row in waiting], ["awaiting_reply"])
+        task = self.wait_for_inbox("bob", lambda i: i["text"] == "QUEUED-REQUEST")
+        result = self.cli("bob", "result", task["id"], "--status", "done", "-m", "done", agent="bob-worker")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.cli("alice", "outgoing", "--json").stdout), [])
+
+    def test_concurrent_claims_have_exactly_one_owner(self):
+        sent = self.cli("alice", "send", "bob", "-t", "RACE", agent="alice-target")
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        task = self.wait_for_inbox("bob", lambda i: i["text"] == "RACE")
+        gate = pathlib.Path(self.root) / "start"
+        code = ("import os,pathlib,sys,time; gate=pathlib.Path(sys.argv[1]); "
+                "pathlib.Path(sys.argv[2]).touch()\n"
+                "while not gate.exists(): time.sleep(0.01)\n"
+                "os.execv(sys.executable, [sys.executable, sys.argv[3], 'read', sys.argv[4]])")
+        workers = []
+        try:
+            for agent in ("one", "two"):
+                workers.append(subprocess.Popen(
+                    [sys.executable, "-c", code, str(gate), str(gate.with_name(agent)), HERALD_PY, task["id"]],
+                    env=self._env("bob", agent), cwd=self.root,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+            deadline = time.time() + 5
+            while not all(gate.with_name(a).exists() for a in ("one", "two")):
+                self.assertLess(time.time(), deadline, "Both claimants must reach the barrier")
+                time.sleep(0.01)
+            gate.touch()
+            for worker in workers:
+                worker.communicate(timeout=10)
+            self.assertEqual(sorted(w.returncode for w in workers), [0, 1])
+        finally:
+            for worker in workers:
+                if worker.poll() is None:
+                    worker.kill()
+                worker.communicate()
 
     def test_two_listeners_on_one_mailbox_each_get_their_own_item(self):
         """Jamie's setup: two tabs, two topics, one mailbox. Each must receive the
@@ -1065,7 +1151,7 @@ class Protocol(unittest.TestCase):
         self.assertEqual(pathlib.Path(bell).read_bytes(), b"\a")
         self.assertIn("Rang the terminal bell", r.stdout)
 
-    def test_close_and_reopen_free_an_item_pinned_to_a_gone_session(self):
+    def test_named_item_requires_explicit_takeover_when_listener_is_absent(self):
         def pin(text):
             self.cli("alice", "send", "bob", "-t", text, "--agent", "ghost-session",
                      agent="alice-1")
@@ -1075,15 +1161,21 @@ class Protocol(unittest.TestCase):
 
         closed = pin("PINNED-CLOSE")
         r = self.cli("bob", "close", closed["id"], agent="bob-other")
+        self.assertNotEqual(r.returncode, 0)
+        r = self.cli("bob", "takeover", closed["id"], agent="bob-other")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.cli("bob", "close", closed["id"], agent="bob-other")
         self.assertEqual(r.returncode, 0, r.stderr)
 
         reopened = pin("PINNED-REOPEN")
         r = self.cli("bob", "reopen", reopened["id"], agent="bob-other")
+        self.assertNotEqual(r.returncode, 0)
+        r = self.cli("bob", "reopen", reopened["id"], agent="ghost-session")
         self.assertEqual(r.returncode, 0, r.stderr)
         freed = self.wait_for_inbox("bob", lambda i: i["id"] == reopened["id"]
                                     and i.get("state") == "pending")
-        self.assertEqual(freed.get("to_agent"), "")
-        self.assertTrue(freed.get("unpinned"))
+        self.assertEqual(freed.get("to_agent"), "ghost-session")
+        self.assertTrue(freed.get("targeted"))
 
     def test_pinned_item_stays_private_to_a_live_target_session(self):
         listener = subprocess.Popen(
@@ -1310,14 +1402,16 @@ class Protocol(unittest.TestCase):
         tasks = [i for i in self.inbox("bob") if i.get("text") == "ALL-WORK"]
         self.assertEqual(len(tasks), 2)
 
-        self.cli("bob", "result", tasks[0]["id"], "--status", "done",
-                 "-m", "first", agent="bob-1")
+        first = self.cli("bob", "result", tasks[0]["id"], "--status", "done",
+                         "-m", "first", agent="bob-1", mailbox=tasks[0]["to_mailbox"])
+        self.assertEqual(first.returncode, 0, first.stderr)
         request = next(i for i in self.outbox("alice") if i.get("text") == "ALL-WORK")
         self.assertEqual(request.get("state"), "awaiting_terminal")
         self.assertEqual(len(request.get("awaiting_reply_ids", [])), 1)
 
-        self.cli("bob", "result", tasks[1]["id"], "--status", "done",
-                 "-m", "second", agent="bob-2")
+        second = self.cli("bob", "result", tasks[1]["id"], "--status", "done",
+                          "-m", "second", agent="bob-2", mailbox=tasks[1]["to_mailbox"])
+        self.assertEqual(second.returncode, 0, second.stderr)
         request = next(i for i in self.outbox("alice") if i.get("text") == "ALL-WORK")
         self.assertEqual(request.get("state"), "handled")
         self.assertEqual(request.get("awaiting_reply_ids"), [])
@@ -1405,7 +1499,8 @@ class Protocol(unittest.TestCase):
         item = self.wait_for_inbox("bob", lambda i: i["text"] == "single delivery")
         self.assertIsNotNone(item)
         self.assertFalse(item.get("broadcast"))
-        self.assertEqual(item.get("to_agent"), "bob-tab")   # handed to the one live session
+        self.assertEqual(item.get("to_agent"), "")
+        self.assertEqual(item.get("assigned_session"), "bob-tab")
 
     def test_an_accepted_task_reports_as_waiting_on_the_human(self):
         # A harness with no hooks raises nothing else, so 'accepted' - which

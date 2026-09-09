@@ -2,6 +2,25 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.10.0
+
+- Named replies could reach another session when their listener stopped because
+  the reply also carried a mailbox. Named routing and ownership checks now apply
+  regardless of mailbox, listener presence, or an obsolete preferred listener.
+- `reopen` no longer erases the recipient. `takeover <id>` explicitly transfers
+  one item and records its previous owner. An old queued response cannot close
+  work that has since been reopened or transferred.
+- `peek` shows the full message without claiming or extracting attachments.
+  Notifications and tray rows lead with the recipient. Inbox JSON distinguishes
+  the original recipient, current recipient, listener assignment, and claimant.
+- Shared work remains with the mailbox consumer. A listener for another agent
+  no longer hides an unread named item from the tray warning.
+- `outgoing --json` and the tray's Outgoing / queued menu distinguish queued
+  messages, failed deliveries, and delivered requests awaiting replies. Queue
+  records retain age, attempt count, last attempt, and connection error.
+- Regression tests cover routing, ownership, inspection, recovery, concurrent
+  claims, outgoing lifecycle, and the actual Windows Forms menu functions.
+
 ## 0.9.8
 
 - **Fixed: the tray's "Restart daemon" menu item never restarted anything, and
