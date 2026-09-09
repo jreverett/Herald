@@ -8,7 +8,7 @@ import unittest
 root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root))
 suite = unittest.defaultTestLoader.discover(str(root / "tests"))
-result = unittest.TextTestRunner(verbosity=2).run(suite)
+result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
 if result.testsRun <= len(result.skipped):
     sys.exit("No tests executed")
 sys.exit(0 if result.wasSuccessful() else 1)

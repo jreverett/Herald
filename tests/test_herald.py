@@ -334,12 +334,15 @@ class Protocol(unittest.TestCase):
         self._write_config("alice", "bob", issued=self.TA, token=self.TB)
         self._write_config("bob", "alice", issued=self.TB, token=self.TA)
         self.daemons = {}
+        self.addCleanup(self._cleanup_daemons)
         self.start_daemon("alice")
         self.start_daemon("bob")
         for name in ("alice", "bob"):
-            self.assertTrue(self._wait_port(self.ports[name]), f"{name} daemon did not come up")
+            if not self._wait_port(self.ports[name]):
+                log = pathlib.Path(self.root, f"{name}.log").read_text()
+                self.fail(f"{name} daemon did not come up: {self.last_connection_error}\n{log}")
 
-    def tearDown(self):
+    def _cleanup_daemons(self):
         for p in self.daemons.values():
             p.terminate()
         for p in self.daemons.values():
@@ -376,8 +379,9 @@ class Protocol(unittest.TestCase):
         return env
 
     def start_daemon(self, name):
-        p = subprocess.Popen([sys.executable, HERALD_PY, "daemon"], env=self._env(name),
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(self.root, f"{name}.log"), "a") as log:
+            p = subprocess.Popen([sys.executable, HERALD_PY, "daemon"], env=self._env(name),
+                                 stdout=log, stderr=subprocess.STDOUT)
         self.daemons[name] = p
 
     def stop_daemon(self, name):
@@ -407,7 +411,8 @@ class Protocol(unittest.TestCase):
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/ping", timeout=1)
                 return True
-            except (urllib.error.URLError, OSError):
+            except (urllib.error.URLError, OSError) as error:
+                self.last_connection_error = str(error)
                 time.sleep(0.1)
         return False
 
