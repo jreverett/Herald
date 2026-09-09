@@ -34,4 +34,4 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test Windows Forms menu behaviour
         shell: powershell
-        run: ./tests/test_tray.ps1
+        run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/test_tray.ps1
