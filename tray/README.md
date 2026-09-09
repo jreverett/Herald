@@ -41,12 +41,12 @@ powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File herald-tray.ps1
 ```
 
 The script auto-detects the WSL `~/.herald` path via `wslpath`. Right-click the
-icon for **Inbox / Show status / Restart daemon / Exit**; double-click shows a
+icon for **Inbox / Outgoing / queued / Show status / Restart daemon / Exit**; double-click shows a
 status balloon.
 
 ## The Inbox menu
 
-The **Inbox** submenu lists open items and offers two actions on each, which is
+The **Inbox** submenu lists open items and offers actions on each, which is
 usually quicker than a terminal when you are debugging routing.
 
 When the icon is red, the items that are the reason are red too, the parent
@@ -58,12 +58,29 @@ the count includes. Which rows those are is decided by herald itself
 `herald inbox --json`); the menu only paints what it is told, so the tooltip
 count and the marked rows cannot disagree.
 
-- **Close (reversible)** runs `herald close`. The item leaves the list, the
+- **View without claiming** runs `herald peek` and shows the full message in a
+  read-only window. It does not change ownership or extract attachments.
+- **Take ownership...** requires confirmation and runs `herald takeover` as the
+  tray agent. Use it only for an explicit handoff, not to inspect a message.
+- **Close (reversible)** runs `herald close` with ownership checks. The item leaves the list, the
   record is kept as history, and `herald reopen` puts it back.
 - **Delete permanently...** runs `herald rm` behind a confirmation box. The
   record is not kept: the item leaves `herald thread`, `herald reply` can no
   longer answer it, and a delivery the sender is still retrying could arrive
   again as a new item.
+
+Named rows show the intended recipient first. Shared rows say `shared mailbox`.
+A named item remains reserved when its listener is absent. A different listener
+on that mailbox does not suppress its unread warning.
+
+## The Outgoing / queued menu
+
+This menu reads `herald outgoing --json`. It lists queued messages, rejected
+deliveries, and delivered requests awaiting replies. Hover or click a row for
+the recipient, preview, age, attempt count, last attempt, error, and retry status.
+It performs no network requests and does not resend messages. Automatic retries
+require the daemon to be running. Old queue records show unknown attempt details
+until the next retry.
 
 The list is built when the menu opens, not on the animation tick, so it costs one
 `herald inbox --json` call per right-click. Actions run as `HERALD_AGENT`

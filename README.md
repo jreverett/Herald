@@ -36,10 +36,15 @@ triaging incoming work, threading discipline — lives in [skill/SKILL.md](skill
 
 Changing any of these changes the protocol. Read `skill/SKILL.md` before touching them.
 
-- **One general listener owns a mailbox.** A new listener from a different agent supersedes it. The
-  superseded listener exits without receiving the same item.
+- **One general listener owns shared mailbox work.** Other named listeners can coexist.
+  `resume` explicitly transfers the shared mailbox consumer.
 - **`ask` registers a request-scoped listener** that coexists with the general one. A `reply` or
-  `result` returns to that exact request first, then falls back to the originating mailbox.
+  `result` returns to that exact request first, then waits for the originating agent.
+- **A named recipient remains reserved without a listener.** A mailbox does not override the name.
+  `takeover <id>` explicitly transfers one item and preserves its original address.
+  The sender can explicitly permit timed release with `--fallback broadcast`.
+- **Inspection does not claim work.** `peek` shows the full item without extracting attachments.
+  `reopen` preserves the recipient; only the recipient or the releasing claimant can return it.
 - **Delivery is single-copy and deduplicated** by a stable delivery ID. A retry after an uncertain
   network response must not create a second inbox item.
 - **An item is never lost by having no listener.** It waits in `~/.herald/inbox` until one starts.
@@ -78,6 +83,9 @@ herald ping <peer>                          # daemon liveness and version, no ag
 
 herald inbox [--history|--unclaimed]        # open work, handled history, unpicked work
 herald read <id>                            # show, write attachments, claim
+herald peek <id>                            # full item, no claim or file writes
+herald takeover <id>                        # explicit ownership transfer in the item's mailbox
+herald outgoing [--json]                    # queued, rejected, and awaiting-reply items
 herald reply <id> -m "..."                  # same thread; peer and session inferred
 herald result <id> --status working|accepted|done|failed -m "..." [-f out]
 herald close <id> | herald reopen <id>
@@ -137,7 +145,7 @@ herald a reply, any turn in it counts, since a turn cannot be attributed to a to
 The red state is a separate question and is read from the inbox, never from the harness. A session is
 reused for all sorts of work, so a permission prompt in an unrelated turn is not herald waiting on
 you. Two inbox conditions raise it: a task this side answered `herald result --status accepted`,
-which promises an answer once the human decides, and an item on a mailbox no listener is attached to,
+which promises an answer once the human decides, and an item with no eligible recipient listener,
 which will sit unread until someone looks. Neither needs a hook, so both work under Codex and Copilot.
 
 Only a tool call refreshes the stamp, and a turn can think for minutes without making one, so the

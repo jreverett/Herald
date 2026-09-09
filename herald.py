@@ -50,8 +50,9 @@ import urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
-__version__ = "0.9.8"
+__version__ = "0.10.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -282,14 +283,16 @@ def herald_working_pids():
 
 BLOCK_ACCEPTED = "accepted"
 BLOCK_UNREAD = "unread"
+BLOCK_RECIPIENT = "recipient"
 BLOCK_REASONS = {
     BLOCK_ACCEPTED: "you accepted this task and it still owes an answer",
     BLOCK_UNREAD: "nothing is listening on this mailbox, so it sits unread",
+    BLOCK_RECIPIENT: "the intended recipient has no eligible listener, so this item is held",
 }
 
 
 def listening_mailboxes():
-    return {s.get("mailbox", "main") for s in live_sessions()}
+    return {s.get("mailbox", "main") for s in live_sessions(mode="general")}
 
 
 def blocking_reason(item, listening):
@@ -301,8 +304,16 @@ def blocking_reason(item, listening):
     state = item_state(item)
     if item.get("acked_status") == "accepted" and state == "active":
         return BLOCK_ACCEPTED
-    if state == "pending" and item.get("to_mailbox", "main") not in listening:
-        return BLOCK_UNREAD
+    if state == "pending":
+        sessions = read_sessions()
+        if _eligible_preferred(item, sessions.get(item.get("preferred_session", ""))):
+            return ""
+        recipient = recipient_agent(item)
+        if recipient:
+            if not _pick_live(sessions, agent=recipient):
+                return BLOCK_RECIPIENT
+        elif item.get("to_mailbox", "main") not in listening:
+            return BLOCK_UNREAD
     return ""
 
 
@@ -323,7 +334,7 @@ def awaiting_human():
         reason = blocking_reason(item, listening)
         if reason == BLOCK_ACCEPTED:
             accepted.append(f"{item.get('from') or '?'}'s task")
-        elif reason == BLOCK_UNREAD:
+        elif reason in (BLOCK_UNREAD, BLOCK_RECIPIENT):
             unread += 1
     return accepted + ([f"{unread} unread"] if unread else [])
 
@@ -567,8 +578,8 @@ def register_listener(cfg, mode="general", takeover=False):
             age = time.time() - displaced.get("heartbeat", 0)
             print(f"Displaced a live listener on mailbox '{listener['mailbox']}': agent "
                   f"'{displaced.get('agent')}' ({displaced.get('session_id')}), heartbeat "
-                  f"{age:.0f}s ago. Items meant for that session will now arrive here - "
-                  f"check an item is your work before acting on it. To listen without "
+                  f"{age:.0f}s ago. Shared mailbox work will now arrive here. "
+                  f"Named items require herald takeover <id>. To listen without "
                   f"displacing it, use your own mailbox (herald mailbox add <name>, then "
                   f"HERALD_MAILBOX=<name>).", file=sys.stderr, flush=True)
     write_session(listener)
@@ -589,8 +600,8 @@ def warn_if_owner_was_live(mailbox, agent):
     age = time.time() - owner.get("heartbeat", 0)
     print(f"Displaced a live listener on mailbox '{mailbox}': agent "
           f"'{owner.get('agent')}' ({owner.get('session_id')}), heartbeat {age:.0f}s ago. "
-          f"Items meant for that session will now arrive here - check an item is your "
-          f"work before acting on it. To listen without displacing it, use your own "
+          f"Shared mailbox work will now arrive here. Named items require herald "
+          f"takeover <id>. To listen without displacing it, use your own "
           f"mailbox (herald mailbox add <name>, then HERALD_MAILBOX=<name>).",
           file=sys.stderr, flush=True)
 
@@ -630,7 +641,7 @@ def active_assignment(item, sessions=None):
             # for items addressed to its agent name. This escape is only for a
             # session that never owned the mailbox - an owner that has since been
             # superseded must release its items so a handoff can pick them up.
-            if session.get("owns_mailbox", True) or item.get("to_agent") != session.get("agent"):
+            if recipient_agent(item) != session.get("agent"):
                 return None
     return session
 
@@ -683,7 +694,15 @@ def _apply_source_delivery(payload, delivery_state, error=""):
             changes["acknowledged_at"] = time.time()
     else:
         changes.update(state="delivery_failed", delivery_error=error, presented_generation=0)
-    update_inbox_item(item_id, **changes)
+    with state_lock():
+        path = INBOX_DIR / f"{item_id}.json"
+        if not path.exists():
+            return
+        item = json.loads(path.read_text())
+        if item.get("ownership_revision", 0) != payload.get("_source_revision", 0):
+            return
+        item.update(changes)
+        atomic_write_json(path, item)
 
 
 def _update_outstanding_request(item):
@@ -828,10 +847,10 @@ class Handler(BaseHTTPRequestHandler):
                 thread = thread or item_id
                 sessions = read_sessions()
                 preferred_session = str(item.get("to_session", ""))[:64]
-                selected = (sessions.get(preferred_session)
-                            if preferred_session and session_alive(preferred_session, sessions)
-                            else None)
-                target_agent = str(item.get("to_agent", ""))[:64]
+                selected = sessions.get(preferred_session)
+                if not _eligible_preferred(item, selected):
+                    selected = None
+                target_agent = str(recipient_agent(item))[:64]
                 # An agent name is an address. A live listener under that name gets
                 # the item wherever it is listening, even when another session owns
                 # the mailbox - otherwise two tabs sharing a mailbox each receive the
@@ -839,7 +858,7 @@ class Handler(BaseHTTPRequestHandler):
                 target_listener = (_pick_live(sessions, mailbox=destination, agent=target_agent)
                                    or _pick_live(sessions, agent=target_agent)) if target_agent else None
                 selected = selected or target_listener
-                if not selected and (not item.get("targeted") or item.get("to_mailbox")):
+                if not selected and not target_agent:
                     selected = current_consumer(destination, sessions) or _pick_live(
                         sessions, mailbox=destination)
                 stored = {
@@ -851,8 +870,7 @@ class Handler(BaseHTTPRequestHandler):
                     "from_agent": str(item.get("from_agent", ""))[:64],
                     "from_mailbox": str(item.get("from_mailbox") or "main")[:64],
                     "from_session": str(item.get("from_session", ""))[:64],
-                    "to_agent": str(target_agent or (
-                        selected.get("agent", "") if selected else ""))[:64],
+                    "to_agent": target_agent,
                     "to_mailbox": destination,
                     "preferred_session": preferred_session,
                     "assigned_session": selected.get("session_id", "") if selected else "",
@@ -888,7 +906,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "id": first["id"], "thread": first["thread"],
                          "ids": [stored["id"] for stored in stored_items]})
         if self.notify_command:
-            summary = f"{first['from']}: {first['kind']} - {first['text'][:120]}"
+            summary = f"{recipient_label(first)} - {first['from']}: {first['kind']} - {first['text'][:120]}"
             try:
                 subprocess.Popen(self.notify_command + [summary],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -914,6 +932,12 @@ def resolve_listen_host(host):
     return ip
 
 
+class ReceiverServer(ThreadingHTTPServer):
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def cmd_daemon(cfg, args):
     ensure_dirs()
     listen = cfg.get("listen", {})
@@ -926,12 +950,14 @@ def cmd_daemon(cfg, args):
     Handler.peer_by_token = {p["issued_token"]: name
                              for name, p in cfg.get("peers", {}).items() if p.get("issued_token")}
     scope = "tailnet-only" if listen.get("host", "auto") == "auto" else "custom bind"
+    server = ReceiverServer((host, port), Handler)
     print(f"herald v{__version__} daemon: {cfg['me']} listening on {host}:{port} ({scope}), inbox {INBOX_DIR}",
           flush=True)
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     threading.Thread(target=_maintenance_loop, args=(cfg["me"], f"{host}:{port}", started),
                      daemon=True).start()
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    with server:
+        server.serve_forever()
 
 
 def _maintenance_loop(me, listen, started):
@@ -992,6 +1018,22 @@ def _pick_live(sessions=None, mailbox=None, agent=None, mode="general"):
     return max(live, key=lambda session: session.get("heartbeat", 0)) if live else None
 
 
+def recipient_agent(item):
+    return item.get("taken_over_by") or (
+        item.get("to_agent", "") if item.get("targeted") and not item.get("unpinned") else "")
+
+
+def _eligible_preferred(item, session):
+    if not session or not _session_record_alive(session):
+        return False
+    if (session.get("mode") == "ask" and session.get("request_id")
+            and session["request_id"] != item.get("reply_to")):
+        return False
+    recipient = recipient_agent(item)
+    return (session.get("agent") == recipient if recipient else
+            session.get("mailbox", "main") == (item.get("to_mailbox") or "main"))
+
+
 def _route(cfg):
     """Assign each open item to one eligible listener instance."""
     sessions = read_sessions()
@@ -1004,26 +1046,26 @@ def _route(cfg):
             if item_state(item) == "handled":
                 continue
             preferred = item.get("preferred_session", "")
-            if preferred and session_alive(preferred, sessions):
+            if _eligible_preferred(item, sessions.get(preferred)):
                 if item.get("assigned_session") != preferred:
                     item["assigned_session"] = preferred
                     atomic_write_json(path, item)
                 continue
-            if item.get("targeted") and item.get("to_agent"):
+            recipient = recipient_agent(item)
+            if recipient:
                 destination = item.get("to_mailbox") or "main"
-                chosen = (_pick_live(sessions, mailbox=destination, agent=item["to_agent"])
-                          or _pick_live(sessions, agent=item["to_agent"]))
+                chosen = (_pick_live(sessions, mailbox=destination, agent=recipient)
+                          or _pick_live(sessions, agent=recipient))
                 if chosen:
                     next_session = chosen["session_id"]
                     if item.get("assigned_session") != next_session:
                         item["assigned_session"] = next_session
                         atomic_write_json(path, item)
                     continue
-                if item.get("targeted") and not item.get("mailbox_targeted"):
-                    if item.get("assigned_session"):
-                        item["assigned_session"] = ""
-                        atomic_write_json(path, item)
-                    continue
+                if item.get("assigned_session"):
+                    item["assigned_session"] = ""
+                    atomic_write_json(path, item)
+                continue
             assigned = item.get("assigned_session", "")
             if active_assignment(item, sessions):
                 continue
@@ -1065,13 +1107,15 @@ def _reap(cfg):
             if not targeted or now - item.get("received_ts", 0) < TARGET_GIVEUP:
                 atomic_write_json(path, item)
                 continue
-            target = item.get("to_mailbox") if item.get("mailbox_targeted") else item.get("to_agent")
-            target_live = (current_consumer(target, sessions) if item.get("mailbox_targeted")
-                           else _pick_live(sessions, agent=target))
-            if target_live or item.get("fallback", "hold") == "hold":
+            recipient = recipient_agent(item)
+            target = recipient or item.get("to_mailbox")
+            target_live = (_pick_live(sessions, agent=recipient) if recipient
+                           else current_consumer(target, sessions))
+            preferred = sessions.get(item.get("preferred_session", ""))
+            if target_live or _eligible_preferred(item, preferred) or item.get("fallback", "hold") == "hold":
                 atomic_write_json(path, item)
                 continue
-            target_type = "mailbox" if item.get("mailbox_targeted") else "agent"
+            target_type = "agent" if recipient else "mailbox"
             if item.get("fallback") == "bounce":
                 item.update(bounced=True, state="handled", handled_at=now)
                 notices.append((item, target,
@@ -1079,8 +1123,9 @@ def _reap(cfg):
                                 f"{item.get('kind')} in thread {item.get('thread')}; not reassigned.",
                                 "undeliverable"))
             else:
-                item.update(unpinned=True, targeted=False, mailbox_targeted=False,
-                            to_agent="", to_mailbox=configured_default_mailbox(cfg), assigned_session="")
+                item.update(unpinned=True, mailbox_targeted=False,
+                            fallback_applied_at=now,
+                            to_mailbox=configured_default_mailbox(cfg), assigned_session="")
                 notices.append((item, target,
                                 f"Reassigned: {target_type} '{target}' was unavailable, so your "
                                 f"{item.get('kind')} in thread {item.get('thread')} went to "
@@ -1097,6 +1142,7 @@ def _notify_origin(cfg, item, target, text, intent):
     payload = {"kind": "message", "text": text,
                "thread": item.get("thread", ""), "reply_to": item.get("id", ""),
                "to_agent": item.get("from_agent", ""),
+               "targeted": bool(item.get("from_agent")),
                "to_mailbox": item.get("from_mailbox") or "main",
                "to_session": item.get("from_session", ""),
                "fallback": "hold",
@@ -1142,7 +1188,7 @@ def _record_outbox(payload, result, peer_name):
                        for f in payload.get("files", [])]
     record.update(id=result["id"], thread=result["thread"], to=peer_name,
                   remote_ids=result.get("ids") or [result["id"]],
-                  sent=time.strftime("%Y-%m-%d %H:%M:%S"))
+                  sent=time.strftime("%Y-%m-%d %H:%M:%S"), sent_ts=time.time())
     with state_lock():
         if payload.get("_expects_terminal"):
             record["state"] = "awaiting_terminal"
@@ -1170,6 +1216,7 @@ def enqueue(peer_name, payload):
     d = QUEUE_DIR / sanitize_filename(peer_name)
     d.mkdir(parents=True, exist_ok=True)
     payload.setdefault("_qid", new_id())
+    payload.setdefault("_queued_at", time.time())
     atomic_write_json(d / f"{payload['_qid']}.json", payload)
     return len(list(d.glob("*.json")))
 
@@ -1193,6 +1240,10 @@ def flush_queue(cfg, peer_name, verbose=False):
     sent = 0
     for f in sorted(d.glob("*.json")):
         payload = json.loads(f.read_text())
+        payload["_attempts"] = payload.get("_attempts", 0) + 1
+        payload["_last_attempt_at"] = time.time()
+        payload["_retrying"] = True
+        atomic_write_json(f, payload)
         try:
             result = _post(cfg, peer, payload)
         except urllib.error.HTTPError as e:
@@ -1203,7 +1254,9 @@ def flush_queue(cfg, peer_name, verbose=False):
             if verbose:
                 print(f"  failed queued item for {peer_name}: rejected ({e.code})")
             continue
-        except urllib.error.URLError:
+        except urllib.error.URLError as e:
+            payload.update(_last_error=str(e.reason), _retrying=False)
+            atomic_write_json(f, payload)
             break
         _record_outbox(payload, result, peer_name)
         _apply_source_delivery(payload, "delivered")
@@ -1222,6 +1275,8 @@ def deliver(cfg, peer_name, payload, queue_on_fail=True):
     payload.setdefault("from_agent", sender_agent())
     payload.setdefault("from_mailbox", mailbox_name(cfg))
     flush_queue(cfg, peer_name)
+    payload["_attempts"] = payload.get("_attempts", 0) + 1
+    payload["_last_attempt_at"] = time.time()
     try:
         result = _post(cfg, peer, payload)
     except urllib.error.HTTPError as e:
@@ -1233,8 +1288,9 @@ def deliver(cfg, peer_name, payload, queue_on_fail=True):
     except urllib.error.URLError as e:
         if not queue_on_fail:
             sys.exit(f"Send to {peer_name} failed: {e.reason}")
-        depth = enqueue(peer_name, payload)
         reason = getattr(e, "reason", e)
+        payload.update(_last_error=str(reason), _retrying=False)
+        depth = enqueue(peer_name, payload)
         print(f"Peer '{peer_name}' is unreachable ({reason}) - queued for retry "
               f"({depth} pending). Delivers on next contact, or run: herald flush {peer_name}")
         _apply_source_delivery(payload, "queued")
@@ -1302,7 +1358,7 @@ def find_inbox_item(item_id):
 
 
 def cmd_reply(cfg, args):
-    orig = find_inbox_item(args.id)
+    orig = _claim_item(args.id, agent_name(), mailbox_name(cfg))
     meta = parse_meta(args.meta)
     payload = {
         "kind": "message",
@@ -1311,6 +1367,7 @@ def cmd_reply(cfg, args):
         "reply_to": orig["id"],
         "meta": meta,
         "_source_item_id": orig["id"],
+        "_source_revision": orig.get("ownership_revision", 0),
         "_source_effect": "ack" if meta.get("herald_intent") == "ack" else "final",
     }
     if args.all:
@@ -1336,6 +1393,7 @@ def cmd_result(cfg, args):
     orig = find_inbox_item(args.id)
     if orig["kind"] != "task":
         sys.exit(f"Item {args.id} is a {orig['kind']}, not a task")
+    orig = _claim_item(args.id, agent_name(), mailbox_name(cfg))
     payload = {
         "kind": "result",
         "status": args.status,
@@ -1344,6 +1402,7 @@ def cmd_result(cfg, args):
         "reply_to": orig["id"],
         "meta": parse_meta(args.meta),
         "_source_item_id": orig["id"],
+        "_source_revision": orig.get("ownership_revision", 0),
         "_source_effect": "ack" if args.status in ("accepted", "working") else "final",
     }
     if args.all:
@@ -1479,8 +1538,7 @@ def summarise(i, direction):
     who = f"from {i['from']}" if direction == "in" else f"to {i['to']}"
     status = f" [{i['status']}]" if i.get("status") else ""
     state = f" [{item_state(i)}]" if direction == "in" else f" [{i.get('state')}]" if i.get("state") else ""
-    target = (f" ->{i['to_agent']} mailbox {i.get('to_mailbox', 'main')}"
-              if i.get("to_agent") else f" ->{i.get('to_mailbox', 'main')}")
+    target = f" [{recipient_label(i)}]"
     files = f" ({len(i['files'])} file{'s' if len(i['files']) != 1 else ''})" if i.get("files") else ""
     claimed = f" (claimed: {i['claimed_by']})" if i.get("claimed_by") else ""
     preview = i["text"][:80].replace("\n", " ")
@@ -1488,13 +1546,29 @@ def summarise(i, direction):
 
 
 def _item_matches_mailbox(item, mailbox, agent):
-    if (item.get("to_mailbox") or "main") != mailbox:
-        return False
-    if (item.get("targeted") and not item.get("mailbox_targeted")
-            and item.get("to_agent") and item.get("to_agent") != agent
-            and not item.get("unpinned")):
-        return False
-    return True
+    recipient = recipient_agent(item)
+    return recipient == agent if recipient else (item.get("to_mailbox") or "main") == mailbox
+
+
+def recipient_label(item):
+    recipient = recipient_agent(item)
+    return f"to {recipient}" if recipient else f"shared mailbox {item.get('to_mailbox') or 'main'}"
+
+
+def _check_item_access(item, agent, mailbox):
+    if not _item_matches_mailbox(item, mailbox, agent):
+        sys.exit(f"Item {item['id']} is addressed to '{recipient_agent(item) or item.get('to_mailbox') or 'main'}'. "
+                 "Use herald peek to inspect it or herald takeover <id> for an explicit handoff.")
+    assignment = active_assignment(item)
+    if assignment and assignment.get("agent") != agent and not recipient_agent(item):
+        sys.exit(f"Item {item['id']} is assigned to live agent '{assignment.get('agent')}'.")
+    if (not recipient_agent(item) and item.get("claimed_mailbox")
+            and item["claimed_mailbox"] != mailbox):
+        sys.exit(f"Item {item['id']} is active in mailbox '{item['claimed_mailbox']}'.")
+    if (item.get("claimed_by") not in (None, "", agent) and item_state(item) != "pending"
+            and recipient_agent(item) != agent):
+        sys.exit(f"Item {item['id']} is active under agent '{item['claimed_by']}'. "
+                 "Use herald takeover <id> for an explicit handoff.")
 
 
 def _is_progress_item(item):
@@ -1502,37 +1576,16 @@ def _is_progress_item(item):
             or item.get("meta", {}).get("herald_intent") == "ack")
 
 
-def orphaned(item, mailbox, sessions=None):
-    """The item is pinned to, or claimed by, an agent with no live session. The
-    reaper skips items that were already claimed, so an explicit close or reopen
-    from the same mailbox is the only way one of these leaves the open list."""
-    if (item.get("to_mailbox") or "main") != mailbox:
-        return False
-    owners = {item.get("to_agent", ""), item.get("claimed_by", "")} - {""}
-    return bool(owners) and not any(_pick_live(sessions, agent=owner) for owner in owners)
-
-
-def _claim_item(item_id, agent, mailbox, listener=None, force=False, allow_orphan=False):
+def _claim_item(item_id, agent, mailbox, listener=None, force=False):
     path = INBOX_DIR / f"{item_id}.json"
     with state_lock():
         if not path.exists():
             sys.exit(f"No inbox item {item_id}")
         item = json.loads(path.read_text())
-        orphan = allow_orphan and orphaned(item, mailbox)
-        if not force and not orphan and not _item_matches_mailbox(item, mailbox, agent):
-            target = item.get("to_agent") or item.get("to_mailbox") or "main"
-            sys.exit(f"Item {item_id} is addressed to '{target}', not this agent mailbox.")
-        assignment = active_assignment(item)
-        if (not force and assignment and assignment.get("agent") != agent):
-            sys.exit(f"Item {item_id} is assigned to live agent '{assignment.get('agent')}'.")
-        owner_mailbox = item.get("claimed_mailbox", "")
-        if owner_mailbox and owner_mailbox != mailbox and not force:
-            sys.exit(f"Item {item_id} is active in mailbox '{owner_mailbox}'.")
-        if (not force and not orphan and item.get("claimed_by") not in ("", agent)
-                and item_state(item) != "pending"):
-            sys.exit(f"Item {item_id} is active under agent '{item.get('claimed_by')}'. "
-                     "Use `herald resume` to take over the mailbox.")
         if not force:
+            _check_item_access(item, agent, mailbox)
+            if item.get("claimed_by") and item["claimed_by"] != agent:
+                item["ownership_revision"] = item.get("ownership_revision", 0) + 1
             item["claimed_by"] = agent
             item["claimed_mailbox"] = mailbox
             item["claimed_pid"] = harness_pid()
@@ -1565,19 +1618,26 @@ def _claim_next(listener):
             if listener["mode"] == "ask":
                 if not listener.get("request_id") or item.get("reply_to") != listener["request_id"]:
                     continue
-            elif state != "pending" and item.get("presented_generation", 0) >= listener["generation"]:
+            elif (state != "pending" and item.get("presented_generation", 0) >= listener["generation"]
+                  and not (recipient_agent(item) == listener["agent"]
+                           and item.get("claimed_by") != listener["agent"])):
                 continue
             preferred = item.get("preferred_session", "")
-            if preferred and preferred != listener["session_id"] and session_alive(preferred, sessions):
+            if (preferred != listener["session_id"]
+                    and _eligible_preferred(item, sessions.get(preferred))):
                 continue
             assigned = item.get("assigned_session", "")
             assignment = active_assignment(item, sessions)
-            if assignment and assigned != listener["session_id"]:
+            if (assignment and assigned != listener["session_id"]
+                    and (not recipient_agent(item)
+                         or assignment.get("agent") == recipient_agent(item))):
                 continue
             candidates.append((item.get("received_ts", 0), item["id"], path, item))
         if not candidates:
             return None
         _, _, path, item = min(candidates)
+        if item.get("claimed_by") and item["claimed_by"] != listener["agent"]:
+            item["ownership_revision"] = item.get("ownership_revision", 0) + 1
         item["claimed_by"] = listener["agent"]
         item["claimed_mailbox"] = listener["mailbox"]
         item["claimed_pid"] = listener.get("harness_pid")
@@ -1599,11 +1659,13 @@ def _write_files(item, out_dir=None):
         print(f"File written to {out.resolve()}", flush=True)
 
 
-def _show_item(item, out_dir=None):
-    shown = {k: v for k, v in item.items() if k != "files"}
+def _show_item(item, out_dir=None, extract=True):
+    shown = {"recipient_label": recipient_label(item),
+             **{k: v for k, v in item.items() if k != "files"}}
     shown["files"] = [f["filename"] for f in item.get("files", [])]
     print(json.dumps(shown, indent=2))
-    _write_files(item, out_dir)
+    if extract:
+        _write_files(item, out_dir)
 
 
 def inbox_summary(item, listening=None):
@@ -1625,6 +1687,13 @@ def inbox_summary(item, listening=None):
         "from": item.get("from", ""),
         "from_agent": item.get("from_agent", ""),
         "to_agent": item.get("to_agent", ""),
+        "intended_agent": item.get("to_agent", "") if item.get("targeted") else "",
+        "recipient_agent": recipient_agent(item),
+        "recipient_label": recipient_label(item),
+        "targeted": bool(item.get("targeted")),
+        "mailbox_targeted": bool(item.get("mailbox_targeted")),
+        "taken_over_by": item.get("taken_over_by", ""),
+        "assigned_agent": (active_assignment(item) or {}).get("agent", ""),
         "to_mailbox": item.get("to_mailbox") or "main",
         "thread": item.get("thread", ""),
         "received": item.get("received", ""),
@@ -1663,14 +1732,77 @@ def cmd_inbox(cfg, args):
         print(f"{flag} {summarise(i, 'in')}{why}")
 
 
+def outgoing_summary(item, peer, state, timestamp):
+    retrying = item.get("_retrying") and time.time() - item.get("_last_attempt_at", 0) < 35
+    return {
+        "id": item.get("id") or item.get("_qid") or item.get("delivery_id", ""),
+        "delivery_id": item.get("delivery_id", ""),
+        "thread": item.get("thread", ""),
+        "to": peer,
+        "to_agent": item.get("to_agent", ""),
+        "to_mailbox": item.get("to_mailbox") or "main",
+        "recipient_agent": recipient_agent(item),
+        "recipient_label": recipient_label(item),
+        "from_agent": item.get("from_agent", ""),
+        "state": state,
+        "kind": item.get("kind", ""),
+        "preview": item.get("text", "")[:120].replace("\n", " "),
+        "files": len(item.get("files", [])),
+        "since": timestamp,
+        "age_seconds": max(0, int(time.time() - timestamp)) if timestamp else None,
+        "attempts": item.get("_attempts", 0),
+        "last_attempt_at": item.get("_last_attempt_at", 0),
+        "last_error": item.get("_delivery_error") or item.get("_last_error", ""),
+        "retry_status": ("retrying" if retrying else "automatic retry pending") if state == "queued"
+                        else "not retried" if state == "delivery_failed" else "delivered; awaiting reply",
+    }
+
+
+def cmd_outgoing(cfg, args):
+    rows = []
+    for directory, pattern, state in ((QUEUE_DIR, "*/*.json", "queued"),
+                                      (FAILED_DIR, "*.json", "delivery_failed"),
+                                      (OUTBOX_DIR, "*.json", "awaiting_reply")):
+        for path in sorted(directory.glob(pattern)):
+            try:
+                item = json.loads(path.read_text())
+                if state == "awaiting_reply" and item.get("state") != "awaiting_terminal":
+                    continue
+                peer = path.parent.name if state == "queued" else item.get("_peer") or item.get("to", "")
+                timestamp = (item.get("_queued_at") if state == "queued" else
+                             item.get("_failed_at") if state == "delivery_failed" else item.get("sent_ts"))
+                rows.append(outgoing_summary(item, peer, state, timestamp or path.stat().st_mtime))
+            except (OSError, json.JSONDecodeError):
+                continue
+    rows.sort(key=lambda row: (row["since"], row["id"]))
+    if args.json:
+        print(json.dumps(rows))
+    elif not rows:
+        print("No pending outgoing items")
+    else:
+        for row in rows:
+            print(f"{row['to']} / {row['recipient_label']} [{row['state']}] "
+                  f"{row['id']} {row['age_seconds']}s old - {row['preview']}\n"
+                  f"    {row['retry_status']}; {row['attempts']} attempt(s)"
+                  + (f"; last error: {row['last_error']}" if row["last_error"] else ""))
+
+
 def cmd_read(cfg, args):
     item = _claim_item(args.id, agent_name(), mailbox_name(cfg), force=args.force)
     _show_item(item, args.out)
 
 
+def cmd_peek(cfg, args):
+    _show_item(find_inbox_item(args.id), extract=False)
+
+
 def cmd_close(cfg, args):
-    item = _claim_item(args.id, agent_name(), mailbox_name(cfg), allow_orphan=True)
-    update_inbox_item(item["id"], state="handled", handled_at=time.time())
+    with state_lock():
+        item = find_inbox_item(args.id)
+        _check_item_access(item, agent_name(), mailbox_name(cfg))
+        item.update(state="handled", handled_at=time.time(),
+                    ownership_revision=item.get("ownership_revision", 0) + 1)
+        atomic_write_json(INBOX_DIR / f"{item['id']}.json", item)
     print(f"Closed inbox item {item['id']}")
 
 
@@ -1683,6 +1815,8 @@ def cmd_rm(cfg, args):
     """
     with state_lock():
         item = find_inbox_item(args.id)
+        if not args.force:
+            _check_item_access(item, agent_name(), mailbox_name(cfg))
         assignment = active_assignment(item)
         if assignment and not args.force and assignment.get("agent") != agent_name():
             sys.exit(f"Item {args.id} is assigned to live agent "
@@ -1700,18 +1834,33 @@ def cmd_rm(cfg, args):
 
 def cmd_reopen(cfg, args):
     mailbox = mailbox_name(cfg)
-    item = find_inbox_item(args.id)
-    orphan = orphaned(item, mailbox)
-    if not _item_matches_mailbox(item, mailbox, agent_name()) and not orphan:
-        sys.exit(f"Item {args.id} belongs to another mailbox")
-    # a pin to a session that no longer exists would make the item invisible again
-    released = ({"unpinned": True, "targeted": False, "to_agent": ""}
-                if orphan and item.get("to_agent") and item["to_agent"] != agent_name() else {})
-    update_inbox_item(item["id"], state="pending", claimed_by="", claimed_mailbox="",
-                      claimed_pid=None, claimed_at=0, handled_at=0, assigned_session="",
-                      presented_generation=0, **released)
-    print(f"Reopened inbox item {item['id']}"
-          + (f", released from the gone session '{item['to_agent']}'" if released else ""))
+    with state_lock():
+        item = find_inbox_item(args.id)
+        if item.get("claimed_by") != agent_name() or (item.get("to_mailbox") or "main") != mailbox:
+            _check_item_access(item, agent_name(), mailbox)
+        item.update(state="pending", claimed_by="", claimed_mailbox="",
+                    claimed_pid=None, claimed_at=0, handled_at=0, assigned_session="",
+                    presented_generation=0, ownership_revision=item.get("ownership_revision", 0) + 1)
+        atomic_write_json(INBOX_DIR / f"{item['id']}.json", item)
+    print(f"Reopened inbox item {item['id']} ({recipient_label(item)})")
+
+
+def cmd_takeover(cfg, args):
+    with state_lock():
+        item = find_inbox_item(args.id)
+        if (item.get("to_mailbox") or "main") != mailbox_name(cfg):
+            sys.exit(f"Item {args.id} belongs to another mailbox")
+        previous = recipient_agent(item) or item.get("claimed_by", "")
+        item.setdefault("ownership_history", []).append({
+            "from_agent": previous, "to_agent": agent_name(), "at": time.time()})
+        item.update(taken_over_by=agent_name(), assigned_session="", preferred_session="",
+                    claimed_by=agent_name(), claimed_mailbox=mailbox_name(cfg),
+                    claimed_pid=harness_pid(), claimed_at=time.time(), presented_generation=0,
+                    ownership_revision=item.get("ownership_revision", 0) + 1)
+        if item_state(item) != "handled":
+            item["state"] = "active"
+        atomic_write_json(INBOX_DIR / f"{item['id']}.json", item)
+    print(f"Took over {item['id']} from '{previous or 'shared mailbox'}' as '{agent_name()}'")
 
 
 def cmd_thread(cfg, args):
@@ -1763,7 +1912,7 @@ def cmd_wait(cfg, args):
                 _show_item(item, args.out)
             else:
                 status = f" [{item['status']}]" if item.get("status") else ""
-                print(f"NEW {item['kind']}{status} from {item['from']}: "
+                print(f"NEW [{recipient_label(item)}] {item['kind']}{status} from {item['from']}: "
                       f"id {item['id']}, thread {item['thread']}")
             clear_session(listener["session_id"])
             return
@@ -1942,6 +2091,7 @@ def cmd_accept(cfg, args):
     name, url, token = meta.get("name"), meta.get("url"), meta.get("token")
     if not (name and url and token):
         sys.exit("Introduction is missing name/url/token")
+    item = _claim_item(args.id, agent_name(), mailbox_name(cfg))
     peer = cfg.setdefault("peers", {}).setdefault(name, {})   # keep any token we already issued them
     peer["url"] = url
     peer["token"] = token
@@ -1952,9 +2102,11 @@ def cmd_accept(cfg, args):
                "meta": {"herald_intent": "accepted", "name": cfg["me"]},
                "to_mailbox": item.get("from_mailbox") or "main",
                "to_agent": item.get("from_agent", ""),
+               "targeted": bool(item.get("from_agent")),
                "to_session": item.get("from_session", ""),
                "fallback": "hold",
-               "_source_item_id": item["id"], "_source_effect": "final"}
+               "_source_item_id": item["id"], "_source_effect": "final",
+               "_source_revision": item.get("ownership_revision", 0)}
     deliver(cfg, name, payload)
     print(f"Peer '{name}' added ({url}) and confirmation sent")
 
@@ -2107,6 +2259,15 @@ def main():
     sp.add_argument("--out")
     sp.add_argument("--force", action="store_true", help="read without claiming, even if claimed")
 
+    sp = sub.add_parser("peek", help="inspect the full item without claiming or extracting files")
+    sp.add_argument("id")
+
+    sp = sub.add_parser("outgoing", help="list queued, failed and delivered requests awaiting replies")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("takeover", help="explicitly take ownership of one item in this mailbox")
+    sp.add_argument("id")
+
     sp = sub.add_parser("close", help="mark an inbox item handled")
     sp.add_argument("id")
 
@@ -2142,7 +2303,7 @@ def main():
     sp = sub.add_parser("wait", help="block until eligible open work is available")
     sp.add_argument("--timeout", type=int, default=0)
     sp.add_argument("--read", action="store_true",
-                    help="show and claim each new item on wake (folds in the read)")
+                    help="show the full claimed item and extract files (wait always claims)")
     sp.add_argument("--out", help="directory for attached files (with --read)")
 
     sp = sub.add_parser("resume", help="take over a mailbox, surface open work, and wait")
@@ -2182,7 +2343,7 @@ def main():
 
     args = p.parse_args()
     identity_commands = {"send", "reply", "result", "read", "close", "reopen",
-                         "rm", "wait", "resume", "ask"}
+                         "rm", "wait", "resume", "ask", "takeover", "accept"}
     if args.cmd in identity_commands and not os.environ.get("HERALD_AGENT"):
         sys.exit(
             f"HERALD_AGENT is required for `herald {args.cmd}`. Set one stable session name "
@@ -2202,6 +2363,7 @@ def main():
                  f"herald mailbox add {selected_mailbox}")
     {"init": cmd_init, "daemon": cmd_daemon, "send": cmd_send, "reply": cmd_reply,
      "result": cmd_result, "inbox": cmd_inbox, "read": cmd_read,
+     "peek": cmd_peek, "takeover": cmd_takeover, "outgoing": cmd_outgoing,
      "close": cmd_close, "reopen": cmd_reopen, "rm": cmd_rm, "peer": cmd_peer,
      "mailbox": cmd_mailbox,
      "introduce": cmd_introduce, "accept": cmd_accept, "ask": cmd_ask, "ping": cmd_ping,

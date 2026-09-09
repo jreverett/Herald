@@ -207,6 +207,39 @@ function Get-Inbox {
     }
 }
 
+function Get-Outgoing {
+    $r = Invoke-Herald "herald outgoing --json"
+    if (-not $r.ok) { return @{ ok = $false; items = @(); error = $r.out } }
+    try {
+        $parsed = $r.out | ConvertFrom-Json
+        return @{ ok = $true; items = @($parsed); error = "" }
+    } catch {
+        return @{ ok = $false; items = @(); error = "unreadable listing: $($r.out)" }
+    }
+}
+
+function Show-TextDialog($title, $text) {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = $title
+    $dialog.Size = New-Object System.Drawing.Size(760, 520)
+    $dialog.StartPosition = 'CenterScreen'
+    $body = New-Object System.Windows.Forms.TextBox
+    $body.Multiline = $true
+    $body.ReadOnly = $true
+    $body.ScrollBars = 'Both'
+    $body.Dock = 'Fill'
+    $body.Text = $text
+    $dialog.Controls.Add($body)
+    try { [void]$dialog.ShowDialog() } finally { $dialog.Dispose() }
+}
+
+function Show-InboxItem($item) {
+    if ($item.id -notmatch $script:idPattern) { return }
+    $r = Invoke-Herald "herald peek '$($item.id)'"
+    if ($r.ok) { Show-TextDialog "herald - view item (no claim)" $r.out }
+    else { Show-Balloon "herald - failed" $r.out }
+}
+
 function Show-Balloon($title, $text) {
     $script:ni.ShowBalloonTip(4000, $title, $text, [System.Windows.Forms.ToolTipIcon]::Info)
 }
@@ -226,10 +259,11 @@ function Invoke-ItemAction($item, $verb) {
 function Format-InboxLabel($item) {
     $who = $item.from
     if ($item.from_agent) { $who = "$($item.from) / $($item.from_agent)" }
-    $lane = if ($item.to_agent) { " ->$($item.to_agent)" } else { " ->$($item.to_mailbox)" }
+    $lane = $item.recipient_label
+    if (-not $lane) { $lane = "shared mailbox $($item.to_mailbox)" }
     $preview = $item.preview
     if ($preview.Length -gt 60) { $preview = $preview.Substring(0, 57) + "..." }
-    $label = "[$($item.state)] $who$lane  $preview"
+    $label = "$lane [$($item.state)] from $who  $preview"
     # WinForms eats a single & as a mnemonic marker.
     return $label.Replace("&", "&&")
 }
@@ -271,6 +305,25 @@ function Build-InboxMenu {
             $entry.ToolTipText = "$($entry.ToolTipText)`n`nwaiting on you: $($item.blocked_reason)"
         }
 
+        $miView = $entry.DropDownItems.Add("View without claiming")
+        $miView.Tag = $item
+        $miView.add_Click({ Show-InboxItem $this.Tag }.GetNewClosure())
+
+        $miTakeover = $entry.DropDownItems.Add("Take ownership...")
+        $miTakeover.Tag = $item
+        $miTakeover.add_Click({
+            $it = $this.Tag
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "Transfer $($it.id) from $($it.recipient_label) to $MenuAgent?`n`n" +
+                "This changes who can handle the item. Viewing it does not need a transfer.",
+                "herald - take ownership", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question,
+                [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+            if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+                Invoke-ItemAction $it "takeover"
+            }
+        }.GetNewClosure())
+
         $miClose = $entry.DropDownItems.Add("Close (reversible)")
         $miClose.Tag = $item
         $miClose.add_Click({ Invoke-ItemAction $this.Tag "close" }.GetNewClosure())
@@ -299,6 +352,47 @@ function Build-InboxMenu {
     }
 }
 
+function Format-OutgoingDetails($item) {
+    $attempt = if ($item.last_attempt_at) {
+        [DateTimeOffset]::FromUnixTimeSeconds([long]$item.last_attempt_at).ToLocalTime().ToString('g')
+    } else { "unknown" }
+    return "To $($item.to) / $($item.recipient_label)`r`nState: $($item.state)`r`n" +
+        "Item: $($item.id)`r`nThread: $($item.thread)`r`nFrom agent: $($item.from_agent)`r`n" +
+        "Age: $($item.age_seconds)s`r`nAttempts: $($item.attempts)`r`nLast attempt: $attempt`r`n" +
+        "Retry: $($item.retry_status)`r`nLast error: $($item.last_error)`r`n`r`n$($item.preview)"
+}
+
+function Build-OutgoingMenu {
+    $script:miOutgoing.DropDownItems.Clear()
+    $listing = Get-Outgoing
+    $script:miOutgoing.Text = "Outgoing / queued"
+    if (-not $listing.ok) {
+        $entry = $script:miOutgoing.DropDownItems.Add("Could not read outgoing items")
+        $entry.Enabled = $false
+        $entry.ToolTipText = $listing.error
+        return
+    }
+    if ($listing.items.Count -eq 0) {
+        $script:miOutgoing.DropDownItems.Add("(nothing pending)").Enabled = $false
+        return
+    }
+    $script:miOutgoing.Text = "Outgoing / queued ($($listing.items.Count))"
+    foreach ($item in ($listing.items | Select-Object -First $MaxInboxItems)) {
+        $label = "$($item.to) / $($item.recipient_label) [$($item.state)] $($item.preview)"
+        if ($label.Length -gt 150) { $label = $label.Substring(0, 147) + "..." }
+        $entry = $script:miOutgoing.DropDownItems.Add($label.Replace("&", "&&"))
+        $entry.Tag = $item
+        $entry.ToolTipText = Format-OutgoingDetails $item
+        $entry.add_Click({
+            Show-TextDialog "herald - outgoing item" (Format-OutgoingDetails $this.Tag)
+        }.GetNewClosure())
+    }
+    if ($listing.items.Count -gt $MaxInboxItems) {
+        $more = $listing.items.Count - $MaxInboxItems
+        $script:miOutgoing.DropDownItems.Add("... and $more more").Enabled = $false
+    }
+}
+
 # Context menu: Inbox, Status balloon, Restart daemon, Exit.
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
@@ -306,7 +400,9 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 # right-click rather than eleven a second.
 $script:miInbox = New-Object System.Windows.Forms.ToolStripMenuItem "Inbox"
 [void]$menu.Items.Add($script:miInbox)
-$menu.add_Opening({ Build-InboxMenu })
+$script:miOutgoing = New-Object System.Windows.Forms.ToolStripMenuItem "Outgoing / queued"
+[void]$menu.Items.Add($script:miOutgoing)
+$menu.add_Opening({ Build-InboxMenu; Build-OutgoingMenu })
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
 $miStatus = $menu.Items.Add("Show status")
