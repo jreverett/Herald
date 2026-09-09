@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -954,25 +954,25 @@ def cmd_daemon(cfg, args):
     print(f"herald v{__version__} daemon: {cfg['me']} listening on {host}:{port} ({scope}), inbox {INBOX_DIR}",
           flush=True)
     started = time.strftime("%Y-%m-%d %H:%M:%S")
-    threading.Thread(target=_maintenance_loop, args=(cfg["me"], f"{host}:{port}", started),
-                     daemon=True).start()
+    stop = threading.Event()
+    maintenance = threading.Thread(target=_maintenance_loop, args=(stop,), daemon=True)
+    heartbeat = threading.Thread(target=_heartbeat_loop,
+                                 args=(cfg["me"], f"{host}:{port}", started, stop, maintenance),
+                                 daemon=True)
     with server:
-        server.serve_forever()
+        maintenance.start()
+        heartbeat.start()
+        try:
+            server.serve_forever()
+        finally:
+            stop.set()
+            heartbeat.join(timeout=1)
+            maintenance.join(timeout=1)
 
 
-def _maintenance_loop(me, listen, started):
-    """Heartbeat the status file every tick, drain queued items to reachable
-    peers periodically, and reap dead sessions / stranded targeted items.
-    Network is only touched when items queue or a target is unreachable."""
-    retry_every = max(1, RETRY_INTERVAL // HEARTBEAT_INTERVAL)
-    tick = 0
-    last = time.time()
-    skip_reap_until = 0
-    while True:
+def _heartbeat_loop(me, listen, started, stop, maintenance):
+    while not stop.is_set() and maintenance.is_alive():
         now = time.time()
-        if now - last > SUSPEND_GAP:
-            skip_reap_until = now + SESSION_LEASE   # host likely slept; let sessions re-check in
-        last = now
         working_labels()                      # prune spent markers before filtering
         working = working_labels(herald_working_pids())
         blocked = awaiting_human()
@@ -983,6 +983,19 @@ def _maintenance_loop(me, listen, started):
                       "working_agents": working_summary(working)[:4],
                       "blocked": len(blocked),
                       "blocked_agents": working_summary(blocked)[:4]})
+        stop.wait(HEARTBEAT_INTERVAL)
+
+
+def _maintenance_loop(stop):
+    retry_every = max(1, RETRY_INTERVAL // HEARTBEAT_INTERVAL)
+    tick = 0
+    last = time.time()
+    skip_reap_until = 0
+    while not stop.is_set():
+        now = time.time()
+        if now - last > SUSPEND_GAP:
+            skip_reap_until = now + SESSION_LEASE
+        last = now
         try:
             cfg = load_config()
         except (SystemExit, OSError, json.JSONDecodeError):
@@ -1009,7 +1022,7 @@ def _maintenance_loop(me, listen, started):
             except (SystemExit, OSError, json.JSONDecodeError):
                 pass
         tick += 1
-        time.sleep(HEARTBEAT_INTERVAL)
+        stop.wait(HEARTBEAT_INTERVAL)
 
 
 def _pick_live(sessions=None, mailbox=None, agent=None, mode="general"):

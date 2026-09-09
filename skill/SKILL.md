@@ -164,6 +164,11 @@ herald ping <person>                                  # is their daemon up? whic
 
 ## Daemon role
 
+The daemon updates its heartbeat independently of outbound network waits.
+An unreachable peer must not make the local tray report the daemon as offline.
+The tray's Show status dialog includes the recorded daemon version even when
+its heartbeat is stale; use Outgoing / queued for peer delivery failures.
+
 The daemon is the one long-running Herald process for the OS user. It accepts
 authenticated network requests, writes the durable inbox, assigns items to
 mailboxes and listener instances, deduplicates retries, expires dead listener

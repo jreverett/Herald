@@ -244,6 +244,32 @@ function Show-Balloon($title, $text) {
     $script:ni.ShowBalloonTip(4000, $title, $text, [System.Windows.Forms.ToolTipIcon]::Info)
 }
 
+function Show-Status {
+    $status = $null
+    if ($script:statusPath -and (Test-Path $script:statusPath)) {
+        try { $status = Get-Content -Raw $script:statusPath | ConvertFrom-Json } catch { $status = $null }
+    }
+    if (-not $status) {
+        Show-TextDialog 'herald - status' "Daemon status unavailable.`r`nRecorded daemon version: unknown"
+        return
+    }
+    $version = if ($status.version) { $status.version } else { 'unknown' }
+    $health = 'unknown (heartbeat unavailable)'
+    if ($status.heartbeat) {
+        $age = [math]::Max(0, (Now-Unix) - [double]$status.heartbeat)
+        $seconds = [math]::Floor($age)
+        $health = if ($age -gt $HeartbeatTimeout) { "stale (last heartbeat ${seconds}s ago)" }
+                  else { "running (last heartbeat ${seconds}s ago)" }
+    }
+    Show-TextDialog 'herald - status' (
+        "Recorded daemon version: $version`r`nDaemon: $health`r`n" +
+        "Identity: $($status.me)`r`nListening: $($status.listen)`r`n" +
+        "PID: $($status.pid)`r`nStarted: $($status.started)`r`nQueued: $($status.queued)`r`n" +
+        "Working: $($status.working)`r`nWorking agents (summary): $($status.working_agents -join ', ')`r`n" +
+        "Waiting on you: $($status.blocked)`r`nWaiting agents (summary): $($status.blocked_agents -join ', ')"
+    )
+}
+
 function Invoke-ItemAction($item, $verb) {
     # Both close and rm need HERALD_AGENT, and close needs the item's own mailbox -
     # the default lane will not match an item that arrived on another one.
@@ -393,7 +419,7 @@ function Build-OutgoingMenu {
     }
 }
 
-# Context menu: Inbox, Status balloon, Restart daemon, Exit.
+# Context menu: Inbox, Outgoing, Status, Restart daemon, Exit.
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 # Built when the menu opens, not on the animation tick - one WSL call per
@@ -406,10 +432,7 @@ $menu.add_Opening({ Build-InboxMenu; Build-OutgoingMenu })
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
 $miStatus = $menu.Items.Add("Show status")
-$miStatus.add_Click({
-    $t = $script:ni.Text
-    $script:ni.ShowBalloonTip(3000, "herald", $t, [System.Windows.Forms.ToolTipIcon]::Info)
-})
+$miStatus.add_Click({ Show-Status })
 
 $miRestart = $menu.Items.Add("Restart daemon")
 $miRestart.add_Click({
