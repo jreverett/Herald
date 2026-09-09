@@ -2,6 +2,15 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.10.1
+
+- Sending to an unreachable peer blocked the daemon heartbeat during retries
+  and fallback notices. The tray then reported a live receiver as offline.
+  A separate heartbeat worker now keeps status current during network waits.
+- Show status reused the short hover tooltip, which could omit the version.
+  It now opens a full status dialog with the recorded daemon version, heartbeat
+  age, queue count and activity summaries, including when the heartbeat is stale.
+
 ## 0.10.0
 
 - Named replies could reach another session when their listener stopped because

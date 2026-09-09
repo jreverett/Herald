@@ -26,6 +26,7 @@ function Invoke-Herald($command) {
 }
 function Show-TextDialog($title, $text) { $script:shown = $text }
 function Show-Balloon($title, $text) { $script:shown = $text }
+function Now-Unix { 2000000000.0 }
 $script:idPattern = '^[A-Za-z0-9_.-]+$'
 $script:NormalColour = [System.Drawing.Color]::Black
 $script:BlockedColour = [System.Drawing.Color]::Red
@@ -35,6 +36,45 @@ $MenuAgent = 'herald-tray'
 $MaxInboxItems = 2
 
 try {
+    $script:statusPath = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.json')
+    $HeartbeatTimeout = 15
+    $script:ni = New-Object System.Windows.Forms.NotifyIcon
+    $status = [pscustomobject]@{
+        version = '0.10.1'; heartbeat = (Now-Unix); me = 'jamie'; listen = '100.89.123.31:8765'
+        pid = 123; started = 'today'; queued = 2; working = 5; blocked = 1
+        working_agents = @('a-very-long-agent-name', 'second', 'third', 'fourth')
+        blocked_agents = @('a-very-long-blocked-agent-name')
+    }
+    $script:state = 'blocked'
+    Set-Tip $status
+    Assert-True ($script:ni.Text.Length -le 63) 'The hover tooltip must stay within its Windows limit.'
+    $status | ConvertTo-Json | Set-Content $script:statusPath
+    $statusClick = $ast.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $node.Expression.Extent.Text -eq '$miStatus' -and $node.Member.Value -eq 'add_Click'
+    }, $true)[0]
+    $miStatus = New-Object System.Windows.Forms.ToolStripMenuItem
+    Invoke-Expression $statusClick.Extent.Text
+    $miStatus.PerformClick()
+    Assert-True ($script:shown -like '*0.10.1*') 'Show status must include the version even when the tooltip is full.'
+    Assert-True ($script:shown.Contains('100.89.123.31:8765')) 'Show status must include the listening address.'
+    Assert-True ($script:shown.Contains('Queued: 2')) 'Show status must include the queue count.'
+    Assert-True ($script:shown.Contains('Working: 5')) 'Show status must include the full working count.'
+    Assert-True ($script:shown.Contains('summary')) 'Capped activity lists must be labelled as summaries.'
+    $status.heartbeat = (Now-Unix) - 15.5
+    $status | ConvertTo-Json | Set-Content $script:statusPath
+    $miStatus.PerformClick()
+    Assert-True ($script:shown.Contains('stale')) 'A stale heartbeat must be explicit.'
+    Assert-True ($script:shown.Contains('0.10.1')) 'A stale daemon must retain its recorded version.'
+    foreach ($json in @('{}', 'null', 'broken json')) {
+        Set-Content $script:statusPath $json
+        $miStatus.PerformClick()
+        Assert-True ($script:shown.Contains('unknown')) 'Incomplete or corrupt status must show unknown values.'
+    }
+    Remove-Item $script:statusPath
+    $miStatus.PerformClick()
+    Assert-True ($script:shown.Contains('unavailable')) 'A missing status file must be explicit.'
+
     $script:response = @{ ok = $true; out = '[]' }
     Build-OutgoingMenu
     Assert-True ($script:miOutgoing.DropDownItems.Count -eq 1) 'An empty outgoing list needs one row.'
@@ -101,6 +141,9 @@ try {
     Show-InboxItem $item
     Assert-True ($script:commands.Count -eq $before) 'Malformed ids must not reach a shell.'
 } finally {
+    if (Test-Path $script:statusPath) { Remove-Item $script:statusPath }
+    if ($miStatus) { $miStatus.Dispose() }
+    if ($script:ni) { $script:ni.Dispose() }
     $script:miInbox.Dispose()
     $script:miOutgoing.Dispose()
 }

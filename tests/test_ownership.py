@@ -2,14 +2,17 @@ import contextlib
 import io
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
-from unittest.mock import patch
+import urllib.request
+from unittest.mock import Mock, patch
 
 import herald
 
@@ -46,6 +49,94 @@ class Ownership(unittest.TestCase):
 
     def save(self):
         herald.atomic_write_json(self.path, self.item)
+
+    def test_slow_queue_and_fallback_delivery_do_not_stop_heartbeat(self):
+        launch = """
+import sys, time, urllib.error
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import herald
+herald.HEARTBEAT_INTERVAL = 0.05
+herald.RETRY_INTERVAL = 0.1
+def blocked_post(*args):
+    with (herald.HERALD_DIR / 'attempts').open('a') as log:
+        log.write('attempt\\n')
+    while not (herald.HERALD_DIR / 'release').exists():
+        time.sleep(0.01)
+    raise urllib.error.URLError('timed out')
+herald._post = blocked_post
+herald.cmd_daemon(herald.load_config(), None)
+"""
+        for source in ("queue", "fallback"):
+            with self.subTest(source=source):
+                with socket.socket() as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    port = probe.getsockname()[1]
+                self.cfg.update(listen={"host": "127.0.0.1", "port": port},
+                                peers={"peer": {"url": "http://127.0.0.1:1", "token": "test"}})
+                herald.atomic_write_json(herald.CONFIG_PATH, self.cfg)
+                self.item.update(fallback="bounce" if source == "fallback" else "hold",
+                                 received_ts=0, state="pending", bounced=False)
+                self.save()
+                queued = herald.QUEUE_DIR / "peer" / "queued.json"
+                if source == "queue":
+                    herald.atomic_write_json(queued, {"kind": "message", "text": "queued",
+                                                      "delivery_id": "slow-delivery"})
+                attempts = self.root / "attempts"
+                release = self.root / "release"
+                for path in (attempts, release, herald.STATUS_PATH):
+                    path.unlink(missing_ok=True)
+                process = subprocess.Popen([sys.executable, "-c", launch,
+                                            str(Path(herald.__file__).parent)],
+                                           env=os.environ.copy(), stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while (not attempts.exists() or not herald.STATUS_PATH.exists()) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(attempts.exists(), "Daemon did not start delivery")
+                    first = json.loads(herald.STATUS_PATH.read_text())
+                    time.sleep(0.3)
+                    latest = json.loads(herald.STATUS_PATH.read_text())
+
+                    self.assertGreater(latest["heartbeat"], first["heartbeat"])
+                    self.assertLess(time.time() - latest["heartbeat"], 0.15)
+                    with urllib.request.urlopen("http://" + latest["listen"] + "/ping", timeout=2) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertEqual(attempts.read_text().splitlines(), ["attempt"])
+                finally:
+                    release.touch()
+                    process.terminate()
+                    process.communicate(timeout=5)
+                    queued.unlink(missing_ok=True)
+
+    def test_heartbeat_stops_if_maintenance_exits(self):
+        maintenance = Mock()
+        maintenance.is_alive.return_value = False
+
+        with patch.object(herald, "write_status") as write:
+            herald._heartbeat_loop("local", "127.0.0.1:1", "today", threading.Event(), maintenance)
+
+        write.assert_not_called()
+
+    def test_daemon_workers_stop_when_server_exits(self):
+        self.cfg["listen"] = {"host": "127.0.0.1", "port": 0}
+        workers = []
+        real_thread = threading.Thread
+
+        def create_thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        with patch.object(herald, "ReceiverServer") as server, \
+                patch.object(herald.threading, "Thread", side_effect=create_thread), \
+                contextlib.redirect_stdout(io.StringIO()):
+            server.return_value.serve_forever.return_value = None
+            herald.cmd_daemon(self.cfg, None)
+
+        self.assertEqual(len(workers), 2)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
 
     def cli(self, *args, agent="other", mailbox="main"):
         return subprocess.run([sys.executable, str(Path(herald.__file__)), *args],

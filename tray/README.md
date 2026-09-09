@@ -42,7 +42,12 @@ powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File herald-tray.ps1
 
 The script auto-detects the WSL `~/.herald` path via `wslpath`. Right-click the
 icon for **Inbox / Outgoing / queued / Show status / Restart daemon / Exit**; double-click shows a
-status balloon.
+status dialog.
+
+**Show status** displays the recorded daemon version, heartbeat age, identity,
+listening address, process, queue count and activity summaries. It keeps the
+recorded version visible when the heartbeat is stale. It does not use the
+63-character hover tooltip, which can omit lower-priority details.
 
 ## The Inbox menu
 
