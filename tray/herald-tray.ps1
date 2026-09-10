@@ -228,7 +228,8 @@ function Show-TextDialog($title, $text) {
     $body.ReadOnly = $true
     $body.ScrollBars = 'Both'
     $body.Dock = 'Fill'
-    $body.Text = $text
+    # A multiline TextBox only breaks on CRLF, and herald's JSON uses bare LF.
+    $body.Text = (($text -replace "`r`n", "`n") -replace "`n", "`r`n")
     $dialog.Controls.Add($body)
     try { [void]$dialog.ShowDialog() } finally { $dialog.Dispose() }
 }
