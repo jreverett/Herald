@@ -1001,6 +1001,25 @@ class Protocol(unittest.TestCase):
         item = self.wait_for_inbox("bob", lambda i: i["text"] == "while offline")
         self.assertIsNotNone(item)
 
+    def test_peek_shows_a_queued_item_the_inbox_does_not_hold(self):
+        self.stop_daemon("bob")
+        try:
+            self.cli("alice", "send", "bob", "-m", "QUEUED-PEEK", agent="alice-1")
+            listing = json.loads(self.cli("alice", "outgoing", "--json").stdout)
+            row = next(r for r in listing if r["preview"] == "QUEUED-PEEK")
+
+            r = self.cli("alice", "peek", row["id"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            shown = json.loads(r.stdout)
+            self.assertEqual(shown["location"], "queued")
+            self.assertEqual(shown["text"], "QUEUED-PEEK")
+
+            full = json.loads(self.cli("alice", "outgoing", "--json", "--full").stdout)
+            self.assertIn("QUEUED-PEEK", [i.get("text") for i in full])
+        finally:
+            self.start_daemon("bob")
+            self._wait_port(self.ports["bob"])
+
     def test_ask_returns_terminal_result_in_one_command(self):
         p = subprocess.Popen(
             [sys.executable, HERALD_PY, "ask", "bob", "-t", "compute please", "--timeout", "20"],
@@ -1177,6 +1196,32 @@ class Protocol(unittest.TestCase):
         r = run("bell", agent=None)
         self.assertEqual(pathlib.Path(bell).read_bytes(), b"\a")
         self.assertIn("Rang the terminal bell", r.stdout)
+
+    def test_named_item_closes_when_acting_as_its_recipient(self):
+        self.cli("alice", "send", "bob", "-t", "AS-CLOSE", "--agent", "ghost-session",
+                 agent="alice-1")
+        item = self.wait_for_inbox("bob", lambda i: i.get("text") == "AS-CLOSE")
+        self.cli("bob", "read", item["id"], agent="ghost-session")   # the session then dies
+
+        refused = self.cli("bob", "close", item["id"], agent="bob-other")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("--as ghost-session", refused.stderr)
+
+        r = self.cli("bob", "close", item["id"], "--as", "ghost-session", agent=None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        closed = next(i for i in self.inbox("bob") if i["id"] == item["id"])
+        self.assertEqual(closed["state"], "handled")
+
+    def test_takeover_of_an_item_this_agent_already_holds_says_so(self):
+        self.cli("alice", "send", "bob", "-t", "MINE-ALREADY", "--agent", "bob-1",
+                 agent="alice-1")
+        item = self.wait_for_inbox("bob", lambda i: i.get("text") == "MINE-ALREADY")
+
+        r = self.cli("bob", "takeover", item["id"], agent="bob-1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("already yours", r.stdout)
+        held = next(i for i in self.inbox("bob") if i["id"] == item["id"])
+        self.assertEqual(held.get("ownership_history", []), [])
 
     def test_named_item_requires_explicit_takeover_when_listener_is_absent(self):
         def pin(text):

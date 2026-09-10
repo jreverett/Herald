@@ -101,8 +101,13 @@ try {
     Assert-True ($row.Text.StartsWith('simon / to simon-task [queued]')) 'Recipient and state must lead the row.'
     Assert-True ($row.Text.Contains('A&&B')) 'Ampersands must remain visible.'
     Assert-True ($row.ToolTipText.Contains('connection timed out')) 'The error must appear on hover.'
-    $row.PerformClick()
-    Assert-True ($script:shown.Contains('Attempts: 3')) 'Click must show the actual retry details.'
+    Assert-True ($row.DropDownItems[0].Text -eq 'View without claiming') 'Outgoing rows must offer the same inspection as inbox rows.'
+    $script:response = @{ ok = $true; out = '{"location":"queued","text":"Queued body"}' }
+    $row.DropDownItems[0].PerformClick()
+    Assert-True ($script:commands[-1] -eq "herald peek 'queued-1'") 'Outgoing inspection must call peek.'
+    Assert-True ($script:shown.Contains('Queued body')) 'Outgoing inspection must show the full item.'
+    $row.DropDownItems[1].PerformClick()
+    Assert-True ($script:shown.Contains('Attempts: 3')) 'Delivery details must show the actual retry details.'
     Assert-True ($script:shown.Contains('automatic retry pending')) 'Retry status must be visible.'
     Assert-True ($script:shown.Contains('Age: 90s')) 'Queue age must be visible.'
 
@@ -118,7 +123,7 @@ try {
 
     $item = [pscustomobject]@{
         id = 'inbox-1'; from = 'simon'; from_agent = 'simon-agent'; to_mailbox = 'main'
-        recipient_label = 'to jamie-task'; preview = 'Task'; state = 'pending'
+        recipient_label = 'to jamie-task'; recipient_agent = 'jamie-task'; preview = 'Task'; state = 'pending'
         blocked = $true; blocked_reason = 'recipient absent'; thread = 'thread-1'; received = 'today'
     }
     $script:response = @{ ok = $true; out = (ConvertTo-Json -InputObject @($item)) }
@@ -134,11 +139,14 @@ try {
     $script:response = @{ ok = $true; out = 'Transferred' }
     Invoke-ItemAction $item 'takeover'
     Assert-True ($script:commands[-1] -eq "HERALD_AGENT='herald-tray' HERALD_MAILBOX='main' herald takeover 'inbox-1'") 'Takeover must use the item mailbox and tray identity.'
+    $script:response = @{ ok = $true; out = 'Closed' }
+    Invoke-ItemAction $item 'close'
+    Assert-True ($script:commands[-1] -eq "HERALD_AGENT='herald-tray' HERALD_MAILBOX='main' herald close 'inbox-1' --as 'jamie-task'") 'A named item must be closed as its own recipient.'
     $item.recipient_label = 'shared mailbox main'
     Assert-True ((Format-InboxLabel $item).StartsWith('shared mailbox main')) 'Shared work must be explicit.'
     $before = $script:commands.Count
     $item.id = "bad'; echo unsafe"
-    Show-InboxItem $item
+    Show-ItemWithoutClaiming $item
     Assert-True ($script:commands.Count -eq $before) 'Malformed ids must not reach a shell.'
 } finally {
     if (Test-Path $script:statusPath) { Remove-Item $script:statusPath }

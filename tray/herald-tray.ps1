@@ -233,7 +233,7 @@ function Show-TextDialog($title, $text) {
     try { [void]$dialog.ShowDialog() } finally { $dialog.Dispose() }
 }
 
-function Show-InboxItem($item) {
+function Show-ItemWithoutClaiming($item) {
     if ($item.id -notmatch $script:idPattern) { return }
     $r = Invoke-Herald "herald peek '$($item.id)'"
     if ($r.ok) { Show-TextDialog "herald - view item (no claim)" $r.out }
@@ -277,7 +277,11 @@ function Invoke-ItemAction($item, $verb) {
         Show-Balloon "herald" "Refusing to act on an item with an unexpected id or mailbox."
         return
     }
-    $cmd = "HERALD_AGENT='$MenuAgent' HERALD_MAILBOX='$($item.to_mailbox)' herald $verb '$($item.id)'"
+    $as = ""
+    if ($verb -ne "takeover" -and $item.recipient_agent -match $script:idPattern) {
+        $as = " --as '$($item.recipient_agent)'"
+    }
+    $cmd = "HERALD_AGENT='$MenuAgent' HERALD_MAILBOX='$($item.to_mailbox)' herald $verb '$($item.id)'$as"
     $r = Invoke-Herald $cmd
     if ($r.ok) { Show-Balloon "herald" $r.out } else { Show-Balloon "herald - failed" $r.out }
 }
@@ -333,7 +337,7 @@ function Build-InboxMenu {
 
         $miView = $entry.DropDownItems.Add("View without claiming")
         $miView.Tag = $item
-        $miView.add_Click({ Show-InboxItem $this.Tag }.GetNewClosure())
+        $miView.add_Click({ Show-ItemWithoutClaiming $this.Tag }.GetNewClosure())
 
         $miTakeover = $entry.DropDownItems.Add("Take ownership...")
         $miTakeover.Tag = $item
@@ -409,7 +413,14 @@ function Build-OutgoingMenu {
         $entry = $script:miOutgoing.DropDownItems.Add($label.Replace("&", "&&"))
         $entry.Tag = $item
         $entry.ToolTipText = Format-OutgoingDetails $item
-        $entry.add_Click({
+
+        $miView = $entry.DropDownItems.Add("View without claiming")
+        $miView.Tag = $item
+        $miView.add_Click({ Show-ItemWithoutClaiming $this.Tag }.GetNewClosure())
+
+        $miSummary = $entry.DropDownItems.Add("Delivery details")
+        $miSummary.Tag = $item
+        $miSummary.add_Click({
             Show-TextDialog "herald - outgoing item" (Format-OutgoingDetails $this.Tag)
         }.GetNewClosure())
     }

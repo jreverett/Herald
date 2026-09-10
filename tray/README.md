@@ -65,9 +65,11 @@ count and the marked rows cannot disagree.
 
 - **View without claiming** runs `herald peek` and shows the full message in a
   read-only window. It does not change ownership or extract attachments.
+  The same entry is on every **Outgoing / queued** row.
 - **Take ownership...** requires confirmation and runs `herald takeover` as the
   tray agent. Use it only for an explicit handoff, not to inspect a message.
-- **Close (reversible)** runs `herald close` with ownership checks. The item leaves the list, the
+- **Close (reversible)** runs `herald close` with ownership checks. A named
+  item is closed with `--as <recipient>`, so it needs no transfer first. The item leaves the list, the
   record is kept as history, and `herald reopen` puts it back.
 - **Delete permanently...** runs `herald rm` behind a confirmation box. The
   record is not kept: the item leaves `herald thread`, `herald reply` can no
@@ -81,8 +83,10 @@ on that mailbox does not suppress its unread warning.
 ## The Outgoing / queued menu
 
 This menu reads `herald outgoing --json`. It lists queued messages, rejected
-deliveries, and delivered requests awaiting replies. Hover or click a row for
-the recipient, preview, age, attempt count, last attempt, error, and retry status.
+deliveries, and delivered requests awaiting replies. Each row carries
+**View without claiming** (`herald peek`, the full item) and **Delivery
+details** (recipient, preview, age, attempt count, last attempt, error, and
+retry status, also shown on hover).
 It performs no network requests and does not resend messages. Automatic retries
 require the daemon to be running. Old queue records show unknown attempt details
 until the next retry.

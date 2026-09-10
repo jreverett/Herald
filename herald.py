@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -513,6 +513,10 @@ def clear_session(session_id):
         (SESSIONS_DIR / f"{sanitize_filename(session_id)}.json").unlink()
     except OSError:
         pass
+
+
+def acting_agent(args):
+    return getattr(args, "as_agent", "") or agent_name()
 
 
 def consumer_path(mailbox):
@@ -1370,6 +1374,25 @@ def find_inbox_item(item_id):
     return json.loads(path.read_text())
 
 
+def find_any_item(item_id):
+    """The item wherever it currently sits, for a read-only view of it."""
+    path = INBOX_DIR / f"{item_id}.json"
+    if path.exists():
+        return json.loads(path.read_text()), "inbox"
+    for directory, pattern, where in ((QUEUE_DIR, "*/*.json", "queued"),
+                                      (FAILED_DIR, "*.json", "delivery_failed"),
+                                      (OUTBOX_DIR, "*.json", "outgoing")):
+        for candidate in sorted(directory.glob(pattern)):
+            try:
+                item = json.loads(candidate.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if item_id in (item.get("id"), item.get("_qid"), item.get("delivery_id"),
+                           candidate.stem):
+                return item, where
+    sys.exit(f"No item {item_id} in the inbox or the outgoing queues")
+
+
 def cmd_reply(cfg, args):
     orig = _claim_item(args.id, agent_name(), mailbox_name(cfg))
     meta = parse_meta(args.meta)
@@ -1570,8 +1593,16 @@ def recipient_label(item):
 
 def _check_item_access(item, agent, mailbox):
     if not _item_matches_mailbox(item, mailbox, agent):
-        sys.exit(f"Item {item['id']} is addressed to '{recipient_agent(item) or item.get('to_mailbox') or 'main'}'. "
-                 "Use herald peek to inspect it or herald takeover <id> for an explicit handoff.")
+        recipient = recipient_agent(item)
+        if recipient:
+            sys.exit(f"Item {item['id']} is addressed to '{recipient}', not to '{agent}'. Act as "
+                     f"the named recipient with --as {recipient} (or HERALD_AGENT={recipient}), "
+                     f"inspect it with herald peek {item['id']}, or take it over with "
+                     f"herald takeover {item['id']}.")
+        target = item.get("to_mailbox") or "main"
+        sys.exit(f"Item {item['id']} is addressed to shared mailbox '{target}', not to "
+                 f"'{mailbox}'. Select that mailbox with HERALD_MAILBOX={target} or inspect the "
+                 f"item with herald peek {item['id']}.")
     assignment = active_assignment(item)
     if assignment and assignment.get("agent") != agent and not recipient_agent(item):
         sys.exit(f"Item {item['id']} is assigned to live agent '{assignment.get('agent')}'.")
@@ -1672,8 +1703,8 @@ def _write_files(item, out_dir=None):
         print(f"File written to {out.resolve()}", flush=True)
 
 
-def _show_item(item, out_dir=None, extract=True):
-    shown = {"recipient_label": recipient_label(item),
+def _show_item(item, out_dir=None, extract=True, where="inbox"):
+    shown = {"location": where, "recipient_label": recipient_label(item),
              **{k: v for k, v in item.items() if k != "files"}}
     shown["files"] = [f["filename"] for f in item.get("files", [])]
     print(json.dumps(shown, indent=2))
@@ -1732,7 +1763,9 @@ def cmd_inbox(cfg, args):
             i, mailbox_name(cfg), agent_name())]
     if args.json:
         listening = listening_mailboxes()
-        print(json.dumps([inbox_summary(i, listening) for i in items]))
+        rows = (items if args.full
+                else [inbox_summary(i, listening) for i in items])
+        print(json.dumps(rows, indent=2))
         return
     if not items:
         print("No matching inbox items")
@@ -1784,12 +1817,16 @@ def cmd_outgoing(cfg, args):
                 peer = path.parent.name if state == "queued" else item.get("_peer") or item.get("to", "")
                 timestamp = (item.get("_queued_at") if state == "queued" else
                              item.get("_failed_at") if state == "delivery_failed" else item.get("sent_ts"))
-                rows.append(outgoing_summary(item, peer, state, timestamp or path.stat().st_mtime))
+                row = outgoing_summary(item, peer, state, timestamp or path.stat().st_mtime)
+                row["item"] = item
+                rows.append(row)
             except (OSError, json.JSONDecodeError):
                 continue
     rows.sort(key=lambda row: (row["since"], row["id"]))
     if args.json:
-        print(json.dumps(rows))
+        print(json.dumps([row["item"] for row in rows] if args.full else
+                         [{k: v for k, v in row.items() if k != "item"} for row in rows],
+                         indent=2))
     elif not rows:
         print("No pending outgoing items")
     else:
@@ -1806,13 +1843,14 @@ def cmd_read(cfg, args):
 
 
 def cmd_peek(cfg, args):
-    _show_item(find_inbox_item(args.id), extract=False)
+    item, where = find_any_item(args.id)
+    _show_item(item, extract=False, where=where)
 
 
 def cmd_close(cfg, args):
     with state_lock():
         item = find_inbox_item(args.id)
-        _check_item_access(item, agent_name(), mailbox_name(cfg))
+        _check_item_access(item, acting_agent(args), mailbox_name(cfg))
         item.update(state="handled", handled_at=time.time(),
                     ownership_revision=item.get("ownership_revision", 0) + 1)
         atomic_write_json(INBOX_DIR / f"{item['id']}.json", item)
@@ -1829,9 +1867,9 @@ def cmd_rm(cfg, args):
     with state_lock():
         item = find_inbox_item(args.id)
         if not args.force:
-            _check_item_access(item, agent_name(), mailbox_name(cfg))
+            _check_item_access(item, acting_agent(args), mailbox_name(cfg))
         assignment = active_assignment(item)
-        if assignment and not args.force and assignment.get("agent") != agent_name():
+        if assignment and not args.force and assignment.get("agent") != acting_agent(args):
             sys.exit(f"Item {args.id} is assigned to live agent "
                      f"'{assignment.get('agent')}'. Use --force to delete it anyway.")
         files = 0
@@ -1864,8 +1902,10 @@ def cmd_takeover(cfg, args):
         if (item.get("to_mailbox") or "main") != mailbox_name(cfg):
             sys.exit(f"Item {args.id} belongs to another mailbox")
         previous = recipient_agent(item) or item.get("claimed_by", "")
-        item.setdefault("ownership_history", []).append({
-            "from_agent": previous, "to_agent": agent_name(), "at": time.time()})
+        already_mine = previous == agent_name()
+        if not already_mine:
+            item.setdefault("ownership_history", []).append({
+                "from_agent": previous, "to_agent": agent_name(), "at": time.time()})
         item.update(taken_over_by=agent_name(), assigned_session="", preferred_session="",
                     claimed_by=agent_name(), claimed_mailbox=mailbox_name(cfg),
                     claimed_pid=harness_pid(), claimed_at=time.time(), presented_generation=0,
@@ -1873,7 +1913,10 @@ def cmd_takeover(cfg, args):
         if item_state(item) != "handled":
             item["state"] = "active"
         atomic_write_json(INBOX_DIR / f"{item['id']}.json", item)
-    print(f"Took over {item['id']} from '{previous or 'shared mailbox'}' as '{agent_name()}'")
+    if already_mine:
+        print(f"Item {item['id']} is already yours as '{agent_name()}'")
+    else:
+        print(f"Took over {item['id']} from '{previous or 'shared mailbox'}' as '{agent_name()}'")
 
 
 def cmd_thread(cfg, args):
@@ -2266,6 +2309,8 @@ def main():
                     help="only items for this mailbox and exact agent targets")
     sp.add_argument("--json", action="store_true",
                     help="machine-readable listing, one object per item, [] when empty")
+    sp.add_argument("--full", action="store_true",
+                    help="with --json, the complete item records including the text body")
 
     sp = sub.add_parser("read", help="show an item (writes files to cwd), claim it for this agent")
     sp.add_argument("id")
@@ -2277,18 +2322,24 @@ def main():
 
     sp = sub.add_parser("outgoing", help="list queued, failed and delivered requests awaiting replies")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--full", action="store_true",
+                    help="with --json, the complete item records including the text body")
 
     sp = sub.add_parser("takeover", help="explicitly take ownership of one item in this mailbox")
     sp.add_argument("id")
 
     sp = sub.add_parser("close", help="mark an inbox item handled")
     sp.add_argument("id")
+    sp.add_argument("--as", dest="as_agent", default="", metavar="AGENT",
+                    help="act as this agent name, for an item addressed to it")
 
     sp = sub.add_parser("reopen", help="return a handled inbox item to pending")
     sp.add_argument("id")
 
     sp = sub.add_parser("rm", help="delete an inbox item and its files, keeping no history")
     sp.add_argument("id")
+    sp.add_argument("--as", dest="as_agent", default="", metavar="AGENT",
+                    help="act as this agent name, for an item addressed to it")
     sp.add_argument("--force", action="store_true",
                     help="delete even when a live session other than this one holds it")
 
@@ -2357,7 +2408,8 @@ def main():
     args = p.parse_args()
     identity_commands = {"send", "reply", "result", "read", "close", "reopen",
                          "rm", "wait", "resume", "ask", "takeover", "accept"}
-    if args.cmd in identity_commands and not os.environ.get("HERALD_AGENT"):
+    if (args.cmd in identity_commands and not os.environ.get("HERALD_AGENT")
+            and not getattr(args, "as_agent", "")):
         sys.exit(
             f"HERALD_AGENT is required for `herald {args.cmd}`. Set one stable session name "
             f"and use it for every related command, for example: "

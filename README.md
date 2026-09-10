@@ -43,7 +43,8 @@ Changing any of these changes the protocol. Read `skill/SKILL.md` before touchin
 - **A named recipient remains reserved without a listener.** A mailbox does not override the name.
   `takeover <id>` explicitly transfers one item and preserves its original address.
   The sender can explicitly permit timed release with `--fallback broadcast`.
-- **Inspection does not claim work.** `peek` shows the full item without extracting attachments.
+- **Inspection does not claim work.** `peek` shows the full item without extracting attachments,
+  for an inbox item or one still in an outgoing queue.
   `reopen` preserves the recipient; only the recipient or the releasing claimant can return it.
 - **Delivery is single-copy and deduplicated** by a stable delivery ID. A retry after an uncertain
   network response must not create a second inbox item.
@@ -83,7 +84,7 @@ herald ping <peer>                          # daemon liveness and version, no ag
 
 herald inbox [--history|--unclaimed]        # open work, handled history, unpicked work
 herald read <id>                            # show, write attachments, claim
-herald peek <id>                            # full item, no claim or file writes
+herald peek <id>                            # full item (inbox or outgoing), no claim
 herald takeover <id>                        # explicit ownership transfer in the item's mailbox
 herald outgoing [--json]                    # queued, rejected, and awaiting-reply items
 herald reply <id> -m "..."                  # same thread; peer and session inferred

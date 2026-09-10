@@ -59,7 +59,8 @@ herald send <person> -t "run the ImageGen tests"      # task request
 herald reply <inbox-id> -m "..."                      # continue a thread
 herald result <inbox-id> --status done -m "42 passed" -f out.txt
 herald thread <thread-id>                             # view whole conversation
-herald peek <inbox-id>                                # full message, no claim or file writes
+herald peek <id>                                     # full message, no claim or file writes
+                                                     # reads inbox, queued and failed items
 herald outgoing [--json]                              # queued, rejected, or awaiting reply
 herald flush [person]                                 # retry items queued for offline peers
 herald send <person> -t "..." --mailbox work          # address durable work
@@ -198,7 +199,9 @@ new item. It refuses an item held by another live session unless you pass
 `--force`. Ordinary removal also checks the intended recipient. Prefer `close`.
 Herald keeps handled JSON records as history and does not delete them automatically.
 Named items remain reserved even when their listener is absent. `read`, `close`,
-`reply`, `result`, and `accept` check ownership before acting.
+`reply`, `result`, and `accept` check ownership before acting. To clear an item
+addressed to a session name you are not using, pass `close --as <recipient>` or
+`rm --as <recipient>` rather than taking it over.
 
 `herald reopen <id>` preserves the recipient. A session that wrongly claimed
 the item can return it with `reopen`; it must not close it. A different session

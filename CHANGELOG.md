@@ -2,6 +2,20 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.11.0
+
+- `close` and `rm` take `--as <agent>`, so an item addressed to another session
+  name can be handled without a transfer. The refusal now names the recipient
+  and how to act as it, instead of pointing only at `takeover`.
+- `takeover` of an item this agent already holds says so and records no
+  ownership change.
+- `peek` finds queued, delivery-failed and awaiting-reply items, not only inbox
+  ones, and reports where the item sits as `location`.
+- `inbox --json` and `outgoing --json` are indented, and take `--full` for the
+  complete records including the text body.
+- The tray shows **View without claiming** on every Outgoing / queued row, and
+  its inbox actions act as the item's own recipient.
+
 ## 0.10.1
 
 - Sending to an unreachable peer blocked the daemon heartbeat during retries
