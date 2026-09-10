@@ -2,6 +2,14 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.11.1
+
+- The tray's view dialog rendered a peeked item as one long line, because a
+  multiline TextBox breaks only on CRLF and herald's JSON uses LF.
+- `setup-tray.ps1 enable` launched 300ms after killing the old tray, so a slow
+  exit left two icons. It now waits for the exit, refuses to launch over a
+  survivor, and reports the instance count.
+
 ## 0.11.0
 
 - `close` and `rm` take `--as <agent>`, so an item addressed to another session
