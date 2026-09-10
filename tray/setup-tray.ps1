@@ -27,9 +27,13 @@ function Stop-LegacyTray {
 }
 
 function Stop-Tray {
+    # Waits for the icons to actually go: Stop-Process returns before the process
+    # has exited, and launching over a survivor leaves two icons and two menus.
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
         Where-Object { $_.CommandLine -like '*herald-tray.ps1*' } |
         ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }
+    for ($i = 0; $i -lt 25 -and (Count-Tray) -gt 0; $i++) { Start-Sleep -Milliseconds 200 }
+    return (Count-Tray)
 }
 
 function Count-Tray {
@@ -48,10 +52,14 @@ s.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""$trayScript""",
         if (Test-Path $lnk) { Remove-Item $lnk -Force }   # drop the old shortcut
         foreach ($f in $legacy) { if (Test-Path $f) { Remove-Item $f -Force } }  # drop pre-rename launchers
         Stop-LegacyTray                                    # kill any pre-rename tray still running
-        Stop-Tray                                          # avoid stacking duplicates
-        Start-Sleep -Milliseconds 300
+        $left = Stop-Tray                                  # avoid stacking duplicates
+        if ($left -gt 0) {
+            Write-Host "Refusing to launch: $left tray process(es) would not stop. Close the icon from its Exit menu, then run enable again."
+            break
+        }
         & $wscript $vbs                                    # start it now (inherits the desktop)
-        Write-Host "Tray auto-start ENABLED ($vbs). Starts at login; launched now."
+        for ($i = 0; $i -lt 25 -and (Count-Tray) -lt 1; $i++) { Start-Sleep -Milliseconds 200 }
+        Write-Host "Tray auto-start ENABLED ($vbs). Starts at login; launched now; running instances: $(Count-Tray)."
     }
     'disable' {
         Stop-Tray
