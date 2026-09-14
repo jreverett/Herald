@@ -612,11 +612,14 @@ class Protocol(unittest.TestCase):
         self.assertIn("EXACT-TARGET", target.stdout)
         self.assertNotIn("EXACT-TARGET", other_out, other_err)
 
-    def _listener(self, name, agent, timeout="20", mailbox=None):
+    def _listener(self, name, agent, timeout="20", mailbox=None, subjects=()):
         """Start a listener and return only once it has registered, so ownership
         is decided by the order the test intends rather than by process startup."""
+        argv = [sys.executable, HERALD_PY, "wait", "--read", "--timeout", timeout]
+        for subject in subjects:
+            argv += ["--subject", subject]
         proc = subprocess.Popen(
-            [sys.executable, HERALD_PY, "wait", "--read", "--timeout", timeout],
+            argv,
             env=self._env(name, agent, mailbox), cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.wait_for_listener(name, agent)
@@ -701,6 +704,102 @@ class Protocol(unittest.TestCase):
                 if worker.poll() is None:
                     worker.kill()
                 worker.communicate()
+
+    def test_one_generic_listener_receives_undirected_work(self):
+        """The common case: nothing is being worked on, a peer sends something,
+        the single listening session picks it up and owns the topic from then on."""
+        solo = self._listener("bob", "bob-solo")
+        try:
+            self.cli("alice", "send", "bob", "-m", "UNDIRECTED-WORK", agent="alice-1")
+            out, err = solo.communicate(timeout=30)
+        finally:
+            if solo.poll() is None:
+                solo.kill()
+        self.assertIn("UNDIRECTED-WORK", out, err)
+        received = [x for x in self.inbox("bob") if "UNDIRECTED-WORK" in x.get("text", "")]
+        self.assertEqual(received[0]["thread_owner"], "bob-solo")
+
+    def test_a_follow_up_is_routed_back_to_the_session_that_answered_the_thread(self):
+        """Thread affinity: the conversation stays with whoever answered it, even
+        once a different session is the one owning the mailbox."""
+        first = self._listener("bob", "bob-owner")
+        try:
+            self.cli("alice", "send", "bob", "-m", "FIRST-MESSAGE", agent="alice-1")
+            first.communicate(timeout=30)
+        finally:
+            if first.poll() is None:
+                first.kill()
+        item = [x for x in self.inbox("bob") if "FIRST-MESSAGE" in x.get("text", "")][0]
+        self.assertEqual(item["thread_owner"], "bob-owner")
+
+        newcomer = self._listener("bob", "bob-newcomer", timeout="8")
+        try:
+            self.cli("alice", "send", "bob", "-m", "FOLLOW-UP",
+                     "--thread", item["thread"], agent="alice-1")
+            out, _ = newcomer.communicate(timeout=30)
+        finally:
+            if newcomer.poll() is None:
+                newcomer.kill()
+
+        # The newcomer owns the mailbox but must not be given another session's thread.
+        self.assertNotIn("FOLLOW-UP", out)
+        follow = [x for x in self.inbox("bob") if "FOLLOW-UP" in x.get("text", "")][0]
+        self.assertEqual(follow["thread_owner"], "bob-owner")
+        self.assertNotEqual(follow.get("claimed_by", ""), "bob-newcomer")
+
+    def test_a_subject_reaches_the_session_working_on_it(self):
+        general = self._listener("bob", "bob-general")
+        topic = self._listener("bob", "bob-topic", subjects=["pbi-738"])
+        try:
+            self.cli("alice", "send", "bob", "-m", "ABOUT-738", "--subject", "pbi-738",
+                     agent="alice-1")
+            out, err = topic.communicate(timeout=30)
+        finally:
+            for proc in (general, topic):
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertIn("ABOUT-738", out, err)
+
+    def test_undirected_work_waits_when_two_sessions_could_take_it(self):
+        one = self._listener("bob", "bob-one", timeout="8")
+        two = self._listener("bob", "bob-two", timeout="8")
+        try:
+            self.cli("alice", "send", "bob", "-m", "AMBIGUOUS", agent="alice-1")
+            one_out, _ = one.communicate(timeout=30)
+            two_out, _ = two.communicate(timeout=30)
+        finally:
+            for proc in (one, two):
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertNotIn("AMBIGUOUS", one_out)
+        self.assertNotIn("AMBIGUOUS", two_out)
+        item = [x for x in self.inbox("bob") if "AMBIGUOUS" in x.get("text", "")][0]
+        self.assertTrue(item["unrouted"])
+
+        claimed = self.cli("bob", "claim", item["id"], agent="bob-two")
+        self.assertIn("Claimed", claimed.stdout, claimed.stderr)
+        again = [x for x in self.inbox("bob") if x["id"] == item["id"]][0]
+        self.assertEqual(again["claimed_by"], "bob-two")
+
+    def test_an_attachment_never_lands_in_the_working_directory(self):
+        note = os.path.join(self.root, "payload.txt")
+        with open(note, "w") as handle:
+            handle.write("attached content")
+        solo = self._listener("bob", "bob-solo")
+        try:
+            self.cli("alice", "send", "bob", "-m", "WITH-FILE", "-f", str(note), agent="alice-1")
+            out, err = solo.communicate(timeout=30)
+        finally:
+            if solo.poll() is None:
+                solo.kill()
+        self.assertIn("WITH-FILE", out, err)
+        # The listener ran with cwd=self.root, which is where the old code wrote.
+        # The only payload.txt there must still be the one the test created.
+        self.assertEqual(
+            sorted(f for f in os.listdir(self.root) if f.endswith(".txt")), ["payload.txt"])
+        written = os.path.join(self.homes["bob"], "files", "payload.txt")
+        self.assertFalse(os.path.exists(written), "extracted beside the canonical copy")
+        self.assertIn(os.path.join(self.homes["bob"], "files"), out)
 
     def test_two_listeners_on_one_mailbox_each_get_their_own_item(self):
         """Jamie's setup: two tabs, two topics, one mailbox. Each must receive the

@@ -53,6 +53,7 @@ HERALD_AGENT=codex-ticket123 herald send simon -m "message"
 
 ```bash
 herald send <person> -m "message text"                # message
+herald send <person> -m "..." --subject pbi-738      # route to the session on that topic
 herald send <person> -m "see attached" -f report.csv  # files (-f repeatable)
 herald send <person> -t "run the ImageGen tests"      # task request
       --meta repo=Studio --meta branch=feature/x   # structured context
@@ -224,21 +225,48 @@ It does not transfer items addressed to a different agent.
 `herald ask` is request-scoped and can run beside the general consumer without
 stealing unrelated work.
 
-**Several tabs can listen on one mailbox at the same time.** Working two topics
-in two tabs is normal and needs no special setup - each `herald wait` receives
-the items addressed to its own `HERALD_AGENT`. The first listener owns the
-mailbox and additionally receives anything sent without a named agent; a later
-listener under a different name coexists and prints `Listening alongside ...` so
-it knows it is not the owner. Running a single listener behaves exactly as
-before for shared work. Named work still requires the named agent.
+**Several tabs can listen on one mailbox at the same time**, and work reaches the
+session it belongs to rather than whichever one owns the mailbox. Owning the
+mailbox is an accident of startup order, so it must never decide which context a
+conversation lands in - a misrouted item puts unrelated work into another
+session, which costs that agent tokens to read and pollutes the thread it lands
+in.
+
+Four rules decide where an item goes:
+
+- **Named** - addressed to an agent, it goes to that agent wherever it listens.
+- **Thread** - a thread stays with the session that answered it, permanently.
+  A later item on that thread goes there even if another session owns the mailbox.
+- **Subject** - `herald wait --subject pbi-738` declares a topic, repeatable.
+  An item sent with `--subject pbi-738` reaches only a session that declared it.
+  A session declaring no subjects is a generalist and takes work naming no subject.
+- **Unambiguous only** - work nobody is named on is delivered when exactly one
+  session could take it. That is the common case: one listener, a peer sends
+  something, it arrives and that session owns the topic from then on. With two
+  eligible sessions it is held instead, and a listener prints the waiting ids
+  without their content, because the content belongs to whoever ends up owning it.
+
+Deciding held work, and moving work that landed in the wrong place:
+
+```bash
+herald claims                      # who holds what, and what is waiting
+herald claim <id>                  # take held work deliberately
+herald release <id>                # hand it back; gives up the thread too
+herald handoff <id> --to <agent>   # give the item and its thread to another session
+```
+
+**`release` the moment you realise an item is not yours.** It returns the item
+*and* the thread, so the next item in that conversation is not sent to you again.
 
 Taking the mailbox is a separate, explicit act:
 
 - `herald wait` under the **same** agent name reclaims the mailbox - a restarted
   tab is the same worker, not a second one.
 - `herald resume` takes it from a different agent, for a genuine handoff, and
-  prints `Displaced a live listener ...` naming who it displaced. This transfers
-  shared mailbox work, not named items.
+  prints `Displaced a live listener ...` naming who it displaced. **It also takes
+  threads another session owns**, which is what a provider switch needs and what
+  makes it the wrong command for simply listening again. Use `herald wait` to
+  resume listening; use `resume` only to take over from a session that has gone.
 
 `herald sessions` shows who currently owns the mailbox and its heartbeat age.
 

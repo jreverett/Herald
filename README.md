@@ -36,8 +36,12 @@ triaging incoming work, threading discipline — lives in [skill/SKILL.md](skill
 
 Changing any of these changes the protocol. Read `skill/SKILL.md` before touching them.
 
-- **One general listener owns shared mailbox work.** Other named listeners can coexist.
-  `resume` explicitly transfers the shared mailbox consumer.
+- **Work goes to the session it belongs to, or waits.** A thread stays with the session that
+  answered it; a subject reaches only a session that declared it. Untargeted work is delivered
+  only when exactly one session could take it - otherwise it is held `unrouted` for
+  `herald claim`, because owning the mailbox is an accident of startup order and must not decide
+  which context a conversation lands in. `resume` explicitly transfers the shared mailbox consumer
+  and may take another session's threads with it; plain `wait` may not.
 - **`ask` registers a request-scoped listener** that coexists with the general one. A `reply` or
   `result` returns to that exact request first, then waits for the originating agent.
 - **A named recipient remains reserved without a listener.** A mailbox does not override the name.

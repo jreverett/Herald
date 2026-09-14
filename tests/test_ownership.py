@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import threading
 import time
 import unittest
@@ -256,7 +257,18 @@ herald.cmd_daemon(herald.load_config(), None)
         self.assertFalse(summary["targeted"])
         self.assertIn("shared", self.cli("inbox").stdout)
 
-    def test_shared_work_still_goes_to_mailbox_owner(self):
+    def test_shared_work_goes_to_the_only_eligible_listener(self):
+        self.item.update(targeted=False, to_agent="")
+        self.save()
+        owner = herald.register_listener(self.cfg)
+
+        herald._route(self.cfg)
+
+        self.assertEqual(herald._claim_next(owner)["claimed_by"], "other")
+
+    def test_shared_work_waits_when_two_listeners_could_take_it(self):
+        # Owning the mailbox is an accident of who started last, so it must not
+        # decide which session a conversation lands in.
         self.item.update(targeted=False, to_agent="")
         self.save()
         owner = herald.register_listener(self.cfg)
@@ -266,7 +278,8 @@ herald.cmd_daemon(herald.load_config(), None)
         herald._route(self.cfg)
 
         self.assertIsNone(herald._claim_next(other))
-        self.assertEqual(herald._claim_next(owner)["claimed_by"], "other")
+        self.assertIsNone(herald._claim_next(owner))
+        self.assertTrue(json.loads(self.path.read_text())["unrouted"])
 
     def test_hold_survives_expired_listener_and_reaper(self):
         self.item["received_ts"] = time.time() - herald.TARGET_GIVEUP - 1
@@ -497,3 +510,384 @@ herald.cmd_daemon(herald.load_config(), None)
                 item = json.loads(self.path.read_text())
                 self.assertEqual(item["state"], "pending")
                 self.assertFalse(herald.inbox_summary(item)["blocked"])
+
+
+class Routing(unittest.TestCase):
+    """Topic and thread routing: work reaches the session it belongs to, or waits."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.env = patch.dict(os.environ, {"HERALD_DIR": str(root), "HERALD_AGENT": "solo"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        for name, sub in (("HERALD_DIR", ""), ("INBOX_DIR", "inbox"), ("OUTBOX_DIR", "outbox"),
+                          ("FILES_DIR", "files"), ("QUEUE_DIR", "queue"), ("SESSIONS_DIR", "sessions"),
+                          ("CONSUMERS_DIR", "consumers"), ("ACTIVITY_DIR", "activity"),
+                          ("WORKING_DIR", "working"), ("FAILED_DIR", "failed")):
+            if hasattr(herald, name):
+                patcher = patch.object(herald, name, root / sub if sub else root)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        for name, leaf in (("LOCK_PATH", "state.lock"), ("STATUS_PATH", "status.json"),
+                           ("CONFIG_PATH", "config.json")):
+            if hasattr(herald, name):
+                patcher = patch.object(herald, name, root / leaf)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        herald.ensure_dirs()
+        self.cfg = {"me": "jamie", "peers": {}, "default_mailbox": "main", "mailboxes": ["main"]}
+
+    def _listener(self, agent, subjects=None, mailbox="main"):
+        with patch.dict(os.environ, {"HERALD_AGENT": agent, "HERALD_MAILBOX": mailbox}):
+            return herald.register_listener(self.cfg, subjects=subjects)
+
+    def _item(self, item_id="i1", thread="t1", subject="", **extra):
+        item = {
+            "id": item_id, "thread": thread, "subject": subject, "reply_to": "",
+            "from": "simon", "from_agent": "si", "kind": "message", "text": "hello",
+            "to_agent": "", "to_mailbox": "main", "targeted": False, "mailbox_targeted": False,
+            "broadcast": False, "fallback": "hold", "state": "pending",
+            "received_ts": time.time(), "presented_generation": 0, "files": [],
+        }
+        item.update(extra)
+        herald.atomic_write_json(herald.INBOX_DIR / f"{item_id}.json", item)
+        return item
+
+    def _stored(self, item_id="i1"):
+        return json.loads((herald.INBOX_DIR / f"{item_id}.json").read_text())
+
+    # --- the case that must keep working: one listener, undirected message ---
+
+    def test_a_single_generic_listener_receives_undirected_work(self):
+        solo = self._listener("solo")
+        self._item()
+
+        herald._route(self.cfg)
+        claimed = herald._claim_next(solo)
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["claimed_by"], "solo")
+        self.assertFalse(self._stored()["unrouted"])
+
+    def test_a_single_listener_owns_the_thread_after_receiving_it(self):
+        solo = self._listener("solo")
+        self._item()
+        herald._route(self.cfg)
+        herald._claim_next(solo)
+
+        self.assertEqual(herald.thread_owner("t1"), "solo")
+
+    # --- ambiguity is never resolved by luck ---
+
+    def test_two_generic_listeners_leave_undirected_work_unrouted(self):
+        one = self._listener("one")
+        two = self._listener("two")
+        self._item()
+
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(one))
+        self.assertIsNone(herald._claim_next(two))
+        self.assertTrue(self._stored()["unrouted"])
+
+    def test_an_unrouted_item_is_taken_by_an_explicit_claim(self):
+        self._listener("one")
+        self._listener("two")
+        self._item()
+        herald._route(self.cfg)
+
+        herald._claim_item("i1", "two", "main")
+
+        stored = self._stored()
+        self.assertEqual(stored["claimed_by"], "two")
+        self.assertFalse(stored["unrouted"])
+        self.assertEqual(herald.thread_owner("t1"), "two")
+
+    def test_a_named_item_is_never_unrouted_even_with_two_listeners(self):
+        one = self._listener("one")
+        self._listener("two")
+        self._item(to_agent="one", targeted=True)
+
+        herald._route(self.cfg)
+
+        self.assertEqual(herald._claim_next(one)["claimed_by"], "one")
+
+    # --- thread affinity ---
+
+    def test_a_later_item_on_a_claimed_thread_goes_to_its_owner(self):
+        one = self._listener("one")
+        two = self._listener("two")
+        self._item(item_id="i1", thread="t1")
+        herald._claim_item("i1", "two", "main")
+
+        self._item(item_id="i2", thread="t1")
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(one))
+        self.assertEqual(herald._claim_next(two)["id"], "i2")
+
+    def test_thread_affinity_beats_being_the_mailbox_owner(self):
+        owner = self._listener("owner")
+        other = self._listener("other")
+        self._item(item_id="i1", thread="t1")
+        herald._claim_item("i1", "other", "main")
+
+        self._item(item_id="i2", thread="t1")
+        herald._route(self.cfg)
+
+        self.assertEqual(self._stored("i2")["assigned_session"], other["session_id"])
+        self.assertIsNone(herald._claim_next(owner))
+
+    def test_a_different_thread_is_not_pulled_in_by_affinity(self):
+        one = self._listener("one")
+        self._item(item_id="i1", thread="t1")
+        herald._claim_item("i1", "one", "main")
+        self._listener("two")
+
+        self._item(item_id="i2", thread="t2")
+        herald._route(self.cfg)
+
+        self.assertTrue(self._stored("i2")["unrouted"])
+
+    def test_releasing_an_item_gives_up_its_thread(self):
+        self._listener("one")
+        self._listener("two")
+        self._item(item_id="i1", thread="t1")
+        herald._claim_item("i1", "one", "main")
+        self.assertEqual(herald.thread_owner("t1"), "one")
+
+        with patch.dict(os.environ, {"HERALD_AGENT": "one"}):
+            herald.cmd_release(self.cfg, SimpleNamespace(id="i1"))
+
+        self.assertEqual(herald.thread_owner("t1"), "")
+        stored = self._stored("i1")
+        self.assertEqual(stored["state"], "pending")
+        self.assertEqual(stored["claimed_by"], "")
+
+    def test_release_refuses_an_item_held_by_another_agent(self):
+        self._listener("one")
+        self._item(item_id="i1")
+        herald._claim_item("i1", "one", "main")
+
+        with patch.dict(os.environ, {"HERALD_AGENT": "two"}):
+            with self.assertRaises(SystemExit):
+                herald.cmd_release(self.cfg, SimpleNamespace(id="i1"))
+
+        self.assertEqual(self._stored("i1")["claimed_by"], "one")
+
+    # --- handoff ---
+
+    def test_handoff_moves_the_item_and_the_thread(self):
+        self._listener("one")
+        two = self._listener("two")
+        self._item(item_id="i1", thread="t1")
+        herald._claim_item("i1", "one", "main")
+
+        with patch.dict(os.environ, {"HERALD_AGENT": "one"}):
+            herald.cmd_handoff(self.cfg, SimpleNamespace(id="i1", to="two"))
+
+        self.assertEqual(herald.thread_owner("t1"), "two")
+        self.assertEqual(herald.recipient_agent(self._stored("i1")), "two")
+        herald._route(self.cfg)
+        self.assertEqual(herald._claim_next(two)["id"], "i1")
+
+    def test_after_handoff_later_thread_items_follow_the_new_owner(self):
+        one = self._listener("one")
+        two = self._listener("two")
+        self._item(item_id="i1", thread="t1")
+        herald._claim_item("i1", "one", "main")
+        with patch.dict(os.environ, {"HERALD_AGENT": "one"}):
+            herald.cmd_handoff(self.cfg, SimpleNamespace(id="i1", to="two"))
+
+        self._item(item_id="i2", thread="t1")
+        herald._route(self.cfg)
+
+        self.assertEqual(self._stored("i2")["assigned_session"], two["session_id"])
+        self.assertIsNone(herald._claim_next(one))
+
+    def test_handoff_refuses_an_item_held_by_another_agent(self):
+        self._listener("one")
+        self._item(item_id="i1")
+        herald._claim_item("i1", "one", "main")
+
+        with patch.dict(os.environ, {"HERALD_AGENT": "three"}):
+            with self.assertRaises(SystemExit):
+                herald.cmd_handoff(self.cfg, SimpleNamespace(id="i1", to="two"))
+
+    # --- subjects ---
+
+    def test_a_subject_reaches_the_session_that_declared_it(self):
+        general = self._listener("general")
+        topic = self._listener("topic", subjects=["pbi-738"])
+        self._item(subject="pbi-738")
+
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(general))
+        self.assertEqual(herald._claim_next(topic)["claimed_by"], "topic")
+
+    def test_a_subject_nobody_declared_falls_back_to_a_generalist(self):
+        general = self._listener("general")
+        self._listener("topic", subjects=["something-else"])
+        self._item(subject="pbi-738")
+
+        herald._route(self.cfg)
+
+        self.assertEqual(herald._claim_next(general)["claimed_by"], "general")
+
+    def test_undirected_work_does_not_go_to_a_subject_bound_session(self):
+        self._listener("topic", subjects=["pbi-738"])
+        self._item()
+
+        herald._route(self.cfg)
+
+        stored = self._stored()
+        self.assertFalse(stored.get("assigned_session"))
+
+    def test_two_sessions_on_the_same_subject_leave_it_unrouted(self):
+        one = self._listener("one", subjects=["pbi-738"])
+        two = self._listener("two", subjects=["pbi-738"])
+        self._item(subject="pbi-738")
+
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(one))
+        self.assertIsNone(herald._claim_next(two))
+        self.assertTrue(self._stored()["unrouted"])
+
+    def test_subjects_are_recorded_on_the_session(self):
+        listener = self._listener("topic", subjects=["a", "b"])
+        herald.write_session(listener)
+
+        record = herald.read_sessions()[listener["session_id"]]
+        self.assertEqual(record["subjects"], ["a", "b"])
+
+    # --- attachments never land in the process CWD ---
+
+    def test_attachments_are_written_under_the_herald_directory(self):
+        stored_file = herald.FILES_DIR / "i1_note.txt"
+        stored_file.parent.mkdir(parents=True, exist_ok=True)
+        stored_file.write_bytes(b"payload")
+        item = {"id": "i1", "files": [{"filename": "note.txt", "stored_path": str(stored_file)}]}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            herald._write_files(item)
+
+        written = herald.item_files_dir("i1") / "note.txt"
+        self.assertTrue(written.exists())
+        self.assertEqual(written.read_bytes(), b"payload")
+        self.assertFalse((Path.cwd() / "note.txt").exists())
+
+
+class ContextIsolation(unittest.TestCase):
+    """No item's content may reach a session that is not working on it.
+
+    The cost of getting this wrong is not only a confused agent: a delivered item
+    is printed into that session's context, so unrelated work is paid for in
+    tokens and pollutes the conversation it lands in.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.env = patch.dict(os.environ, {"HERALD_DIR": str(root), "HERALD_AGENT": "solo"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        for name, sub in (("HERALD_DIR", ""), ("INBOX_DIR", "inbox"), ("OUTBOX_DIR", "outbox"),
+                          ("FILES_DIR", "files"), ("QUEUE_DIR", "queue"), ("SESSIONS_DIR", "sessions"),
+                          ("CONSUMERS_DIR", "consumers"), ("ACTIVITY_DIR", "activity"),
+                          ("WORKING_DIR", "working"), ("FAILED_DIR", "failed")):
+            if hasattr(herald, name):
+                patcher = patch.object(herald, name, root / sub if sub else root)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        for name, leaf in (("LOCK_PATH", "state.lock"), ("STATUS_PATH", "status.json"),
+                           ("CONFIG_PATH", "config.json")):
+            if hasattr(herald, name):
+                patcher = patch.object(herald, name, root / leaf)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        herald.ensure_dirs()
+        self.cfg = {"me": "jamie", "peers": {}, "default_mailbox": "main", "mailboxes": ["main"]}
+
+    def _listener(self, agent, subjects=None):
+        with patch.dict(os.environ, {"HERALD_AGENT": agent}):
+            return herald.register_listener(self.cfg, subjects=subjects)
+
+    def _item(self, item_id, thread, subject="", text="body"):
+        herald.atomic_write_json(herald.INBOX_DIR / f"{item_id}.json", {
+            "id": item_id, "thread": thread, "subject": subject, "reply_to": "",
+            "from": "simon", "from_agent": "si", "kind": "message", "text": text,
+            "to_agent": "", "to_mailbox": "main", "targeted": False, "mailbox_targeted": False,
+            "broadcast": False, "fallback": "hold", "state": "pending",
+            "received_ts": time.time(), "presented_generation": 0, "files": [],
+        })
+
+    def _drain(self, listener):
+        """Everything this session would actually be shown."""
+        seen = []
+        while True:
+            item = herald._claim_next(listener)
+            if not item:
+                return seen
+            seen.append(item["id"])
+
+    def test_two_topics_two_sessions_never_cross(self):
+        deploy = self._listener("deploy-session", subjects=["workflow-deploy"])
+        herald_work = self._listener("herald-session", subjects=["herald-routing"])
+
+        self._item("d1", "t-deploy", subject="workflow-deploy", text="pipeline 45 question")
+        self._item("h1", "t-herald", subject="herald-routing", text="routing question")
+        self._item("d2", "t-deploy", subject="workflow-deploy", text="follow-up on 45")
+        herald._route(self.cfg)
+
+        self.assertEqual(sorted(self._drain(deploy)), ["d1", "d2"])
+        self.assertEqual(self._drain(herald_work), ["h1"])
+
+    def test_a_reply_on_a_claimed_thread_never_reaches_the_other_session(self):
+        one = self._listener("session-one")
+        self._item("a1", "t-one")
+        herald._claim_item("a1", "session-one", "main")
+        two = self._listener("session-two")
+
+        # The follow-up carries no subject and names nobody - only the thread ties it.
+        self._item("a2", "t-one", text="follow-up nobody addressed")
+        herald._route(self.cfg)
+
+        self.assertEqual(self._drain(two), [])
+        self.assertEqual(self._stored("a2")["thread_owner"], "session-one")
+
+    def test_an_ambiguous_item_is_shown_to_nobody_rather_than_to_everybody(self):
+        one = self._listener("one")
+        two = self._listener("two")
+        self._item("x1", "t-x", text="secret content")
+        herald._route(self.cfg)
+
+        self.assertEqual(self._drain(one), [])
+        self.assertEqual(self._drain(two), [])
+
+    def test_a_departed_owners_thread_is_not_handed_to_a_live_stranger(self):
+        gone = self._listener("gone-session")
+        self._item("g1", "t-gone")
+        herald._claim_item("g1", "gone-session", "main")
+        herald.clear_session(gone["session_id"])
+
+        stranger = self._listener("stranger")
+        self._item("g2", "t-gone", text="follow-up after the owner left")
+        herald._route(self.cfg)
+
+        self.assertEqual(self._drain(stranger), [])
+
+    def test_a_generalist_is_not_given_work_another_session_declared(self):
+        general = self._listener("general")
+        self._listener("specialist", subjects=["pbi-738"])
+        self._item("s1", "t-s", subject="pbi-738", text="738 detail")
+        herald._route(self.cfg)
+
+        self.assertEqual(self._drain(general), [])
+
+    def _stored(self, item_id):
+        return json.loads((herald.INBOX_DIR / f"{item_id}.json").read_text())

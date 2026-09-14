@@ -2,6 +2,33 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.12.0
+
+- Work reached whichever session happened to own the mailbox, not the session it
+  belonged to. Two agents routinely run several sessions each on different
+  subjects, so an item landing in the wrong one put an unrelated conversation
+  into that context: the receiving agent paid tokens to read work it could not
+  act on, and the thread it polluted was someone else's. Routing now follows the
+  work rather than the listener.
+- A thread stays with the session that answered it. A later item on that thread
+  goes there even when a different session owns the mailbox, and is never
+  re-presented to a stranger when taking the mailbox bumps the generation.
+- `wait` and `resume` take `--subject`, repeatable, and `send` takes `--subject`.
+  An item naming a subject reaches only a session that declared it; a session
+  declaring none is a generalist and takes work that names no subject.
+- Untargeted work is delivered only when exactly one session could take it. With
+  two, it is held `unrouted` instead of going to whoever polls first, and a
+  listener reports the waiting ids without showing their content.
+- New `herald claim <id>` takes held work deliberately, `herald release <id>`
+  hands an item and its thread back, `herald handoff <id> --to <agent>` moves
+  both permanently, and `herald claims` renders who holds what from the store.
+- An attachment was extracted into the process working directory, so a file sent
+  between agents was written into whatever repository the receiving terminal
+  happened to sit in. It now goes to `files/<item-id>/` under the herald
+  directory.
+- `herald resume` still takes another session's threads, because it is the
+  deliberate handoff a provider switch needs. Plain `wait` no longer does.
+
 ## 0.11.1
 
 - The tray's view dialog rendered a peeked item as one long line, because a

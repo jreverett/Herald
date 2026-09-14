@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.11.1"
+__version__ = "0.12.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -496,6 +496,7 @@ def write_session(listener, waiting_on="inbox"):
             "mode": listener["mode"],
             "generation": listener.get("generation", 0),
             "request_id": listener.get("request_id", ""),
+            "subjects": list(listener.get("subjects", [])),
             "pid": os.getpid(),
             "harness_pid": listener.get("harness_pid"),
             "host": socket.gethostname(),
@@ -523,7 +524,7 @@ def consumer_path(mailbox):
     return CONSUMERS_DIR / f"{sanitize_filename(mailbox)}.json"
 
 
-def register_listener(cfg, mode="general", takeover=False):
+def register_listener(cfg, mode="general", takeover=False, subjects=None):
     ensure_dirs()
     listener = {
         "session_id": f"listener-{new_id()}",
@@ -535,6 +536,12 @@ def register_listener(cfg, mode="general", takeover=False):
         "harness_pid": harness_pid(),
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "request_id": "",
+        # Topics this session is working on. An item carrying a subject goes only
+        # to a session that declared it; a session with none takes general work.
+        "subjects": list(subjects or []),
+        # herald resume is the deliberate handoff, so it may take a thread that
+        # another session owns. Plain wait may not.
+        "takeover": bool(takeover),
         # Only a mailbox owner is given a generation, counting from 1. Zero means
         # this listener holds none, so a later owner re-presents what it left open.
         "generation": 0,
@@ -574,9 +581,11 @@ def register_listener(cfg, mode="general", takeover=False):
                 })
         if coexist:
             print(f"Listening alongside '{owner.get('agent')}' on mailbox "
-                  f"'{listener['mailbox']}'. Items addressed to '{listener['agent']}' "
-                  f"come here; untargeted items stay with the mailbox owner. Use "
-                  f"herald resume to take the mailbox instead.",
+                  f"'{listener['mailbox']}'. Items addressed to '{listener['agent']}', "
+                  f"threads it already owns, and subjects it declared come here. Work "
+                  f"either of you could take is held unrouted for herald claim rather "
+                  f"than going to whoever polls first. herald resume would take another "
+                  f"session's threads with the mailbox - use it only for a real handoff.",
                   file=sys.stderr, flush=True)
         elif displaced:
             age = time.time() - displaced.get("heartbeat", 0)
@@ -632,6 +641,17 @@ def current_consumer(mailbox, sessions=None):
     return session if session and _session_record_alive(session) else None
 
 
+def session_owns_item(item, session):
+    """Reasons a session is the right home for an item beyond being named on it."""
+    agent = session.get("agent")
+    if recipient_agent(item) == agent:
+        return True
+    if item.get("thread_owner") and item["thread_owner"] == agent:
+        return True
+    subject = item.get("subject")
+    return bool(subject) and subject in (session.get("subjects") or [])
+
+
 def active_assignment(item, sessions=None):
     sessions = sessions or read_sessions()
     session_id = item.get("assigned_session", "")
@@ -642,10 +662,11 @@ def active_assignment(item, sessions=None):
         consumer = current_consumer(item.get("to_mailbox") or "main", sessions)
         if not consumer or consumer.get("session_id") != session_id:
             # A co-listener does not own the mailbox but is still the right home
-            # for items addressed to its agent name. This escape is only for a
-            # session that never owned the mailbox - an owner that has since been
-            # superseded must release its items so a handoff can pick them up.
-            if recipient_agent(item) != session.get("agent"):
+            # for items addressed to its agent name, for a thread it already owns,
+            # and for a subject it declared. This escape is only for a session that
+            # never owned the mailbox - an owner that has since been superseded
+            # must release its items so a handoff can pick them up.
+            if not session_owns_item(item, session):
                 return None
     return session
 
@@ -862,13 +883,29 @@ class Handler(BaseHTTPRequestHandler):
                 target_listener = (_pick_live(sessions, mailbox=destination, agent=target_agent)
                                    or _pick_live(sessions, agent=target_agent)) if target_agent else None
                 selected = selected or target_listener
+                stored_owner, stored_unrouted = "", False
                 if not selected and not target_agent:
-                    selected = current_consumer(destination, sessions) or _pick_live(
-                        sessions, mailbox=destination)
+                    stored_owner = thread_owner(thread, exclude_id=item_id)
+                    if stored_owner:
+                        selected = (_pick_live(sessions, mailbox=destination, agent=stored_owner)
+                                    or _pick_live(sessions, agent=stored_owner))
+                    if not selected:
+                        candidates = _general_candidates(
+                            sessions, destination, str(item.get("subject", ""))[:64])
+                        # Decide ambiguity here, not only in the routing pass: an
+                        # item left unmarked is claimable by whichever listener
+                        # polls first in the window before _route runs.
+                        if len(candidates) == 1:
+                            selected = candidates[0]
+                        elif len(candidates) > 1:
+                            stored_unrouted = True
                 stored = {
                     "id": item_id,
                     "delivery_id": delivery_id,
                     "thread": thread,
+                    "subject": str(item.get("subject", ""))[:64],
+                    "thread_owner": stored_owner,
+                    "unrouted": stored_unrouted,
                     "reply_to": str(item.get("reply_to", ""))[:64],
                     "from": sender,
                     "from_agent": str(item.get("from_agent", ""))[:64],
@@ -1051,6 +1088,46 @@ def _eligible_preferred(item, session):
             session.get("mailbox", "main") == (item.get("to_mailbox") or "main"))
 
 
+def thread_owner(thread, exclude_id=""):
+    """The agent that last claimed an item on this thread, if any.
+
+    Derived from the items themselves rather than a second store, so it cannot
+    disagree with the inbox and survives a restart for as long as the thread does.
+    """
+    if not thread:
+        return ""
+    best, best_ts = "", -1.0
+    for path in INBOX_DIR.glob("*.json"):
+        try:
+            item = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if item.get("thread") != thread or item.get("id") == exclude_id:
+            continue
+        claimant = item.get("thread_owner") or item.get("claimed_by", "")
+        if not claimant:
+            continue
+        stamp = float(item.get("claimed_at") or item.get("received_ts") or 0)
+        if stamp >= best_ts:
+            best, best_ts = claimant, stamp
+    return best
+
+
+def _general_candidates(sessions, mailbox, subject):
+    """Live general listeners that should be offered an item nobody is named on.
+
+    A subject goes only to a session that declared it. A session that declared
+    no subjects is a generalist and takes work that names no subject, or that
+    names one nobody claimed.
+    """
+    live = [x for x in live_sessions(sessions, mailbox=mailbox, mode="general")]
+    if subject:
+        matched = [x for x in live if subject in (x.get("subjects") or [])]
+        if matched:
+            return matched
+    return [x for x in live if not (x.get("subjects") or [])]
+
+
 def _route(cfg):
     """Assign each open item to one eligible listener instance."""
     sessions = read_sessions()
@@ -1087,11 +1164,35 @@ def _route(cfg):
             if active_assignment(item, sessions):
                 continue
             destination = item.get("to_mailbox") or configured_default_mailbox(cfg)
-            chosen = current_consumer(destination, sessions) or _pick_live(
-                sessions, mailbox=destination)
+
+            # A thread belongs to whoever answered it. Later items follow, so a
+            # conversation cannot migrate into another session's context.
+            owner = thread_owner(item.get("thread", ""), exclude_id=item.get("id", ""))
+            chosen = None
+            if owner:
+                # Stamp it on the item, so the reason it was routed here is durable
+                # and a later claim check does not have to re-derive it.
+                if item.get("thread_owner") != owner:
+                    item["thread_owner"] = owner
+                    atomic_write_json(path, item)
+                chosen = (_pick_live(sessions, mailbox=destination, agent=owner)
+                          or _pick_live(sessions, agent=owner))
+
+            unrouted = False
+            if chosen is None:
+                candidates = _general_candidates(sessions, destination, item.get("subject", ""))
+                # Deliver only when the choice is unambiguous. With two eligible
+                # sessions, picking one is a coin toss that puts a conversation in
+                # the wrong context, so it waits for an explicit herald claim.
+                if len(candidates) == 1:
+                    chosen = candidates[0]
+                elif len(candidates) > 1:
+                    unrouted = True
+
             next_session = chosen.get("session_id", "") if chosen else ""
-            if next_session != assigned:
+            if next_session != assigned or bool(item.get("unrouted")) != unrouted:
                 item["assigned_session"] = next_session
+                item["unrouted"] = unrouted
                 atomic_write_json(path, item)
 
 
@@ -1350,6 +1451,8 @@ def cmd_send(cfg, args):
         payload["_expects_terminal"] = True
     if args.thread:
         payload["thread"] = args.thread
+    if getattr(args, "subject", None):
+        payload["subject"] = args.subject
     if args.all:
         payload["broadcast"] = True
     else:
@@ -1631,6 +1734,8 @@ def _claim_item(item_id, agent, mailbox, listener=None, force=False):
             if item.get("claimed_by") and item["claimed_by"] != agent:
                 item["ownership_revision"] = item.get("ownership_revision", 0) + 1
             item["claimed_by"] = agent
+            item["thread_owner"] = agent
+            item["unrouted"] = False
             item["claimed_mailbox"] = mailbox
             item["claimed_pid"] = harness_pid()
             item["claimed_at"] = item.get("claimed_at") or time.time()
@@ -1643,6 +1748,24 @@ def _claim_item(item_id, agent, mailbox, listener=None, force=False):
                 item["presented_generation"] = listener.get("generation", 0)
             atomic_write_json(path, item)
         return item
+
+
+def unrouted_ids(listener, sessions=None):
+    """Open items this session may not take because the choice is ambiguous."""
+    held = []
+    for path in INBOX_DIR.glob("*.json"):
+        try:
+            item = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if item_state(item) == "handled" or recipient_agent(item):
+            continue
+        if not _item_matches_mailbox(item, listener["mailbox"], listener["agent"]):
+            continue
+        owner = item.get("thread_owner", "")
+        if item.get("unrouted") or (owner and owner != listener["agent"]):
+            held.append(item["id"])
+    return sorted(held)
 
 
 def _claim_next(listener):
@@ -1658,6 +1781,19 @@ def _claim_next(listener):
             if state == "handled":
                 continue
             if not _item_matches_mailbox(item, listener["mailbox"], listener["agent"]):
+                continue
+            # Several sessions could take this one, so no listener takes it by
+            # being first to poll. herald claim decides it deliberately.
+            if item.get("unrouted") and not recipient_agent(item):
+                continue
+            # A thread belongs to the session that answered it. Taking the mailbox
+            # bumps the generation and re-presents open items, which would
+            # otherwise pull another session's conversation into this one. When
+            # that session is gone the work waits for an explicit claim or
+            # handoff rather than being reassigned by accident.
+            owner = item.get("thread_owner", "")
+            if (owner and owner != listener["agent"] and not recipient_agent(item)
+                    and not listener.get("takeover")):
                 continue
             if listener["mode"] == "ask":
                 if not listener.get("request_id") or item.get("reply_to") != listener["request_id"]:
@@ -1683,6 +1819,8 @@ def _claim_next(listener):
         if item.get("claimed_by") and item["claimed_by"] != listener["agent"]:
             item["ownership_revision"] = item.get("ownership_revision", 0) + 1
         item["claimed_by"] = listener["agent"]
+        item["thread_owner"] = listener["agent"]
+        item["unrouted"] = False
         item["claimed_mailbox"] = listener["mailbox"]
         item["claimed_pid"] = listener.get("harness_pid")
         item["claimed_at"] = item.get("claimed_at") or time.time()
@@ -1696,9 +1834,17 @@ def _claim_next(listener):
         return item
 
 
+def item_files_dir(item_id):
+    return FILES_DIR / sanitize_filename(str(item_id))
+
+
 def _write_files(item, out_dir=None):
+    # Never the process CWD by default: an agent session's CWD is whatever repo
+    # its terminal sits in, so an unrelated attachment landed in a git checkout.
+    target = Path(out_dir) if out_dir else item_files_dir(item.get("id", "item"))
+    target.mkdir(parents=True, exist_ok=True)
     for attached in item.get("files", []):
-        out = Path(out_dir or ".") / attached["filename"]
+        out = target / attached["filename"]
         out.write_bytes(Path(attached["stored_path"]).read_bytes())
         print(f"File written to {out.resolve()}", flush=True)
 
@@ -1837,6 +1983,104 @@ def cmd_outgoing(cfg, args):
                   + (f"; last error: {row['last_error']}" if row["last_error"] else ""))
 
 
+def cmd_claim(cfg, args):
+    """Take an item nobody is named on, deliberately."""
+    item = _claim_item(args.id, agent_name(), mailbox_name(cfg))
+    print(f"Claimed {item['id']}; this session now owns thread {item.get('thread', '')}.")
+    if getattr(args, "read", False):
+        _show_item(item, args.out)
+
+
+def cmd_release(cfg, args):
+    """Hand an item back. The session that took it gives up the thread with it."""
+    agent = agent_name()
+    with state_lock():
+        path = INBOX_DIR / f"{args.id}.json"
+        if not path.exists():
+            sys.exit(f"No inbox item {args.id}")
+        item = json.loads(path.read_text())
+        if item.get("claimed_by") not in (None, "", agent):
+            sys.exit(f"Item {args.id} is held by agent '{item['claimed_by']}'. "
+                     "Only its claimant can release it.")
+        item["state"] = "pending"
+        for field in ("claimed_by", "claimed_mailbox", "claimed_at", "claimed_pid",
+                      "thread_owner", "assigned_session"):
+            item[field] = "" if isinstance(item.get(field), str) else None
+        item["thread_owner"] = ""
+        item["assigned_session"] = ""
+        item["presented_generation"] = 0
+        item["unrouted"] = False
+        item["ownership_revision"] = item.get("ownership_revision", 0) + 1
+        atomic_write_json(path, item)
+    print(f"Released {args.id}; it is pending again and no longer owns its thread.")
+
+
+def cmd_handoff(cfg, args):
+    """Give an item and its thread to another session, permanently."""
+    agent = agent_name()
+    with state_lock():
+        path = INBOX_DIR / f"{args.id}.json"
+        if not path.exists():
+            sys.exit(f"No inbox item {args.id}")
+        item = json.loads(path.read_text())
+        if item.get("claimed_by") not in (None, "", agent) and recipient_agent(item) != agent:
+            sys.exit(f"Item {args.id} is held by agent '{item['claimed_by']}'. "
+                     "Only its holder can hand it on.")
+        item.setdefault("ownership_history", []).append(
+            {"from": item.get("claimed_by", ""), "to": args.to, "at": time.time(), "by": agent})
+        item["taken_over_by"] = args.to
+        item["thread_owner"] = args.to
+        item["claimed_by"] = ""
+        item["claimed_at"] = None
+        item["assigned_session"] = ""
+        item["preferred_session"] = ""
+        item["presented_generation"] = 0
+        item["unrouted"] = False
+        item["state"] = "pending"
+        item["ownership_revision"] = item.get("ownership_revision", 0) + 1
+        atomic_write_json(path, item)
+    print(f"Handed {args.id} to '{args.to}'; that agent now owns thread {item.get('thread', '')}.")
+
+
+def cmd_claims(cfg, args):
+    """Who holds what, rendered from the store so it cannot disagree with it."""
+    sessions = read_sessions()
+    now = time.time()
+    rows = []
+    for path in sorted(INBOX_DIR.glob("*.json")):
+        try:
+            item = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if item_state(item) == "handled" and not args.all:
+            continue
+        assigned = sessions.get(item.get("assigned_session", "")) or {}
+        rows.append({
+            "id": item.get("id", ""),
+            "thread": item.get("thread", ""),
+            "subject": item.get("subject", ""),
+            "from": item.get("from", ""),
+            "state": item_state(item),
+            "recipient": recipient_agent(item),
+            "owner": item.get("thread_owner") or item.get("claimed_by", ""),
+            "unrouted": bool(item.get("unrouted")),
+            "listener": assigned.get("agent", ""),
+            "listener_heartbeat_age": (round(now - assigned["heartbeat"])
+                                       if assigned.get("heartbeat") else None),
+            "preview": str(item.get("text", ""))[:60].replace("\n", " "),
+        })
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    elif not rows:
+        print("No open items")
+    else:
+        for row in rows:
+            who = row["owner"] or row["recipient"] or ("UNROUTED" if row["unrouted"] else "-")
+            subject = f" subject={row['subject']}" if row["subject"] else ""
+            print(f"{row['id']}  [{row['state']}] owner={who}{subject} "
+                  f"thread={row['thread']} from={row['from']} - {row['preview']}")
+
+
 def cmd_read(cfg, args):
     item = _claim_item(args.id, agent_name(), mailbox_name(cfg), force=args.force)
     _show_item(item, args.out)
@@ -1947,7 +2191,8 @@ def _open_outstanding_requests(mailbox):
 
 
 def cmd_wait(cfg, args):
-    listener = register_listener(cfg, mode="general", takeover=getattr(args, "resume", False))
+    listener = register_listener(cfg, mode="general", takeover=getattr(args, "resume", False),
+                                 subjects=getattr(args, "subject", None))
     atexit.register(clear_session, listener["session_id"])
     signal.signal(signal.SIGTERM,
                   lambda *a: (clear_session(listener["session_id"]), sys.exit(0)))
@@ -1956,6 +2201,7 @@ def cmd_wait(cfg, args):
         if outstanding:
             print(f"{len(outstanding)} outgoing request(s) still await a final reply", flush=True)
     deadline = time.time() + args.timeout if args.timeout else None
+    announced = []
     while True:
         if not consumer_is_current(listener):
             clear_session(listener["session_id"])
@@ -1972,6 +2218,14 @@ def cmd_wait(cfg, args):
                       f"id {item['id']}, thread {item['thread']}")
             clear_session(listener["session_id"])
             return
+        # Name them without showing them: an id costs nothing, and the content
+        # belongs to whichever session ends up owning it.
+        held = unrouted_ids(listener)
+        if held and held != announced:
+            announced = held
+            print(f"{len(held)} item(s) waiting for an owner: {', '.join(held)}. "
+                  f"herald claims shows them; herald claim <id> takes one.",
+                  file=sys.stderr, flush=True)
         if deadline and time.time() > deadline:
             print("Timed out with no new items")
             clear_session(listener["session_id"])
@@ -1982,6 +2236,7 @@ def cmd_wait(cfg, args):
 def cmd_resume(cfg, args):
     args.resume = True
     args.read = True
+    args.subject = getattr(args, "subject", None)
     cmd_wait(cfg, args)
 
 
@@ -2273,6 +2528,7 @@ def main():
     sp.add_argument("--file", "-f", action="append")
     sp.add_argument("--meta", action="append", help="key=value, repeatable")
     sp.add_argument("--thread", help="continue an existing thread")
+    sp.add_argument("--subject", help="topic, so it reaches the session working on it")
     sp.add_argument("--agent", help="address a specific session of the peer (see: herald sessions)")
     sp.add_argument("--mailbox", help="address a durable mailbox at the peer")
     sp.add_argument("--fallback", choices=FALLBACKS, default="hold",
@@ -2369,10 +2625,30 @@ def main():
     sp.add_argument("--read", action="store_true",
                     help="show the full claimed item and extract files (wait always claims)")
     sp.add_argument("--out", help="directory for attached files (with --read)")
+    sp.add_argument("--subject", action="append",
+                    help="a topic this session works on, repeatable; declaring none takes "
+                         "general work")
 
     sp = sub.add_parser("resume", help="take over a mailbox, surface open work, and wait")
     sp.add_argument("--timeout", type=int, default=0)
     sp.add_argument("--out", help="directory for attached files")
+    sp.add_argument("--subject", action="append", help="a topic this session works on, repeatable")
+
+    sp = sub.add_parser("claim", help="take an unrouted item that nobody is named on")
+    sp.add_argument("id")
+    sp.add_argument("--read", action="store_true", help="also show the item and extract files")
+    sp.add_argument("--out", help="directory for attached files (with --read)")
+
+    sp = sub.add_parser("release", help="hand an item back; gives up its thread too")
+    sp.add_argument("id")
+
+    sp = sub.add_parser("handoff", help="give an item and its thread to another session")
+    sp.add_argument("id")
+    sp.add_argument("--to", required=True, help="the agent that should own it from now on")
+
+    sp = sub.add_parser("claims", help="who holds what, and what is unrouted")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--all", action="store_true", help="include handled items")
 
     sp = sub.add_parser("ask", help="send and block for the reply in one turn (reachable peers only)")
     sp.add_argument("peer")
@@ -2407,7 +2683,8 @@ def main():
 
     args = p.parse_args()
     identity_commands = {"send", "reply", "result", "read", "close", "reopen",
-                         "rm", "wait", "resume", "ask", "takeover", "accept"}
+                         "rm", "wait", "resume", "ask", "takeover", "accept",
+                         "claim", "release", "handoff"}
     if (args.cmd in identity_commands and not os.environ.get("HERALD_AGENT")
             and not getattr(args, "as_agent", "")):
         sys.exit(
@@ -2435,6 +2712,8 @@ def main():
      "bell": cmd_bell,
      "access": cmd_access, "thread": cmd_thread, "wait": cmd_wait,
      "resume": cmd_resume, "flush": cmd_flush,
+     "claim": cmd_claim, "release": cmd_release, "handoff": cmd_handoff,
+     "claims": cmd_claims,
      "status": cmd_status, "sessions": cmd_sessions,
      "activity": cmd_activity}[args.cmd](cfg, args)
 
