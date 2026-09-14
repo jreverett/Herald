@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1088,7 +1088,28 @@ def _eligible_preferred(item, session):
             session.get("mailbox", "main") == (item.get("to_mailbox") or "main"))
 
 
-def thread_owner(thread, exclude_id=""):
+def thread_owner_index():
+    """thread -> [(timestamp, claimant, item id)], built in one pass over the inbox.
+
+    A routing pass asks about every item, so deriving each answer from its own
+    scan of the inbox would read the whole directory once per item.
+    """
+    index = {}
+    for path in INBOX_DIR.glob("*.json"):
+        try:
+            item = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        thread = item.get("thread")
+        claimant = item.get("thread_owner") or item.get("claimed_by", "")
+        if not thread or not claimant:
+            continue
+        stamp = float(item.get("claimed_at") or item.get("received_ts") or 0)
+        index.setdefault(thread, []).append((stamp, claimant, item.get("id", "")))
+    return index
+
+
+def thread_owner(thread, exclude_id="", index=None):
     """The agent that last claimed an item on this thread, if any.
 
     Derived from the items themselves rather than a second store, so it cannot
@@ -1096,21 +1117,9 @@ def thread_owner(thread, exclude_id=""):
     """
     if not thread:
         return ""
-    best, best_ts = "", -1.0
-    for path in INBOX_DIR.glob("*.json"):
-        try:
-            item = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if item.get("thread") != thread or item.get("id") == exclude_id:
-            continue
-        claimant = item.get("thread_owner") or item.get("claimed_by", "")
-        if not claimant:
-            continue
-        stamp = float(item.get("claimed_at") or item.get("received_ts") or 0)
-        if stamp >= best_ts:
-            best, best_ts = claimant, stamp
-    return best
+    entries = (index if index is not None else thread_owner_index()).get(thread, [])
+    candidates = [x for x in entries if x[2] != exclude_id]
+    return max(candidates)[1] if candidates else ""
 
 
 def _general_candidates(sessions, mailbox, subject):
@@ -1132,6 +1141,7 @@ def _route(cfg):
     """Assign each open item to one eligible listener instance."""
     sessions = read_sessions()
     with state_lock():
+        owners = thread_owner_index()
         for path in INBOX_DIR.glob("*.json"):
             try:
                 item = json.loads(path.read_text())
@@ -1167,7 +1177,8 @@ def _route(cfg):
 
             # A thread belongs to whoever answered it. Later items follow, so a
             # conversation cannot migrate into another session's context.
-            owner = thread_owner(item.get("thread", ""), exclude_id=item.get("id", ""))
+            owner = thread_owner(item.get("thread", ""), exclude_id=item.get("id", ""),
+                                 index=owners)
             chosen = None
             if owner:
                 # Stamp it on the item, so the reason it was routed here is durable

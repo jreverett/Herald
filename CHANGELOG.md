@@ -2,6 +2,13 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.12.1
+
+- A routing pass read the whole inbox once per item. `thread_owner` derived its
+  answer from its own scan, and `_route` asks about every open item, so the cost
+  grew with the square of the inbox and landed in the daemon's maintenance loop.
+  The thread-owner index is now built once per pass.
+
 ## 0.12.0
 
 - Work reached whichever session happened to own the mailbox, not the session it
