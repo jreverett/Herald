@@ -78,6 +78,8 @@ WORKING_LEASE = 90          # a working marker with no live session behind it go
 WORKING_ALIVE_LEASE = 600   # its session is alive, so a long stretch between tool calls is not staleness
 HARNESS_COMMS_SKIP = ("sh", "bash", "dash", "zsh", "fish", "env", "python", "python3", "herald")
 TARGET_GIVEUP = 300         # release a targeted item whose target never reappears after this
+TIDY_AFTER = 2 * 86400      # an open item idle this long is finished, whatever its state says
+TIDY_EVERY = 3600           # how often the daemon sweeps finished work away
 SUSPEND_GAP = HEARTBEAT_INTERVAL * 6   # a maintenance tick later than this means the host slept
 TTY_SEARCH_DEPTH = 12
 PTS_MAJOR = 136
@@ -1071,6 +1073,7 @@ def _maintenance_loop(stop):
     tick = 0
     last = time.time()
     skip_reap_until = 0
+    last_tidy = 0
     while not stop.is_set():
         now = time.time()
         if now - last > SUSPEND_GAP:
@@ -1100,6 +1103,12 @@ def _maintenance_loop(stop):
             try:
                 _reap(cfg)
             except (SystemExit, OSError, json.JSONDecodeError):
+                pass
+        if cfg and now - last_tidy >= TIDY_EVERY:
+            last_tidy = now
+            try:
+                apply_tidy(now - TIDY_AFTER, "Closed automatically once nothing was waiting on it")
+            except (OSError, json.JSONDecodeError):
                 pass
         tick += 1
         stop.wait(HEARTBEAT_INTERVAL)
@@ -2181,20 +2190,13 @@ def _tidy_candidates(cutoff):
         yield "outgoing", path, request, when
 
 
-def cmd_tidy(cfg, args):
-    """Close work that is finished but still counted as open.
-
-    Herald holds an item open until an agent closes it, and a session that ends takes
-    its claims with it, so read results and answered requests accumulate for ever.
-    """
-    ensure_dirs()
-    cutoff = time.time() - args.older_than * 86400
-    reason = f"Closed by herald tidy after {args.older_than} day(s)"
+def apply_tidy(cutoff, reason, dry_run=False):
+    """Close every candidate older than the cutoff. Returns what was closed."""
     closed = []
     with state_lock():
         for where, path, record, when in _tidy_candidates(cutoff):
             closed.append((where, record, when))
-            if args.dry_run:
+            if dry_run:
                 continue
             record.update(state="handled", handled_at=time.time(), closed_reason=reason)
             if where == "inbox":
@@ -2202,6 +2204,20 @@ def cmd_tidy(cfg, args):
             else:
                 record["awaiting_reply_ids"] = []
             atomic_write_json(path, record)
+    return closed
+
+
+def cmd_tidy(cfg, args):
+    """Close work that is finished but still counted as open.
+
+    Herald holds an item open until an agent closes it, and a session that ends takes
+    its claims with it, so read results and answered requests accumulate for ever. The
+    daemon runs this sweep hourly; this command is the same sweep on demand.
+    """
+    ensure_dirs()
+    closed = apply_tidy(time.time() - args.older_than * 86400,
+                        f"Closed by herald tidy after {args.older_than} day(s)",
+                        dry_run=args.dry_run)
     if not closed:
         print(f"Nothing to tidy: no open items older than {args.older_than} day(s)")
         return

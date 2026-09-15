@@ -11,6 +11,8 @@ Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the runni
   gone, and a request whose answer has arrived. It never touches a pending item
   or one a live session still holds. `--older-than DAYS` (default 2) and
   `--dry-run` control it, and `herald reopen` restores an inbox item.
+- The daemon runs that sweep hourly, so clearing finished work no longer depends
+  on an agent remembering to close anything.
 - An acknowledged request could never settle. The acknowledgement kept the record
   open on purpose, but the answer it promised usually arrives as a fresh message
   on the thread rather than a reply to the acknowledged id, so the record waited

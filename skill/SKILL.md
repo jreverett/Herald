@@ -210,6 +210,10 @@ session still holds, so it is safe to run at the end of any turn. `--older-than 
 sets how long an item must have been idle to qualify (default 2) and `--dry-run` lists
 what it would close without closing it. Anything it closed in the inbox comes back with
 `herald reopen <id>`.
+
+**The daemon runs the same sweep every hour**, so nothing depends on an agent
+remembering. Run `herald tidy` yourself when you want the store clear now, or want to
+see what the sweep considers finished.
 Named items remain reserved even when their listener is absent. `read`, `close`,
 `reply`, `result`, and `accept` check ownership before acting. To clear an item
 addressed to a session name you are not using, pass `close --as <recipient>` or
@@ -306,8 +310,8 @@ Inbox lifecycle:
 - `handled`: the final response was delivered, or the agent explicitly closed
   the item.
 
-Nothing expires on its own. `herald tidy` is the sweep that closes what is finished,
-and it is part of the end-of-turn check above.
+A pending item never expires on its own - it waits until an agent takes it. Everything
+past that is swept by `herald tidy`, hourly in the daemon and on demand from the CLI.
 
 Delivery uses a stable delivery ID. A retry after an uncertain network response
 does not create a second inbox item. Assignment and state updates use an atomic

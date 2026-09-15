@@ -1013,3 +1013,27 @@ class ClearingFinishedWork(unittest.TestCase):
         herald.cmd_tidy(self.cfg, argparse.Namespace(older_than=2, dry_run=True))
 
         self.assertEqual(self._outgoing()["state"], "awaiting_terminal")
+
+    def test_the_daemon_sweeps_finished_work_without_being_asked(self):
+        herald.atomic_write_json(herald.CONFIG_PATH, {
+            "me": "jamie", "peers": {}, "default_mailbox": "main", "mailboxes": ["main"]})
+        stale = time.time() - 5 * 86400
+        herald.atomic_write_json(herald.INBOX_DIR / "old.json", {
+            "id": "old", "thread": "t9", "from": "simon", "kind": "result",
+            "status": "done", "text": "nobody closed me", "state": "active",
+            "claimed_by": "dead-session", "claimed_at": stale, "received_ts": stale,
+            "to_mailbox": "main", "files": [],
+        })
+        stop = threading.Event()
+
+        worker = threading.Thread(target=herald._maintenance_loop, args=(stop,), daemon=True)
+        worker.start()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if json.loads((herald.INBOX_DIR / "old.json").read_text())["state"] == "handled":
+                break
+            time.sleep(0.05)
+        stop.set()
+        worker.join(timeout=5)
+
+        self.assertEqual(json.loads((herald.INBOX_DIR / "old.json").read_text())["state"], "handled")
