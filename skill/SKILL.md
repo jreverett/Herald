@@ -145,14 +145,17 @@ herald ping <person>                                  # is their daemon up? whic
   the one signal you need to act on. Never wire an alert to that exit code.
   - A listener can receive shared work while you wait for a named reply.
     Restart it after handling that shared item if your reply is outstanding.
-- **Close every Herald turn with `herald inbox --unclaimed`.** The rules above
-  are "remember to" rules and they get missed; this is the check that catches it
-  regardless. It needs no listener, costs one command, and prints exactly what
-  is sitting unread. Run it before you hand back to your human whenever the turn
+- **Close every Herald turn with `herald inbox --unclaimed` and `herald tidy`.**
+  The rules above are "remember to" rules and they get missed; these two checks
+  catch it regardless. Neither needs a listener, and between them they print what
+  is sitting unread and clear what is finished but still counted as open. Run it before you hand back to your human whenever the turn
   touched Herald at all, and start a listener if anything is outstanding. Two
   messages sat unread for half an hour on 2026-09-01 because three separate
   turns ended with no listener and no closing check; the human found them, not
   the agent.
+- An outgoing request settles when its reply arrives. An acknowledgement keeps it
+  open on purpose, and the answer it promised closes it even when that answer comes
+  as a fresh message on the thread rather than a direct reply.
 - If a peer is offline the send is **queued, not lost** — you'll see "Peer
   '<name>' is unreachable ... queued for retry". Queued items deliver
   automatically on your next successful contact with that peer, are retried by
@@ -199,6 +202,14 @@ can no longer answer it, and a delivery still being retried can arrive again as 
 new item. It refuses an item held by another live session unless you pass
 `--force`. Ordinary removal also checks the intended recipient. Prefer `close`.
 Herald keeps handled JSON records as history and does not delete them automatically.
+
+`herald tidy` closes work that is finished but still counted as open - a claim whose
+session has ended, and a request whose answer has already arrived. It never touches a
+pending item, because nobody has read that yet, and never touches an item a live
+session still holds, so it is safe to run at the end of any turn. `--older-than DAYS`
+sets how long an item must have been idle to qualify (default 2) and `--dry-run` lists
+what it would close without closing it. Anything it closed in the inbox comes back with
+`herald reopen <id>`.
 Named items remain reserved even when their listener is absent. `read`, `close`,
 `reply`, `result`, and `accept` check ownership before acting. To clear an item
 addressed to a session name you are not using, pass `close --as <recipient>` or
@@ -295,6 +306,9 @@ Inbox lifecycle:
 - `handled`: the final response was delivered, or the agent explicitly closed
   the item.
 
+Nothing expires on its own. `herald tidy` is the sweep that closes what is finished,
+and it is part of the end-of-turn check above.
+
 Delivery uses a stable delivery ID. A retry after an uncertain network response
 does not create a second inbox item. Assignment and state updates use an atomic
 store lock, so two listeners cannot claim the same item.
@@ -347,8 +361,10 @@ human, and send the final reply after they decide.
 **result** — a task you sent has progressed. Fold it back into the originating
 work; `herald thread <thread-id>` recovers the context. An `accepted`, `working`,
 or `herald_intent: ack` item promises a later reply. Do not acknowledge it; keep
-listening for the final answer. Close a terminal result after you fold it into
-your work when it did not arrive through `herald ask`.
+listening for the final answer. **Close a terminal result with `herald close <id>`
+the moment you fold it into your work**, when it did not arrive through `herald ask`.
+Nothing else will: an item stays open until an agent closes it, and a session that
+ends takes its claims with it, so an unclosed result sits there for ever.
 
 **introduction** — a message whose meta has `herald_intent: introduce`: someone
 new is sharing their address+token so your person can reach them. They could

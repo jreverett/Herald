@@ -94,6 +94,7 @@ herald outgoing [--json]                    # queued, rejected, and awaiting-rep
 herald reply <id> -m "..."                  # same thread; peer and session inferred
 herald result <id> --status working|accepted|done|failed -m "..." [-f out]
 herald close <id> | herald reopen <id>
+herald tidy [--older-than DAYS] [--dry-run]  # close finished work still counted as open
 herald thread <thread-id>                   # whole conversation, both directions
 herald wait | herald resume                 # become listener; resume also shows existing open work
 herald sessions | herald status | herald flush [peer]

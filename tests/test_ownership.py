@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import json
@@ -891,3 +892,124 @@ class ContextIsolation(unittest.TestCase):
 
     def _stored(self, item_id):
         return json.loads((herald.INBOX_DIR / f"{item_id}.json").read_text())
+
+
+class ClearingFinishedWork(unittest.TestCase):
+    """Records must not stay open once nothing is waiting on them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.env = patch.dict(os.environ, {"HERALD_DIR": str(root), "HERALD_AGENT": "solo"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        for name, sub in (("HERALD_DIR", ""), ("INBOX_DIR", "inbox"), ("OUTBOX_DIR", "outbox"),
+                          ("FILES_DIR", "files"), ("QUEUE_DIR", "queue"), ("SESSIONS_DIR", "sessions"),
+                          ("CONSUMERS_DIR", "consumers"), ("ACTIVITY_DIR", "activity"),
+                          ("WORKING_DIR", "working"), ("FAILED_DIR", "failed")):
+            if hasattr(herald, name):
+                patcher = patch.object(herald, name, root / sub if sub else root)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        for name, leaf in (("LOCK_PATH", "state.lock"), ("STATUS_PATH", "status.json"),
+                           ("CONFIG_PATH", "config.json")):
+            if hasattr(herald, name):
+                patcher = patch.object(herald, name, root / leaf)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        herald.ensure_dirs()
+        self.cfg = {"me": "jamie", "peers": {}, "default_mailbox": "main", "mailboxes": ["main"]}
+
+    def _sent(self, item_id="out1", thread="t1"):
+        herald.atomic_write_json(herald.OUTBOX_DIR / f"{item_id}.json", {
+            "id": item_id, "thread": thread, "to": "simon", "kind": "message",
+            "text": "decisions you are unblocked on", "remote_ids": [item_id],
+            "state": "awaiting_terminal", "awaiting_reply_ids": [item_id],
+            "sent_ts": time.time(), "files": [],
+        })
+
+    def _inbound(self, item_id, thread="t1", reply_to="", meta=None, **extra):
+        item = {
+            "id": item_id, "thread": thread, "reply_to": reply_to, "from": "simon",
+            "kind": "message", "text": "the real answer", "meta": meta or {},
+            "received_ts": time.time(), "files": [],
+        }
+        item.update(extra)
+        return item
+
+    def _outgoing(self, item_id="out1"):
+        return json.loads((herald.OUTBOX_DIR / f"{item_id}.json").read_text())
+
+    def test_an_acknowledged_request_closes_when_the_answer_lands_on_the_thread(self):
+        self._sent()
+        herald._update_outstanding_request(
+            self._inbound("ack1", reply_to="out1", meta={"herald_intent": "ack"}))
+        self.assertEqual(self._outgoing()["state"], "awaiting_terminal")
+
+        herald._update_outstanding_request(self._inbound("answer1", reply_to=""))
+
+        self.assertEqual(self._outgoing()["state"], "handled")
+
+    def test_an_unacknowledged_request_keeps_waiting_for_its_own_reply(self):
+        self._sent()
+
+        herald._update_outstanding_request(self._inbound("chatter", reply_to=""))
+
+        self.assertEqual(self._outgoing()["state"], "awaiting_terminal")
+
+    def test_another_thread_does_not_close_an_acknowledged_request(self):
+        self._sent()
+        herald._update_outstanding_request(
+            self._inbound("ack1", reply_to="out1", meta={"herald_intent": "ack"}))
+
+        herald._update_outstanding_request(self._inbound("elsewhere", thread="t2"))
+
+        self.assertEqual(self._outgoing()["state"], "awaiting_terminal")
+
+    def test_tidy_closes_a_stale_claim_whose_session_has_gone(self):
+        stale = time.time() - 5 * 86400
+        herald.atomic_write_json(herald.INBOX_DIR / "old.json", {
+            "id": "old", "thread": "t9", "from": "simon", "kind": "result",
+            "status": "done", "text": "row reset", "state": "active",
+            "claimed_by": "dead-session", "claimed_at": stale, "received_ts": stale,
+            "to_mailbox": "main", "files": [],
+        })
+
+        herald.cmd_tidy(self.cfg, argparse.Namespace(older_than=2, dry_run=False))
+
+        self.assertEqual(json.loads((herald.INBOX_DIR / "old.json").read_text())["state"], "handled")
+
+    def test_tidy_never_closes_unread_work(self):
+        stale = time.time() - 5 * 86400
+        herald.atomic_write_json(herald.INBOX_DIR / "unread.json", {
+            "id": "unread", "thread": "t9", "from": "simon", "kind": "task",
+            "text": "please run the tests", "state": "pending",
+            "received_ts": stale, "to_mailbox": "main", "files": [],
+        })
+
+        herald.cmd_tidy(self.cfg, argparse.Namespace(older_than=2, dry_run=False))
+
+        self.assertEqual(json.loads((herald.INBOX_DIR / "unread.json").read_text())["state"], "pending")
+
+    def test_tidy_leaves_recent_work_alone(self):
+        herald.atomic_write_json(herald.INBOX_DIR / "fresh.json", {
+            "id": "fresh", "thread": "t9", "from": "simon", "kind": "result",
+            "status": "done", "text": "just in", "state": "active",
+            "claimed_by": "dead-session", "claimed_at": time.time(),
+            "received_ts": time.time(), "to_mailbox": "main", "files": [],
+        })
+
+        herald.cmd_tidy(self.cfg, argparse.Namespace(older_than=2, dry_run=False))
+
+        self.assertEqual(json.loads((herald.INBOX_DIR / "fresh.json").read_text())["state"], "active")
+
+    def test_tidy_dry_run_changes_nothing(self):
+        stale = time.time() - 5 * 86400
+        self._sent()
+        herald.atomic_write_json(herald.OUTBOX_DIR / "out1.json",
+                                 {**self._outgoing(), "sent_ts": stale})
+
+        herald.cmd_tidy(self.cfg, argparse.Namespace(older_than=2, dry_run=True))
+
+        self.assertEqual(self._outgoing()["state"], "awaiting_terminal")

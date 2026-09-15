@@ -2,6 +2,20 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.12.2
+
+- Finished work stayed counted as open for ever. Herald holds an item until an
+  agent closes it, and a session that ends takes its claims with it, so read
+  results and answered requests accumulated until someone cleared them by hand.
+  New `herald tidy` closes what nothing is waiting on: a claim whose session has
+  gone, and a request whose answer has arrived. It never touches a pending item
+  or one a live session still holds. `--older-than DAYS` (default 2) and
+  `--dry-run` control it, and `herald reopen` restores an inbox item.
+- An acknowledged request could never settle. The acknowledgement kept the record
+  open on purpose, but the answer it promised usually arrives as a fresh message
+  on the thread rather than a reply to the acknowledged id, so the record waited
+  for ever. A real reply on the thread now closes it.
+
 ## 0.12.1
 
 - A routing pass read the whole inbox once per item. `thread_owner` derived its

@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.12.1"
+__version__ = "0.12.2"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -730,13 +730,48 @@ def _apply_source_delivery(payload, delivery_state, error=""):
         atomic_write_json(path, item)
 
 
-def _update_outstanding_request(item):
-    reply_to = item.get("reply_to", "")
-    if not reply_to:
+def _only_acknowledged(request):
+    """True when every id this record still waits on has drawn nothing but an acknowledgement."""
+    waiting = request.get("awaiting_reply_ids") or []
+    acknowledged = request.get("acknowledged_ids") or []
+    return bool(waiting) and all(item_id in acknowledged for item_id in waiting)
+
+
+def _settle_acknowledged_on_thread(item, skip_path=None):
+    """Close records an acknowledgement left open, once a real reply lands on their thread.
+
+    An acknowledgement deliberately keeps the record open because a later answer is
+    promised. That answer usually arrives as a fresh message on the thread rather than
+    as a reply to the acknowledged id, so without this the record waits for ever.
+    """
+    thread = item.get("thread", "")
+    if not thread:
         return
+    for path in OUTBOX_DIR.glob("*.json"):
+        if skip_path is not None and path == skip_path:
+            continue
+        try:
+            request = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if request.get("thread") != thread or request.get("to") != item.get("from"):
+            continue
+        if not _only_acknowledged(request):
+            continue
+        request.update(state="handled", awaiting_reply_ids=[],
+                       handled_at=item.get("received_ts", time.time()),
+                       closed_reason=f"Answered on the thread by {item.get('id', '')}")
+        atomic_write_json(path, request)
+
+
+def _update_outstanding_request(item):
+    is_progress = ((item.get("kind") == "result"
+                    and item.get("status") in ("accepted", "working"))
+                   or item.get("meta", {}).get("herald_intent") == "ack")
+    reply_to = item.get("reply_to", "")
     with state_lock():
-        path = OUTBOX_DIR / f"{reply_to}.json"
-        if not path.exists():
+        path = OUTBOX_DIR / f"{reply_to}.json" if reply_to else None
+        if path is not None and not path.exists():
             path = None
             for candidate in OUTBOX_DIR.glob("*.json"):
                 try:
@@ -746,21 +781,23 @@ def _update_outstanding_request(item):
                 if reply_to in request.get("remote_ids", []):
                     path = candidate
                     break
-            if path is None:
-                return
+        if path is None:
+            if not is_progress:
+                _settle_acknowledged_on_thread(item)
+            return
         try:
             request = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             return
-        is_progress = ((item.get("kind") == "result"
-                        and item.get("status") in ("accepted", "working"))
-                       or item.get("meta", {}).get("herald_intent") == "ack")
         if is_progress:
             waiting = request.get("awaiting_reply_ids")
             if request.get("state") == "handled" or (waiting is not None and reply_to not in waiting):
                 return
             request["state"] = "awaiting_terminal"
             request["last_progress_at"] = item.get("received_ts", time.time())
+            acknowledged = request.setdefault("acknowledged_ids", [])
+            if reply_to not in acknowledged:
+                acknowledged.append(reply_to)
         else:
             waiting = request.get("awaiting_reply_ids", [request.get("id", "")])
             request["awaiting_reply_ids"] = [item_id for item_id in waiting
@@ -771,6 +808,8 @@ def _update_outstanding_request(item):
                 request["state"] = "handled"
                 request["handled_at"] = item.get("received_ts", time.time())
         atomic_write_json(path, request)
+        if not is_progress:
+            _settle_acknowledged_on_thread(item, skip_path=path)
 
 
 # ---------------- daemon (receiver) ----------------
@@ -2112,6 +2151,69 @@ def cmd_close(cfg, args):
     print(f"Closed inbox item {item['id']}")
 
 
+def _tidy_candidates(cutoff):
+    """Open records that nothing is still waiting on: finished work and dead sessions.
+
+    Pending items are never candidates - nobody has read them yet.
+    """
+    sessions = read_sessions()
+    for path in sorted(INBOX_DIR.glob("*.json")):
+        try:
+            item = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if item_state(item) != "active":
+            continue
+        when = item.get("claimed_at") or item.get("received_ts", 0)
+        if when > cutoff or active_assignment(item, sessions):
+            continue
+        yield "inbox", path, item, when
+    for path in sorted(OUTBOX_DIR.glob("*.json")):
+        try:
+            request = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if request.get("state") != "awaiting_terminal":
+            continue
+        when = request.get("last_progress_at") or request.get("sent_ts", 0)
+        if when > cutoff:
+            continue
+        yield "outgoing", path, request, when
+
+
+def cmd_tidy(cfg, args):
+    """Close work that is finished but still counted as open.
+
+    Herald holds an item open until an agent closes it, and a session that ends takes
+    its claims with it, so read results and answered requests accumulate for ever.
+    """
+    ensure_dirs()
+    cutoff = time.time() - args.older_than * 86400
+    reason = f"Closed by herald tidy after {args.older_than} day(s)"
+    closed = []
+    with state_lock():
+        for where, path, record, when in _tidy_candidates(cutoff):
+            closed.append((where, record, when))
+            if args.dry_run:
+                continue
+            record.update(state="handled", handled_at=time.time(), closed_reason=reason)
+            if where == "inbox":
+                record["ownership_revision"] = record.get("ownership_revision", 0) + 1
+            else:
+                record["awaiting_reply_ids"] = []
+            atomic_write_json(path, record)
+    if not closed:
+        print(f"Nothing to tidy: no open items older than {args.older_than} day(s)")
+        return
+    verb = "Would close" if args.dry_run else "Closed"
+    for where, record, when in closed:
+        age = int((time.time() - when) / 86400) if when else 0
+        who = recipient_label(record) if where == "inbox" else f"to {record.get('to', '')}"
+        preview = record.get("text", "")[:60].replace("\n", " ")
+        print(f"{verb} {where} {record.get('id', '')} ({age}d, {who}) - {preview}")
+    print(f"{verb} {len(closed)} item(s). Inbox items can be restored with herald reopen <id>.")
+
+
 def cmd_rm(cfg, args):
     """Delete an inbox record outright, for clearing debris while debugging.
 
@@ -2603,6 +2705,12 @@ def main():
     sp = sub.add_parser("reopen", help="return a handled inbox item to pending")
     sp.add_argument("id")
 
+    sp = sub.add_parser("tidy", help="close finished work that is still counted as open")
+    sp.add_argument("--older-than", type=float, default=2, metavar="DAYS",
+                    help="only close items idle this long (default: 2)")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="list what would be closed without closing it")
+
     sp = sub.add_parser("rm", help="delete an inbox item and its files, keeping no history")
     sp.add_argument("id")
     sp.add_argument("--as", dest="as_agent", default="", metavar="AGENT",
@@ -2717,7 +2825,8 @@ def main():
     {"init": cmd_init, "daemon": cmd_daemon, "send": cmd_send, "reply": cmd_reply,
      "result": cmd_result, "inbox": cmd_inbox, "read": cmd_read,
      "peek": cmd_peek, "takeover": cmd_takeover, "outgoing": cmd_outgoing,
-     "close": cmd_close, "reopen": cmd_reopen, "rm": cmd_rm, "peer": cmd_peer,
+     "close": cmd_close, "reopen": cmd_reopen, "rm": cmd_rm, "tidy": cmd_tidy,
+     "peer": cmd_peer,
      "mailbox": cmd_mailbox,
      "introduce": cmd_introduce, "accept": cmd_accept, "ask": cmd_ask, "ping": cmd_ping,
      "bell": cmd_bell,
