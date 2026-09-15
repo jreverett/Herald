@@ -2,6 +2,13 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.12.3
+
+- 0.12.2 settled an acknowledged request only when it carried an
+  `awaiting_reply_ids` list, which a task has and a plain message does not. The
+  message case is the one that stuck in practice, so it went on waiting for ever.
+  An acknowledgement alone now counts as the only thing holding a record open.
+
 ## 0.12.2
 
 - Finished work stayed counted as open for ever. Herald holds an item until an

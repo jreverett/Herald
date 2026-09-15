@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.12.2"
+__version__ = "0.12.3"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -733,10 +733,20 @@ def _apply_source_delivery(payload, delivery_state, error=""):
 
 
 def _only_acknowledged(request):
-    """True when every id this record still waits on has drawn nothing but an acknowledgement."""
-    waiting = request.get("awaiting_reply_ids") or []
+    """True when nothing but an acknowledgement is holding this record open.
+
+    A plain message carries no awaiting_reply_ids at all - the acknowledgement is the
+    only reason it is still open - so an empty list here means settled, not unsettled.
+    """
+    if request.get("state") != "awaiting_terminal":
+        return False
     acknowledged = request.get("acknowledged_ids") or []
-    return bool(waiting) and all(item_id in acknowledged for item_id in waiting)
+    if not acknowledged:
+        return False
+    waiting = request.get("awaiting_reply_ids")
+    if not waiting:
+        return True
+    return all(item_id in acknowledged for item_id in waiting)
 
 
 def _settle_acknowledged_on_thread(item, skip_path=None):

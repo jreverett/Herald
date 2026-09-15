@@ -1037,3 +1037,29 @@ class ClearingFinishedWork(unittest.TestCase):
         worker.join(timeout=5)
 
         self.assertEqual(json.loads((herald.INBOX_DIR / "old.json").read_text())["state"], "handled")
+
+    def test_an_acknowledged_plain_message_closes_when_the_answer_arrives(self):
+        """The real-world shape: a plain send carries no awaiting_reply_ids at all."""
+        herald.atomic_write_json(herald.OUTBOX_DIR / "out2.json", {
+            "id": "out2", "thread": "t1", "to": "simon", "kind": "message",
+            "text": "decisions you are unblocked on", "remote_ids": ["out2"],
+            "state": "awaiting_terminal", "sent_ts": time.time(), "files": [],
+        })
+        herald._update_outstanding_request(
+            self._inbound("ack2", reply_to="out2", meta={"herald_intent": "ack"}))
+        self.assertEqual(self._outgoing("out2")["state"], "awaiting_terminal")
+
+        herald._update_outstanding_request(self._inbound("answer2", reply_to=""))
+
+        self.assertEqual(self._outgoing("out2")["state"], "handled")
+
+    def test_a_plain_message_with_no_acknowledgement_keeps_waiting(self):
+        herald.atomic_write_json(herald.OUTBOX_DIR / "out3.json", {
+            "id": "out3", "thread": "t1", "to": "simon", "kind": "message",
+            "text": "no ack yet", "remote_ids": ["out3"],
+            "state": "awaiting_terminal", "sent_ts": time.time(), "files": [],
+        })
+
+        herald._update_outstanding_request(self._inbound("chatter", reply_to=""))
+
+        self.assertEqual(self._outgoing("out3")["state"], "awaiting_terminal")
