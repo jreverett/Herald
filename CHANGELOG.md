@@ -2,6 +2,24 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.12.5
+
+- The tray named a session by its herald agent name, which is not what the
+  terminal tab is called, so finding the tab still took a guess. A live tab is
+  now named by its own title, read from the harness transcript each time it is
+  shown, so a tab that has moved on to something else is named by what it says
+  now. A tab that no longer exists is marked `(tab closed)`, because there is
+  nothing to open for it.
+- The tooltip no longer repeats `needs you:` under `waiting on you`, which frees
+  the width for the names.
+
+## 0.12.4
+
+- The tray tooltip said `needs you: 1`, which never told you which session to
+  open. A held item is now labelled with the agent it is addressed to, and an
+  item nobody listens for with its mailbox, so the red state names the tab.
+  A name too long for the 63-character tooltip is trimmed rather than dropped.
+
 ## 0.12.3
 
 - 0.12.2 settled an acknowledged request only when it carried an

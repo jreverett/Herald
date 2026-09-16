@@ -247,6 +247,54 @@ herald.cmd_daemon(herald.load_config(), None)
             herald.register_listener(self.cfg)
         self.assertFalse(herald.inbox_summary(self.item)["blocked"])
 
+    def _transcript(self, session_id, *titles):
+        """A harness transcript that has renamed its tab for each title given."""
+        path = self.root / "editor" / "projects" / "a-project" / f"{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for title in titles:
+            lines.append(json.dumps({"type": "user", "text": "work"}))
+            lines.append(json.dumps({"type": "ai-title", "aiTitle": title,
+                                     "sessionId": session_id}))
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def test_a_held_item_names_where_it_waits_rather_than_counting(self):
+        # "needs you: 1" cannot say which session to open, so the label is the name.
+        self.assertEqual(herald.awaiting_human(), ["intended (tab closed)"])
+
+        self.item.update(targeted=False, to_agent="", to_mailbox="work")
+        self.save()
+
+        self.assertEqual(herald.awaiting_human(), ["work mailbox"])
+
+    def test_an_accepted_task_is_named_by_the_tab_it_waits_in(self):
+        # The tab name is what the human reads off the terminal, and it is the
+        # current one: a tab that has moved on must not be named by an old title.
+        self._transcript("sess-1", "First thing", "Herald tray tab names")
+        with patch.dict(os.environ, HERALD_AGENT="intended", CLAUDE_CODE_SESSION_ID="sess-1",
+                        CLAUDE_CONFIG_DIR=str(self.root / "editor")):
+            herald.register_listener(self.cfg)
+            self.item.update(state="active", claimed_by="intended", acked_status="accepted")
+            self.save()
+
+            self.assertEqual(herald.awaiting_human(), ["Herald tray tab names"])
+
+            (self.root / "editor" / "projects" / "a-project" / "sess-1.jsonl").unlink()
+
+            self.assertEqual(herald.awaiting_human(), ["peer's task"],
+                             "a tab herald cannot name still has to be reported")
+
+    def test_a_running_turn_is_named_by_its_tab(self):
+        # The amber tooltip named the repository, which several tabs share.
+        transcript = self._transcript("sess-2", "Herald tray tab names")
+        payload = {"session_id": "sess-2", "transcript_path": str(transcript),
+                   "cwd": "/tmp/some-repo"}
+        args = SimpleNamespace(key="", label="", state="working")
+
+        with patch.object(herald, "_hook_payload", return_value=payload):
+            self.assertEqual(herald._hook_identity(args), ("sess-2", "Herald tray tab names"))
+
     def test_listing_distinguishes_legacy_assignment_from_intended_recipient(self):
         self.item.update(targeted=False, to_agent="old-consumer")
         self.save()

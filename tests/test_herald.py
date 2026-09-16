@@ -1758,7 +1758,7 @@ class Protocol(unittest.TestCase):
                 break
             time.sleep(0.2)
 
-        self.assertEqual(status.get("blocked_agents"), ["1 unread"])
+        self.assertEqual(status.get("blocked_agents"), ["main mailbox"])
 
     def test_the_inbox_listing_marks_which_items_hold_the_tray_red(self):
         # The tooltip counts them but names none, so with a menu full of items the

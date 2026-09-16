@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.12.3"
+__version__ = "0.12.5"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -325,9 +325,10 @@ def awaiting_human():
     Two cases, both about herald itself rather than about whatever else the
     session is doing: a task this side answered 'accepted', which promises an
     answer once the human decides, and an item on a mailbox nothing is listening
-    to, which will sit unread until someone looks."""
+    to, which will sit unread until someone looks. Each label names where the
+    item is waiting, so the tooltip says which session to open."""
     listening = listening_mailboxes()
-    accepted, unread = [], 0
+    labels = []
     for path in INBOX_DIR.glob("*.json"):
         try:
             item = json.loads(path.read_text())
@@ -335,10 +336,13 @@ def awaiting_human():
             continue
         reason = blocking_reason(item, listening)
         if reason == BLOCK_ACCEPTED:
-            accepted.append(f"{item.get('from') or '?'}'s task")
-        elif reason in (BLOCK_UNREAD, BLOCK_RECIPIENT):
-            unread += 1
-    return accepted + ([f"{unread} unread"] if unread else [])
+            labels.append(session_tab(item.get("claimed_by", ""))
+                          or f"{item.get('from') or '?'}'s task")
+        elif reason == BLOCK_RECIPIENT:
+            labels.append(f"{recipient_agent(item) or '?'} (tab closed)")
+        elif reason == BLOCK_UNREAD:
+            labels.append(f"{item.get('to_mailbox', 'main')} mailbox")
+    return labels
 
 
 def working_summary(labels):
@@ -425,6 +429,58 @@ def agent_name():
     return os.environ.get("HERALD_AGENT", socket.gethostname())
 
 
+# A tab title is read from the tail of the editor transcript, not remembered:
+# a tab renames itself as the conversation moves on, and a remembered name would
+# point the human at the wrong tab.
+TITLE_TAIL_BYTES = 128 * 1024
+
+
+def session_transcript(session_id):
+    """The editor transcript for a harness session id, or None."""
+    if not session_id:
+        return None
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    try:
+        found = list((base / "projects").glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        return None
+    return found[0] if found else None
+
+
+def tab_title(session_id="", transcript=None):
+    """What the terminal tab of a harness session is called, or "" if unknown.
+
+    The editor writes the name it puts on the tab into its own transcript, and
+    adds a marker character only when it paints it, so the stored name is the
+    one to show back."""
+    path = Path(transcript) if transcript else session_transcript(session_id)
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - TITLE_TAIL_BYTES))
+            tail = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(tail):
+        if '"ai-title"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("type") == "ai-title" and record.get("aiTitle"):
+            return str(record["aiTitle"]).strip().lstrip("\u2733").strip()
+    return ""
+
+
+def session_tab(agent, sessions=None):
+    """The tab a named agent is live in, for a line a human reads."""
+    session = _pick_live(sessions, agent=agent) if agent else None
+    return tab_title(session.get("harness_session", "")) if session else ""
+
+
 def sender_agent():
     """Agent name stamped on outbound items so replies can target this session.
     Only an explicitly-set HERALD_AGENT is used; unset stays blank so replies
@@ -501,6 +557,7 @@ def write_session(listener, waiting_on="inbox"):
             "subjects": list(listener.get("subjects", [])),
             "pid": os.getpid(),
             "harness_pid": listener.get("harness_pid"),
+            "harness_session": listener.get("harness_session", ""),
             "host": socket.gethostname(),
             "started": listener["started"],
             "heartbeat": time.time(),
@@ -532,6 +589,8 @@ def register_listener(cfg, mode="general", takeover=False, subjects=None):
         "session_id": f"listener-{new_id()}",
         "agent": agent_name(),
         "mailbox": mailbox_name(cfg),
+        # The harness session names the tab this listener sits in.
+        "harness_session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
         "mode": mode,
         # The listener process is short-lived; the harness above it is the thing
         # that stays and does the work, so that is what a claim is attributed to.
@@ -1673,7 +1732,9 @@ def _hook_identity(args):
     HERALD_AGENT nor a herald session of its own."""
     payload = {} if (args.key and args.label) else _hook_payload()
     key = args.key or payload.get("session_id") or os.environ.get("HERALD_AGENT") or "default"
-    label = args.label or os.environ.get("HERALD_AGENT") or ""
+    label = args.label or tab_title(payload.get("session_id", ""),
+                                    payload.get("transcript_path"))
+    label = label or os.environ.get("HERALD_AGENT") or ""
     if not label:
         cwd = str(payload.get("cwd") or "")
         label = _repo_label(cwd) if cwd else str(key)[:8]

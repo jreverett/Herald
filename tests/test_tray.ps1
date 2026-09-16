@@ -48,6 +48,13 @@ try {
     $script:state = 'blocked'
     Set-Tip $status
     Assert-True ($script:ni.Text.Length -le 63) 'The hover tooltip must stay within its Windows limit.'
+    Assert-True ($script:ni.Text.Contains('a-very-long-blocked-agent-name')) 'The tooltip must name the tab that is waiting.'
+    $status.blocked_agents = @('a tab name far too long to fit in the sixty-three characters allowed')
+    Set-Tip $status
+    Assert-True ($script:ni.Text.Length -le 63) 'A long tab name must still fit the tooltip.'
+    Assert-True ($script:ni.Text.Contains('a tab name far too long')) 'A long tab name must be trimmed, not dropped.'
+    $status.blocked_agents = @('a-very-long-blocked-agent-name')
+    Set-Tip $status
     $status | ConvertTo-Json | Set-Content $script:statusPath
     $statusClick = $ast.FindAll({ param($node)
         $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and

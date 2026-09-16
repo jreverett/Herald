@@ -126,14 +126,25 @@ function Set-Tip($status) {
     $verb = @{ idle = 'running'; send = 'sending'; recv = 'receiving'
                work = 'working'; blocked = 'waiting on you' }[$script:state]
     $parts = @()
-    if ($status.blocked -gt 0) { $parts += "needs you: $($status.blocked_agents -join ', ')" }
+    $named = ""
+    if ($status.blocked -gt 0) {
+        # "waiting on you" already says what it is, so the room the words would
+        # take goes to the tab names instead.
+        $names = $status.blocked_agents -join ', '
+        $named = if ($script:state -eq 'blocked') { $names } else { "needs you: $names" }
+        $parts += $named
+    }
     if ($status.working -gt 0) { $parts += "working: $($status.working_agents -join ', ')" }
     if ($status.queued)        { $parts += "$($status.queued) queued" }
     $parts += "$($status.me) on $($status.listen)"
     $parts += "v$($status.version)"
     $tip = "herald: $verb"
     foreach ($p in $parts) {
-        if (($tip.Length + 3 + $p.Length) -le 63) { $tip = "$tip | $p" }
+        $room = 63 - $tip.Length - 3
+        if ($p.Length -le $room) { $tip = "$tip | $p" }
+        # The waiting name is the point of the red state, so it is trimmed to fit
+        # instead of dropped like the parts that only add context.
+        elseif ($p -eq $named -and $room -gt 15) { $tip = "$tip | " + $p.Substring(0, $room - 3) + "..." }
     }
     try { $script:ni.Text = $tip } catch { $script:ni.Text = "herald: $verb" }
 }

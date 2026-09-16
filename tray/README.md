@@ -23,7 +23,10 @@ session that also does herald work does not raise it.
 
 The tooltip must stay within 63 characters: `NotifyIcon.Text` throws above that,
 and the throw would leave the tooltip frozen on whatever it last said. It is
-built in priority order and the parts that do not fit are dropped. It reflects an agent actually
+built in priority order and the parts that do not fit are dropped, except the
+name of what is waiting, which is trimmed instead because it is the part that
+says which tab to open. A live session is named by its terminal tab title, and
+one that has ended is marked `(tab closed)`. It reflects an agent actually
 spending tokens, not a claimed inbox item - a session waiting on a human answer
 reads as idle. See the `activity` section of the main README for the hooks that
 drive it; without them the icon simply never breathes.

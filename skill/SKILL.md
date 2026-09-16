@@ -195,7 +195,10 @@ reimplement herald's rules about what counts as open. Inspect with
 attachment names without claiming, changing state, or extracting files.
 `herald read <id>` claims an
 item and changes it from `pending` to `active`. Use `herald close <id>` when no
-reply is required. Use `herald reopen <id>` to return handled work to pending.
+reply is required. `close` needs your `HERALD_AGENT`, and it refuses an item
+addressed to a different session name: clear that one with
+`herald close <id> --as <recipient>`, which is the normal way to close work left
+behind by a session that has ended. Use `herald reopen <id>` to return handled work to pending.
 `herald rm <id>` deletes an item and its files outright, for clearing debris while
 debugging - it keeps no history, so the item leaves `herald thread`, `herald reply`
 can no longer answer it, and a delivery still being retried can arrive again as a
@@ -204,20 +207,22 @@ new item. It refuses an item held by another live session unless you pass
 Herald keeps handled JSON records as history and does not delete them automatically.
 
 `herald tidy` closes work that is finished but still counted as open - a claim whose
-session has ended, and a request whose answer has already arrived. It never touches a
+session has ended, and an outgoing request that has been idle past the cutoff, whether
+or not its answer ever came. It never touches a
 pending item, because nobody has read that yet, and never touches an item a live
 session still holds, so it is safe to run at the end of any turn. `--older-than DAYS`
-sets how long an item must have been idle to qualify (default 2) and `--dry-run` lists
-what it would close without closing it. Anything it closed in the inbox comes back with
+sets how long an item must have been idle to qualify (default 2, and it takes a
+fraction, so `--older-than 0.75` is eighteen hours) and `--dry-run` lists
+what it would close without closing it. Dry-run first when the cutoff is short
+enough to reach work that is still live. Anything it closed in the inbox comes back with
 `herald reopen <id>`.
 
 **The daemon runs the same sweep every hour**, so nothing depends on an agent
 remembering. Run `herald tidy` yourself when you want the store clear now, or want to
 see what the sweep considers finished.
 Named items remain reserved even when their listener is absent. `read`, `close`,
-`reply`, `result`, and `accept` check ownership before acting. To clear an item
-addressed to a session name you are not using, pass `close --as <recipient>` or
-`rm --as <recipient>` rather than taking it over.
+`reply`, `result`, and `accept` check ownership before acting. Act as the named
+recipient with `--as <recipient>` rather than taking the item over.
 
 `herald reopen <id>` preserves the recipient. A session that wrongly claimed
 the item can return it with `reopen`; it must not close it. A different session
