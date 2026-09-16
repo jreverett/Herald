@@ -37,7 +37,9 @@ triaging incoming work, threading discipline — lives in [skill/SKILL.md](skill
 Changing any of these changes the protocol. Read `skill/SKILL.md` before touching them.
 
 - **Work goes to the session it belongs to, or waits.** A thread stays with the session that
-  answered it; a subject reaches only a session that declared it. Untargeted work is delivered
+  answered it; a topic reaches only a session that answers to it - declared with `--subject`, or
+  derived from the git branch the listener was started in. A topic the sender did not flag is read
+  out of the message text (`PBI 759`, `bug 759`, `#759`). Untargeted work is delivered
   only when exactly one session could take it - otherwise it is held `unrouted` for
   `herald claim`, because owning the mailbox is an accident of startup order and must not decide
   which context a conversation lands in. `resume` explicitly transfers the shared mailbox consumer

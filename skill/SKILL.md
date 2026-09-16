@@ -47,13 +47,15 @@ HERALD_AGENT=codex-ticket123 herald send simon -m "message"
     `HERALD_AGENT=laptop-ticket1234 herald <cmd>`. Do not invent a fresh name
     per command.
 - `herald sessions` lists live listener instances with their agent, mailbox,
-  mode, host, process, and heartbeat.
+  mode, subjects, host, process, and heartbeat. The subjects column is what a
+  topic is matched against, so check it there rather than guessing.
 
 ## Sending
 
 ```bash
 herald send <person> -m "message text"                # message
 herald send <person> -m "..." --subject pbi-738      # route to the session on that topic
+herald send <person> -m "can you look at PBI 738"     # same, matched from the text
 herald send <person> -m "see attached" -f report.csv  # files (-f repeatable)
 herald send <person> -t "run the ImageGen tests"      # task request
       --meta repo=Studio --meta branch=feature/x   # structured context
@@ -258,8 +260,19 @@ Four rules decide where an item goes:
 - **Thread** - a thread stays with the session that answered it, permanently.
   A later item on that thread goes there even if another session owns the mailbox.
 - **Subject** - `herald wait --subject pbi-738` declares a topic, repeatable.
-  An item sent with `--subject pbi-738` reaches only a session that declared it.
+  An item sent with `--subject pbi-738` reaches only a session that answers to it.
   A session declaring no subjects is a generalist and takes work naming no subject.
+  Two things make this work without anyone remembering a flag:
+  - `wait` reads the git branch of its working directory and answers to that
+    ticket as well. `feature/759-presence` and `bug/759-fix` both become
+    `pbi-759`. The listener prints the topic it derived when it starts. A
+    derived topic only *adds* reach - the session is still a generalist for
+    work that names no topic.
+  - An item with no `--subject` is matched on the tickets its text names:
+    `PBI 759`, `bug 759` and `#759` all mean `pbi-759`. So a peer can write
+    plain English and it still reaches the right session.
+  A topic nobody answers to falls back to the generalists, exactly as work
+  naming no topic does.
 - **Unambiguous only** - work nobody is named on is delivered when exactly one
   session could take it. That is the common case: one listener, a peer sends
   something, it arrives and that session owns the topic from then on. With two

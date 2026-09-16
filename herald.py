@@ -37,6 +37,7 @@ import base64
 import fcntl
 import json
 import os
+import re
 import secrets
 import select
 import signal
@@ -52,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.12.5"
+__version__ = "0.13.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -555,6 +556,7 @@ def write_session(listener, waiting_on="inbox"):
             "generation": listener.get("generation", 0),
             "request_id": listener.get("request_id", ""),
             "subjects": list(listener.get("subjects", [])),
+            "derived_subjects": list(listener.get("derived_subjects", [])),
             "pid": os.getpid(),
             "harness_pid": listener.get("harness_pid"),
             "harness_session": listener.get("harness_session", ""),
@@ -583,8 +585,76 @@ def consumer_path(mailbox):
     return CONSUMERS_DIR / f"{sanitize_filename(mailbox)}.json"
 
 
+# A ticket named in prose ("PBI 759", "bug 795", "#759") or in a branch, so a peer
+# needs no flag and a listener needs no memory of one.
+TOPIC_PATTERN = re.compile(r"\b(?:pbi|bug|bugfix)[\s:#_-]*(\d{1,7})\b|#(\d{1,7})\b", re.I)
+BRANCH_TICKET_PATTERN = re.compile(r"\b(?:pbi|bug|bugfix)[\s:#_/-]*(\d{1,7})\b", re.I)
+BRANCH_NUMBER_PATTERN = re.compile(r"(?:^|/)(\d{1,7})\b")
+
+
+def normalise_subject(value):
+    """One canonical form for a topic, so pbi-759, PBI 759 and #759 all match.
+
+    Work item ids are one namespace, so a bug and a PBI can never share a number
+    and the keyword does not need preserving.
+    """
+    text = str(value or "").strip().lower()
+    match = re.fullmatch(r"(?:(?:pbi|bug|bugfix)[\s:#_-]*|#)?(\d{1,7})", text)
+    return f"pbi-{match.group(1)}" if match else text
+
+
+def topics_in_text(text):
+    """Every ticket the text refers to, in the order it names them."""
+    found = []
+    for keyword, hashed in TOPIC_PATTERN.findall(str(text or "")):
+        topic = f"pbi-{keyword or hashed}"
+        if topic not in found:
+            found.append(topic)
+    return found
+
+
+def current_branch(cwd=None):
+    """The checked-out branch, or "" outside a repo or on a detached HEAD."""
+    try:
+        done = subprocess.run(["git", "symbolic-ref", "--short", "-q", "HEAD"],
+                              cwd=cwd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def subject_from_branch(branch):
+    match = BRANCH_TICKET_PATTERN.search(branch or "") or BRANCH_NUMBER_PATTERN.search(branch or "")
+    return f"pbi-{match.group(1)}" if match else ""
+
+
+def session_subjects(session):
+    """Every topic a session answers to, declared or derived from its branch."""
+    declared = list(session.get("subjects") or []) + list(session.get("derived_subjects") or [])
+    return {normalise_subject(x) for x in declared} - {""}
+
+
+def session_is_generalist(session):
+    """Only an explicit --subject narrows a session.
+
+    A derived subject adds reach without giving up untargeted work, so a lone
+    listener on a feature branch still receives a message that names no topic.
+    """
+    return not (session.get("subjects") or [])
+
+
+def item_topics(item):
+    """The topics an item names: its subject, or the tickets its text refers to."""
+    subject = normalise_subject(item.get("subject", ""))
+    return [subject] if subject else topics_in_text(item.get("text", ""))
+
+
 def register_listener(cfg, mode="general", takeover=False, subjects=None):
     ensure_dirs()
+    explicit = [normalise_subject(x) for x in (subjects or [])]
+    # Only a general listener is routed work by topic, so only it needs the branch.
+    branch = current_branch() if mode == "general" else ""
+    derived = [x for x in (subject_from_branch(branch),) if x and x not in explicit]
     listener = {
         "session_id": f"listener-{new_id()}",
         "agent": agent_name(),
@@ -600,6 +670,9 @@ def register_listener(cfg, mode="general", takeover=False, subjects=None):
         # Topics this session is working on. An item carrying a subject goes only
         # to a session that declared it; a session with none takes general work.
         "subjects": list(subjects or []),
+        # The ticket the working directory is on, so the flag is not the only way
+        # a session can be found by topic.
+        "derived_subjects": derived,
         # herald resume is the deliberate handoff, so it may take a thread that
         # another session owns. Plain wait may not.
         "takeover": bool(takeover),
@@ -656,6 +729,9 @@ def register_listener(cfg, mode="general", takeover=False, subjects=None):
                   f"Named items require herald takeover <id>. To listen without "
                   f"displacing it, use your own mailbox (herald mailbox add <name>, then "
                   f"HERALD_MAILBOX=<name>).", file=sys.stderr, flush=True)
+    if derived:
+        print(f"Also answering to {', '.join(derived)}, from branch '{branch}'.",
+              file=sys.stderr, flush=True)
     write_session(listener)
     return listener
 
@@ -709,8 +785,7 @@ def session_owns_item(item, session):
         return True
     if item.get("thread_owner") and item["thread_owner"] == agent:
         return True
-    subject = item.get("subject")
-    return bool(subject) and subject in (session.get("subjects") or [])
+    return bool(session_subjects(session) & set(item_topics(item)))
 
 
 def active_assignment(item, sessions=None):
@@ -1000,8 +1075,9 @@ class Handler(BaseHTTPRequestHandler):
                         selected = (_pick_live(sessions, mailbox=destination, agent=stored_owner)
                                     or _pick_live(sessions, agent=stored_owner))
                     if not selected:
-                        candidates = _general_candidates(
-                            sessions, destination, str(item.get("subject", ""))[:64])
+                        candidates = _general_candidates(sessions, destination, item_topics({
+                            "subject": str(item.get("subject", ""))[:64],
+                            "text": str(item.get("text", ""))[:200_000]}))
                         # Decide ambiguity here, not only in the routing pass: an
                         # item left unmarked is claimable by whichever listener
                         # polls first in the window before _route runs.
@@ -1239,19 +1315,19 @@ def thread_owner(thread, exclude_id="", index=None):
     return max(candidates)[1] if candidates else ""
 
 
-def _general_candidates(sessions, mailbox, subject):
+def _general_candidates(sessions, mailbox, topics):
     """Live general listeners that should be offered an item nobody is named on.
 
-    A subject goes only to a session that declared it. A session that declared
-    no subjects is a generalist and takes work that names no subject, or that
-    names one nobody claimed.
+    A topic goes only to a session that answers to it, whether the session
+    declared it or derived it from its branch. A topic nobody answers to falls
+    back to the generalists, as work naming no topic always has.
     """
     live = [x for x in live_sessions(sessions, mailbox=mailbox, mode="general")]
-    if subject:
-        matched = [x for x in live if subject in (x.get("subjects") or [])]
+    if topics:
+        matched = [x for x in live if session_subjects(x) & set(topics)]
         if matched:
             return matched
-    return [x for x in live if not (x.get("subjects") or [])]
+    return [x for x in live if session_is_generalist(x)]
 
 
 def _route(cfg):
@@ -1308,7 +1384,7 @@ def _route(cfg):
 
             unrouted = False
             if chosen is None:
-                candidates = _general_candidates(sessions, destination, item.get("subject", ""))
+                candidates = _general_candidates(sessions, destination, item_topics(item))
                 # Deliver only when the choice is unambiguous. With two eligible
                 # sessions, picking one is a coin toss that puts a conversation in
                 # the wrong context, so it waits for an explicit herald claim.
@@ -2552,8 +2628,9 @@ def cmd_sessions(cfg, args):
         return
     for session_id, s in live:
         age = now - s.get("heartbeat", 0)
+        topics = ",".join(sorted(session_subjects(s))) or "-"
         print(f"{s.get('agent', '?')}  mailbox {s.get('mailbox', 'main')}  "
-              f"mode {s.get('mode', 'general')}  listener {session_id}  "
+              f"mode {s.get('mode', 'general')}  subjects {topics}  listener {session_id}  "
               f"host {s.get('host', '?')} pid {s.get('pid', '?')}  "
               f"heartbeat {age:.0f}s ago  waiting on {s.get('waiting_on', '?')}")
 

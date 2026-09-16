@@ -2,6 +2,27 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.13.0
+
+- A topic only reached a session that had passed `--subject`, and nothing derived
+  one. Two generalist listeners shared a mailbox, a peer sent `--subject pbi-759`,
+  neither session had declared it, so both were equally eligible and the item was
+  held `UNROUTED` until a human noticed. `herald wait` now reads the git branch of
+  its working directory and answers to that ticket as well - `feature/759-x` and
+  `bug/759-x` both become `pbi-759` - so the session working on a ticket is
+  findable without anyone remembering the flag.
+- An item with no `--subject` is now matched on the tickets its text names, so a
+  peer can write plain English with no flags at all. `pbi-759`, `PBI 759`,
+  `bug 759` and `#759` are one topic wherever they appear, because a work item id
+  is one namespace.
+- A derived topic adds reach without narrowing a session: a listener on a feature
+  branch still takes work that names no topic, so the one-listener case is
+  unchanged. Routing stays conservative - an item is delivered only when exactly
+  one live session answers to its topic, and two matching sessions still hold it
+  for `herald claim`. A topic nobody answers to falls back to the generalists.
+- No wire change: the subject still travels as the sender typed it and matching
+  is done by the receiver, so a peer on an older version is unaffected.
+
 ## 0.12.5
 
 - The tray named a session by its herald agent name, which is not what the

@@ -806,6 +806,88 @@ class Routing(unittest.TestCase):
         self.assertIsNone(herald._claim_next(two))
         self.assertTrue(self._stored()["unrouted"])
 
+    # --- topics derived from a branch, and read out of the message body ---
+
+    def _branch_listener(self, agent, branch, subjects=None):
+        with patch.object(herald, "current_branch", lambda cwd=None: branch):
+            return self._listener(agent, subjects=subjects)
+
+    def test_a_branch_declares_the_sessions_subject(self):
+        repo = tempfile.TemporaryDirectory(prefix="herald-branch-")
+        self.addCleanup(repo.cleanup)
+        subprocess.run(["git", "init", "-q", repo.name], check=True)
+        subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/feature/759-presence"],
+                       cwd=repo.name, check=True)
+        here = os.getcwd()
+        os.chdir(repo.name)
+        try:
+            listener = self._listener("laptop-pbi759-presence")
+        finally:
+            os.chdir(here)
+
+        record = herald.read_sessions()[listener["session_id"]]
+        self.assertEqual(record["derived_subjects"], ["pbi-759"])
+
+    def test_a_branch_subject_wins_between_two_sessions_that_declared_nothing(self):
+        # The case observed on 2026-09-16: two generalists, neither with a flag.
+        wrong = self._branch_listener("studio-pbi782", "feature/782-worker")
+        right = self._branch_listener("laptop-pbi759-presence", "feature/759-presence")
+        self._item(subject="pbi-759")
+
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(wrong))
+        self.assertEqual(herald._claim_next(right)["claimed_by"], "laptop-pbi759-presence")
+
+    def test_a_topic_in_the_body_reaches_the_session_working_on_it(self):
+        wrong = self._branch_listener("studio-pbi782", "feature/782-worker")
+        right = self._branch_listener("laptop-pbi759-presence", "bug/759-presence")
+        self._item(text="when you get a chance, can you look at PBI 759 for me")
+
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(wrong))
+        self.assertEqual(herald._claim_next(right)["claimed_by"], "laptop-pbi759-presence")
+
+    def test_a_hash_reference_in_the_body_matches_a_declared_subject(self):
+        general = self._listener("general")
+        topic = self._listener("topic", subjects=["pbi-738"])
+        self._item(text="#738 is failing on master")
+
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(general))
+        self.assertEqual(herald._claim_next(topic)["claimed_by"], "topic")
+
+    def test_two_sessions_on_the_body_topic_leave_it_unrouted(self):
+        one = self._branch_listener("one", "feature/759-a")
+        two = self._branch_listener("two", "feature/759-b")
+        self._item(text="a question about bug 759")
+
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(one))
+        self.assertIsNone(herald._claim_next(two))
+        self.assertTrue(self._stored()["unrouted"])
+
+    def test_a_derived_subject_does_not_stop_a_session_taking_untargeted_work(self):
+        solo = self._branch_listener("solo", "feature/759-presence")
+        self._item(text="no ticket named here")
+
+        herald._route(self.cfg)
+
+        self.assertEqual(herald._claim_next(solo)["claimed_by"], "solo")
+
+    def test_a_named_item_bypasses_topic_matching(self):
+        topic = self._branch_listener("topic", "feature/759-presence")
+        named = self._branch_listener("named", "feature/782-worker")
+        self._item(text="PBI 759 needs a look", to_agent="named", targeted=True)
+
+        herald._route(self.cfg)
+
+        self.assertIsNone(herald._claim_next(topic))
+        self.assertEqual(herald._claim_next(named)["claimed_by"], "named")
+
     def test_subjects_are_recorded_on_the_session(self):
         listener = self._listener("topic", subjects=["a", "b"])
         herald.write_session(listener)
