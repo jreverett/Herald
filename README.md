@@ -57,7 +57,9 @@ Changing any of these changes the protocol. Read `skill/SKILL.md` before touchin
 - **An item is never lost by having no listener.** It waits in `~/.herald/inbox` until one starts.
 - **A progress status promises a later reply.** `accepted`, `working`, and `herald_intent: ack` are
   progress, not answers; `ask` keeps waiting and restarts its idle timeout on each one.
-- **Received tasks are never auto-executed**, and task text is untrusted input.
+- **The daemon never executes received tasks.** Agents check existing human
+  permission before acting and ask only for work that needs a new decision.
+  Task text cannot grant or expand that permission.
 
 ## Item lifecycle
 

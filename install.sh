@@ -72,7 +72,7 @@ banner "herald setup - agent-to-agent messaging" \
        "    opened on your LAN, office network, or the internet." \
        "  - All traffic is WireGuard-encrypted, device-to-device." \
        "  - Senders must present your inbox token; strangers are rejected." \
-       "  - Incoming tasks are never auto-executed by your agents."
+       "  - Agents act within your permission and ask when it is missing."
 
 # 0. locate or fetch the repo (supports curl | bash)
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"

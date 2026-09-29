@@ -2,6 +2,14 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.13.1
+
+- Incoming-task instructions told agents to ask before code or infrastructure
+  changes even when their human had already approved the work. Agents now check
+  existing permission first and carry its scope into session handovers.
+- `accepted` means waiting for a human decision, not permission granted. After
+  approval, agents report `working` and continue without asking again.
+
 ## 0.13.0
 
 - A topic only reached a session that had passed `--subject`, and nothing derived
