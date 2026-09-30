@@ -2,6 +2,32 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.14.1
+
+- The MCP worker reread the complete inbox and delivery history each second,
+  even with no subscriptions, and held the messaging lock during callbacks.
+  It now skips inactive work, caches configuration, indexes newly observed
+  messages and pending deliveries, and sends a bounded callback batch outside
+  that lock. Local usage counters and a loopback-only benchmark expose CPU,
+  memory, I/O, events and retry attempts; actual ChatGPT billing remains unknown.
+- Unlimited notifications could turn an external auto-reply policy into ongoing
+  usage. Owner policy now caps distinct events, active subscriptions and callback
+  batches. Active refresh does not reset the event allowance; messages remain in
+  Herald after the cap. The bridge itself never invokes a model or auto-replies.
+- Herald's reaper rewrote unchanged records, including handled history, every
+  five seconds. It now persists only changed assignments or applied fallbacks,
+  avoiding unnecessary disk writes while preserving inbox/routing semantics.
+
+## 0.14.0
+
+- CLI-only Herald could not expose owner-scoped messaging or signed MCP Events
+  to a ChatGPT client. A separate local proof-of-concept bridge now exposes text
+  send/list/read/reply tools and verified, durable webhook subscriptions using
+  MCP 2.0 `2026-07-28`. It reuses Herald’s transport, delivery IDs, and ownership
+  checks, restricts peers/mailboxes, and preserves write/event IDs across retries.
+  The isolated two-owner tests exercise the full greeting/event/reply flow;
+  OAuth, plugin installation, and personal-dot wake compatibility remain unproven.
+
 ## 0.13.1
 
 - Incoming-task instructions told agents to ask before code or infrastructure

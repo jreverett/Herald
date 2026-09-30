@@ -236,6 +236,196 @@ temp `HERALD_DIR`, so they never touch a real install. A behaviour change needs 
 against the previous implementation. Bump `__version__` and add a `CHANGELOG.md` entry stating what
 broke and why, not just what changed.
 
+## Dot messaging / MCP Events proof of concept
+
+`herald_mcp.py` adds text-only messaging tools (`send_message`, `list_messages`,
+`read_message`, `reply`), a read-only `usage_stats` tool, and the
+`herald.message.created` webhook event on
+`POST /mcp`. It implements MCP 2.0 version `2026-07-28`, including
+`server/discover`, per-request `_meta`, and matching `MCP-Protocol-Version`,
+`Mcp-Method`, and `Mcp-Name` HTTP headers. No `initialize` session is required.
+
+This is a **local proof of concept**, not an installed ChatGPT integration.
+The automated test sends “Hi from Cody” between two simulated owners through
+real Herald daemons, verifies a signed callback challenge and event, reads the
+message, and replies on the same thread. Neither real dot nor real account is
+used. OAuth 2.1, plugin registration, and personal-dot event compatibility are
+not implemented or proven. A webhook `2xx` proves receipt only, not a dot turn.
+
+### Try the isolated demonstration
+
+On Linux/WSL, from this repository:
+
+```bash
+python3 -B -m unittest discover -s tests -p test_mcp.py -v
+```
+
+The fixtures use temporary directories, random loopback ports, dummy bearer
+tokens, and a callback receiver that independently verifies Standard Webhooks
+HMAC signatures. They terminate their servers and daemons and remove their
+temporary stores. No installation, Tailscale changes, account connections, or
+messages to a real person are needed. HTTP loopback callbacks are allowed only
+by an explicit constructor option inside the tests; the normal CLI requires
+HTTPS and globally routable callback addresses.
+
+### Owner setup for a later integration test
+
+Each owner must approve their own connection and allowed peer. Use a separate
+Herald store per owner, with a dedicated `dot` mailbox. Do not reuse a populated
+store for the fixture demonstration. The sender identity comes from the local
+owner configuration and authenticated Herald peer, not from message text.
+The `agent` names below are bridge routing identities, not verified OpenAI dot IDs.
+
+Jamie’s bridge policy (save outside the repository as `bridge.json`):
+
+```json
+{
+  "owner": "jamie",
+  "enabled": true,
+  "agent": "cody",
+  "mailbox": "dot",
+  "event_limit": 10,
+  "max_subscriptions": 8,
+  "callbacks_per_tick": 16,
+  "peers": {"simon": {"agent": "simon-dot", "mailbox": "dot"}},
+  "callback_hosts": ["<exact ChatGPT callback hostname supplied at subscription time>"]
+}
+```
+
+Simon’s policy mirrors this with owner `simon`, agent `simon-dot`, and peer
+`jamie` addressed to agent `cody`, mailbox `dot`. Use the exact configured Herald
+`me`/peer names if they differ. Both Herald configs must register `dot` and
+already have mutually approved peer transport credentials. Do not issue or
+exchange those credentials as part of merely running the tests.
+
+After each owner has approved setup, the local bridge launch shape is:
+
+```bash
+export HERALD_DIR=/path/to/owner-approved/store
+export HERALD_AGENT=cody        # Simon: simon-dot
+export HERALD_MAILBOX=dot
+# Set HERALD_MCP_TOKEN through an owner-approved secret manager/session.
+# It must be at least 24 characters; never commit or paste it into a chat.
+python3 herald_mcp.py --config /path/to/bridge.json --port 8766
+```
+
+The bridge binds only to `127.0.0.1`. Local bearer auth is a test boundary;
+customer-data/write connections in ChatGPT require an OAuth 2.1 implementation.
+Do not publish this bearer endpoint. A later developer-mode test can use the
+official Secure MCP Tunnel where supported, after approving its credentials
+and permissions and arranging OAuth separately. Plugin packaging/registration
+and connector discovery still need to be completed; a local file alone does
+not install a cloud plugin.
+
+After the intended client can discover this connector and event, each owner
+can request: “When Herald receives a message from [approved peer] in my dot
+mailbox, read it and tell me. Ask me before replying.” Verify that the
+subscription, event receipt, and resulting turn occur in the **intended dot**.
+ChatGPT chat event support does not by itself establish dot compatibility.
+Start with notification/read only, then authorize one greeting and reply.
+There is no automatic reply loop or automatic task execution in this bridge.
+
+### Contract and limits
+
+- Every send/reply requires a `request_id`. Reuse it with exactly the same
+  arguments for retry; a different body with the same key is rejected.
+  A stable Herald delivery ID is persisted before sending, protecting against
+  a lost network response. Offline messages use Herald’s existing queue.
+- Tools and events are restricted to the configured owner, dedicated mailbox,
+  text message kind, and allowlisted peers. Inspection never claims work or
+  extracts files; replying claims the item through Herald’s ownership checks.
+  Tasks, files, broadcasts, introductions, and arbitrary agent overrides are
+  not exposed by the MCP tools. Events contain IDs, not message bodies.
+- Subscriptions are persistent in `$HERALD_DIR/mcp.sqlite3`; this contains
+  callback signing secrets and private message-operation records. Protect the
+  OS account/store; do not commit it. The bridge requests mode `0600`, but NTFS
+  under WSL may require separate Windows ACL protection before real credentials.
+  Mailboxes remain routing boundaries, not security boundaries.
+- Subscriptions are idempotent by owner + callback URL + event + canonical
+  arguments. Defaults expire after one hour; grants are capped at 24 hours.
+  Refreshes verify new signing keys, with a five-minute dual-signature rotation
+  window. Unsubscribe is idempotent. Setting policy `enabled` false or removing
+  a peer stops access and future event delivery; restart after identity changes.
+- Callback verification uses a fresh signed challenge and constant-time echo
+  check. Production callbacks require an explicitly allowed hostname, HTTPS,
+  public DNS answers at each connection, an IP-pinned connection with hostname
+  TLS verification, and no redirects. Request bodies are signed once, using
+  Standard Webhooks headers and the subscription secret.
+- Event delivery persists stable IDs, retries transient failures with bounded
+  exponential backoff (five attempts), and stops on `410` or `413`. `410` also
+  disables the subscription. Receivers must deduplicate event IDs. No protocol
+  replay is advertised (`cursor: null`): use `list_messages` for backlog; it
+  returns the newest 100 messages. Expired-subscription gaps are not replayed.
+  A one-second local worker checks for active subscriptions. With none, it skips
+  inbox and configuration work. With subscriptions, directory metadata detects
+  new files; each new message body is parsed once into a small durable metadata
+  catalog. A 30-second reconciliation enumerates names to cover coarse filesystem
+  timestamps, but does not reread already indexed bodies. Directory enumeration
+  and initial indexing still scale with retained filenames. Delivery to ChatGPT
+  is by webhook. A bounded retry failure remains in the local database for diagnosis.
+
+### Usage acceptance checks
+
+```bash
+python3 -B -m unittest discover -s tests -p 'test_mcp*.py' -v
+python3 -B tests/benchmark_mcp_usage.py --seconds 10 --history 10000 --burst 100 --output /tmp/mcp-usage.json
+```
+
+The benchmark uses five 10-second samples at approximately one worker tick per
+second: no subscriptions, idle subscribed, idle with 10,000 retained messages,
+100 new messages, and a lost webhook acknowledgement plus a duplicate send.
+It blocks non-loopback sockets/DNS in the harness and uses only dummy owners,
+temporary stores and real isolated Herald daemons. No live model or paid API
+is called. Setup, subscription verification and initial indexing are excluded
+from steady-state samples; initial indexing time is reported separately.
+
+CPU and memory figures cover the two-owner test harness/callback receiver and
+two daemon children, not standalone bridge overhead or whole-host consumption.
+RSS is sampled once a second and summed, which can count shared pages twice.
+Linux `/proc` I/O counters distinguish logical transfers from physical bytes;
+measurement reads, OS caching, delayed writeback and existing daemon heartbeats
+affect those totals. The JSON also records CPU model, kernel, Python version,
+sample duration, dataset sizes, event/attempt/byte counters and loopback sockets.
+No performance pass/fail threshold is assumed.
+
+The idle acceptance assertions require zero bridge message-body reads, SQLite
+row changes/commits and callback attempts after warm-up. Successful deliveries
+are not repeatedly sent. Retry tests require stable event IDs and one receiver
+effect after deduplication. A blocked callback must not hold the messaging lock.
+The bridge uses indexed active-subscription and pending-delivery queries, cached
+configuration, and a bounded batch of callbacks outside that lock. Existing
+Herald maintenance now writes an inbox record only when its contents change;
+its routing/maintenance scans still have a cost proportional to retained history.
+
+`usage_stats` exposes in-memory local counters since process start, process CPU
+time, peak RSS, pending events and the configured event limit. It is **not a
+ChatGPT billing meter**: `platform_tokens_and_credits` remains unknown. The code
+has no model invocation or autonomous reply path; receiving an event does not
+cause this bridge to send a reply.
+
+Owner policy caps default to **10 distinct events per subscription**, **8 active
+subscriptions** and **16 callback attempts per tick**. Active refresh does not
+reset the event allowance; unsubscribe/new subscription or expiry starts a new
+allowance. Reaching the cap leaves messages in Herald for manual inspection.
+Set `event_limit` to zero to pause new notifications. Limits are local safeguards,
+not estimates of AI token consumption, and do not bound tool calls initiated by
+an authorized external agent. Requests still require normal owner permissions.
+
+**Live credit acceptance remains a separate gate:** obtain each owner's approved
+connection, agree a token/credit budget, use notification/read-only instructions,
+observe an idle billing baseline, then send one greeting and one authorized
+reply. Verify usage in the actual platform (including delayed reporting),
+personal-dot wake behavior and duplicate-event handling. Local zero-model-call
+results cannot prove the platform bills zero credits for event processing or
+prove its deduplication prevents repeated model runs. No such live test is run
+by the benchmark or by merely launching this bridge.
+
+Protocol references:
+[OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events),
+[MCP 2.0 discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover),
+[MCP 2.0 HTTP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http),
+[ChatGPT connection testing](https://developers.openai.com/plugins/deploy/connect-chatgpt).
+
 ## License
 
 Apache License 2.0 - see [LICENSE](LICENSE). Copyright 2026 Jamie Everett.

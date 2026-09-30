@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.13.1"
+__version__ = "0.14.1"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1419,15 +1419,19 @@ def _reap(cfg):
             except (OSError, json.JSONDecodeError):
                 continue
             assigned = item.get("assigned_session", "")
+            changed = False
             if assigned and not session_alive(assigned, sessions):
                 item["assigned_session"] = ""
+                changed = True
             if (item_state(item) == "handled" or item.get("claimed_by")
                     or item.get("unpinned") or item.get("bounced")):
-                atomic_write_json(path, item)
+                if changed:
+                    atomic_write_json(path, item)
                 continue
             targeted = item.get("targeted") or item.get("mailbox_targeted")
             if not targeted or now - item.get("received_ts", 0) < TARGET_GIVEUP:
-                atomic_write_json(path, item)
+                if changed:
+                    atomic_write_json(path, item)
                 continue
             recipient = recipient_agent(item)
             target = recipient or item.get("to_mailbox")
@@ -1435,7 +1439,8 @@ def _reap(cfg):
                            else current_consumer(target, sessions))
             preferred = sessions.get(item.get("preferred_session", ""))
             if target_live or _eligible_preferred(item, preferred) or item.get("fallback", "hold") == "hold":
-                atomic_write_json(path, item)
+                if changed:
+                    atomic_write_json(path, item)
                 continue
             target_type = "agent" if recipient else "mailbox"
             if item.get("fallback") == "bounce":
