@@ -249,8 +249,11 @@ This is a **local proof of concept**, not an installed ChatGPT integration.
 The automated test sends “Hi from Cody” between two simulated owners through
 real Herald daemons, verifies a signed callback challenge and event, reads the
 message, and replies on the same thread. Neither real dot nor real account is
-used. OAuth 2.1, plugin registration, and personal-dot event compatibility are
-not implemented or proven. A webhook `2xx` proves receipt only, not a dot turn.
+used. The optional OAuth resource-server boundary is tested with dummy signed
+tokens. A separate owner-approved single-account pilot verified provider sign-in,
+private plugin connection, signed callback verification and one native event-triggered
+automation wake. This does not establish two-owner or personal-dot compatibility,
+or platform credit cost. A webhook `2xx` alone proves receipt, not a dot turn.
 
 ### Try the isolated demonstration
 
@@ -316,6 +319,85 @@ official Secure MCP Tunnel where supported, after approving its credentials
 and permissions and arranging OAuth separately. Plugin packaging/registration
 and connector discovery still need to be completed; a local file alone does
 not install a cloud plugin.
+
+### OAuth resource-server pilot
+
+`--oauth-config /path/to/oauth.json` replaces local bearer auth. Python remains
+stdlib-only; this mode additionally requires an installed `openssl` executable
+for RS256 verification. No custom signature algorithm or authorization server is
+implemented. The established identity provider owns login, consent, authorization
+codes, PKCE, refresh tokens and client registration. Tests generate temporary dummy
+RSA keys using OpenSSL; those private keys are never production credentials.
+
+Copy `examples/oauth.example.json` outside the repository and supply the approved
+issuer, exact canonical HTTPS resource/audience, same-origin JWKS URI, stable
+provider subject and Herald owner. Each process permits exactly one `(issuer, sub)`
+mapped to its existing store; email is never an identity or a linking key. A
+second owner uses a second process/store/configuration. Leave `enabled` false until
+the actual owner approves their connection. The subject is private account metadata;
+keep actual configuration outside source control. This connection grants only the
+configured Herald mailbox/peer permissions, not other account data.
+
+```bash
+python3 herald_mcp.py --config /path/to/bridge.json --oauth-config /path/to/oauth.json --port 8766
+python3 -B -m unittest discover -s tests -p test_oauth.py -v
+```
+
+The endpoint still binds only to loopback. Arrange an approved HTTPS ingress or
+supported secure tunnel to the OAuth-mode MCP route; do not expose the Herald
+peer receiver or the local bearer mode. For an owner resource such as
+`https://mcp.example.com/mcp/jamie`, route the corresponding metadata URL
+`/.well-known/oauth-protected-resource/mcp/jamie` to the same owner process.
+The reverse proxy must map the external MCP path to local `/mcp`, preserve the
+Authorization and MCP headers, and avoid caching responses. Configured audience
+must remain the external resource, never the internal loopback URL. No proxy,
+DNS, firewall or tunnel is configured by this command.
+
+Discovery/tool schemas are public in OAuth mode; mailbox contents and event
+discovery remain authenticated. Tools advertise `securitySchemes`; missing tokens
+produce a resource-metadata challenge and tool-level `mcp/www_authenticate` result.
+Scopes are `herald:read` (read/list/local stats), `herald:write` (send/reply), and
+`herald:events` (event discovery/subscribe/unsubscribe). The server validates RS256,
+issuer, resource audience, exact subject, expiry, not-before and scopes. It never
+follows token-supplied key URLs. Provider JWKS is HTTPS-only, size/time bounded,
+with no redirects; only public keys are stored. Key refresh is request-driven,
+cached five minutes and throttled for unknown keys; validated-token caching is
+bounded at 128 entries and at most 60 seconds or token expiry. Idle ticks make no
+identity-provider requests or signature-verification calls.
+`usage_stats.counters` also exposes fixed server/event discovery request,
+authentication-denial and successful-result counts. After connecting or rescanning,
+use these to check whether the host actually called authenticated `events/list`;
+absence from a platform registry does not establish that the bridge was queried.
+Empty owner peer lists omit the optional event peer filter; no peer access is added.
+The owner-only callback diagnostic retains at most the last bounded hostname,
+never the callback path, query or signing secret. Its observation is marked
+unverified and does not authorize a destination; signed challenge verification
+and durable subscription storage establish callback acceptance.
+`usage_stats.oauth_counters` reports key-fetch/signature/cache/auth-denial counts
+without tokens or identity data. Its process CPU/RSS fields do not include the
+OpenSSL subprocess; use OS process measurements when assessing verification cost.
+
+An event subscription persists its authenticated issuer/subject and expires no
+later than the access token. It must refresh with a fresh valid token. Setting
+OAuth `enabled` false rejects cached tokens and stops future callback delivery
+on the next worker check; already transmitted callbacks cannot be recalled.
+Issuer-side JWT revocation is not introspected: tokens otherwise remain valid
+until expiry. Disconnecting must unsubscribe and/or disable the local connection;
+do not claim instant provider revocation. An OAuth grant does not add peer access
+or grant permission to reply automatically.
+
+Actual provider setup still requires an owner-approved tenant, API audience and
+three scopes, compatible OAuth client registration (CIMD where supported), allowed
+redirect URLs and PKCE. For Auth0, configure Resource Parameter Compatibility so
+the client's `resource` is mapped to the intended API audience; import/refresh
+the official client's metadata through tenant administration. Confirm returned
+`iss`, `aud`, `sub` and scope match this configuration without logging/pasting
+tokens. Public/custom-domain URLs, provider eligibility/limits, tunnel permissions
+and any cost require review before setup. No tenant, credentials, grants or paid
+service have been created by the automated tests. Each owner's provider round trip
+and intended personal-dot event discovery/receipt remain required compatibility
+gates before a two-owner greeting. Both owners must approve their connection;
+Jamie initiates the first real dot-to-dot prompt himself.
 
 After the intended client can discover this connector and event, each owner
 can request: “When Herald receives a message from [approved peer] in my dot

@@ -151,6 +151,8 @@ class Bridge:
         self.transport = transport or CallbackTransport()
         self.lock = threading.RLock()
         self.tick_lock = threading.Lock()
+        self.auth = None
+        self.last_callback_hostname = None
         self.stats_lock = threading.Lock()
         self.cache_lock = threading.RLock()
         self.cache = {}
@@ -161,7 +163,9 @@ class Bridge:
             "config_reads", "config_bytes_read", "sqlite_commits", "events_created",
             "pending_rows_loaded", "callback_verifications", "callback_attempts", "callback_accepted",
             "callback_failures", "callback_retries", "callback_request_bytes", "callback_response_bytes",
-            "tool_calls", "send_calls", "reply_calls", "idempotent_write_hits")}
+            "tool_calls", "send_calls", "reply_calls", "idempotent_write_hits",
+            "server_discovery_requests", "event_discovery_requests",
+            "event_discovery_auth_denials", "event_discovery_results")}
         self.inbox_stamp = None
         self.reconcile_at = 0
         self.catalog_dirty = True
@@ -278,11 +282,14 @@ class Bridge:
             strings(args, [])
             with self.stats_lock:
                 counters = dict(self.counts)
+                callback_hostname = self.last_callback_hostname
             usage = resource.getrusage(resource.RUSAGE_SELF)
             peak_bytes = int(usage.ru_maxrss * (1 if os.uname().sysname == "Darwin" else 1024))
             with self.lock:
                 pending = self.db.execute("SELECT count(*) FROM deliveries WHERE json_extract(record,'$.state')='pending'").fetchone()[0]
-            return {"counters": counters, "uptime_seconds": time.time() - self.started,
+            return {"callback_diagnostic": {"last_observed_hostname": callback_hostname, "verified": False},
+                    "counters": counters, "uptime_seconds": time.time() - self.started,
+                    "oauth_counters": self.auth.stats() if self.auth else None,
                     "process_cpu_seconds_since_bridge_start": time.process_time() - self.cpu_start,
                     "process_peak_rss_bytes": peak_bytes, "pending_events": pending,
                     "event_limit_per_subscription": self.policy().get("event_limit", 10),
@@ -342,10 +349,15 @@ class Bridge:
     def definition(self):
         p = self.policy()
         reachable = sorted(set(p["peers"]) & set(self.herald_config().get("peers", {})))
+        filters = {"mailbox": {"type": "string", "enum": [p["mailbox"]]}}
+        # An empty enum is unusable and can be rejected by discovery consumers.
+        # Omit the optional filter until peers exist; server authorization still
+        # rejects any explicitly supplied peer outside the owner allowlist.
+        if reachable:
+            filters["peer"] = {"type": "string", "enum": reachable}
         return {"name": EVENT, "description": "New text message in the connected owner's dedicated Herald mailbox.",
                 "delivery": ["webhook"],
-                "inputSchema": schema({"mailbox": {"type": "string", "enum": [p["mailbox"]]},
-                                       "peer": {"type": "string", "enum": reachable}}, ["mailbox"]),
+                "inputSchema": schema(filters, ["mailbox"]),
                 "payloadSchema": schema({k: {"type": "string"} for k in ("id", "peer", "mailbox", "thread")},
                                         ["id", "peer", "mailbox", "thread"])}
 
@@ -366,8 +378,17 @@ class Bridge:
         identity = [self.owner, delivery["url"], EVENT, args]
         return "sub_" + hashlib.sha256(canonical(identity).encode()).hexdigest(), args, delivery
 
-    def subscribe(self, params):
+    def subscribe(self, params, grant=None):
+        if self.auth and not self.auth.active_grant(grant):
+            raise RPCError(-32012, "Authenticated event grant required")
         sub_id, args, delivery = self.subscription_identity(params)
+        # Retain at most one bounded DNS hostname, never URL/path/query or secret.
+        # Observation does not authorize or verify the destination.
+        host = urlsplit(delivery["url"]).hostname
+        safe_host = host if (host and len(host) <= 253 and host.isascii()
+                             and all(c.isalnum() or c in ".-" for c in host)) else None
+        with self.stats_lock:
+            self.last_callback_hostname = safe_host
         if params.get("cursor") is not None:
             invalid("This event does not support protocol replay; use list_messages for backlog")
         ttl = params.get("ttlMs", 3600000)
@@ -405,6 +426,8 @@ class Bridge:
                 raise RPCError(-32015, "Callback verification failed", {"reason": "timeout_or_response"})
             self.verified[cache_key] = now + 300
         with self.lock:
+            if self.auth and not self.auth.active_grant(grant):
+                raise RPCError(-32012, "Authenticated event grant expired")
             row = self.db.execute("SELECT record FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
             old = json.loads(row[0]) if row else {}
             active_refresh = old.get("enabled") and old.get("expires", 0) > now
@@ -417,6 +440,9 @@ class Bridge:
             rec = {"id": sub_id, "owner": self.owner, "arguments": args, "url": delivery["url"],
                    "secret": delivery["secret"], "created": old["created"] if active_refresh else now,
                    "expires": now + min(ttl, 86400000) / 1000, "enabled": True}
+            if grant:
+                rec["grant"] = grant
+                rec["expires"] = min(rec["expires"], grant["expires"])
             if old.get("secret") and old["secret"] != rec["secret"]:
                 rec.update(old_secret=old["secret"], rotation_until=now + 300)
             elif old.get("rotation_until", 0) > now:
@@ -517,11 +543,16 @@ class Bridge:
             if not rows:
                 self.count("idle_ticks")
                 return
+            subscriptions = [json.loads(row[0]) for row in rows]
+            if self.auth:
+                subscriptions = [sub for sub in subscriptions if self.auth.active_grant(sub.get("grant"))]
+            if not subscriptions:
+                self.count("idle_ticks")
+                return
             try:
                 policy, config = self.policy(), self.herald_config()
             except (RPCError, ValueError, OSError):
                 return
-            subscriptions = [json.loads(row[0]) for row in rows]
             changed = self.scan_new(min(s["created"] for s in subscriptions))
             if changed or self.catalog_dirty:
                 for sub in subscriptions:
@@ -561,6 +592,8 @@ class Bridge:
                 if not row:
                     continue
                 sub = json.loads(row[0])
+                if self.auth and not self.auth.active_grant(sub.get("grant")):
+                    continue
                 try:
                     policy, config = self.policy(), self.herald_config()
                 except (RPCError, ValueError, OSError):
@@ -605,7 +638,7 @@ class Bridge:
                 else:
                     self.db.rollback()
 
-    def rpc(self, request):
+    def rpc(self, request, grant=None):
         self.policy()
         if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request:
             raise RPCError(-32600, "Expected one JSON-RPC request")
@@ -621,7 +654,7 @@ class Bridge:
         method = request.get("method")
         if method == "server/discover":
             return {"resultType": "complete", "supportedVersions": [VERSION], "capabilities": {"tools": {}, "events": {}},
-                    "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "herald-mcp-poc", "version": "0.14.1"}},
+                    "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "herald-mcp-poc", "version": "0.14.2"}},
                     "ttlMs": 0, "cacheScope": "private"}
         if method == "tools/list":
             return {"resultType": "complete", "tools": TOOLS}
@@ -635,7 +668,7 @@ class Bridge:
         if method == "events/list":
             return {"events": [self.definition()]}
         if method == "events/subscribe":
-            return self.subscribe(params)
+            return self.subscribe(params, grant)
         if method == "events/unsubscribe":
             sub_id, _, _ = self.subscription_identity(params, need_secret=False)
             with self.lock:
@@ -647,9 +680,12 @@ class Bridge:
         raise RPCError(-32601, "Method not found")
 
 
-def make_server(bridge, token, port=0):
-    if not token or len(token) < 24:
+def make_server(bridge, token=None, port=0, auth=None):
+    if not auth and (not token or len(token) < 24):
         raise ValueError("HERALD_MCP_TOKEN must contain at least 24 characters")
+    if auth and auth.owner != bridge.owner:
+        raise ValueError("OAuth owner must match bridge")
+    bridge.auth = auth
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -659,15 +695,21 @@ def make_server(bridge, token, port=0):
         def log_message(self, *args):
             pass  # Never log authorization, callback secrets, or message bodies.
 
-        def respond(self, status, value):
+        def respond(self, status, value, headers=None):
             body = canonical(value).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):
+            if auth and self.path in (auth.metadata_path(), "/.well-known/oauth-protected-resource"):
+                self.respond(200, auth.metadata())
+                return
             self.respond(405, {"error": "Use POST /mcp"})
 
         def do_POST(self):
@@ -677,7 +719,7 @@ def make_server(bridge, token, port=0):
             if self.headers.get("Origin"):
                 self.respond(403, {"error": "Browser origins disabled"})
                 return
-            if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token):
+            if not auth and not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token):
                 self.respond(401, {"error": "Unauthorized"})
                 return
             request = None
@@ -705,7 +747,40 @@ def make_server(bridge, token, port=0):
                             raise RPCError(-32020, "Malformed mirrored header")
                     if not isinstance(value, str) or actual != value:
                         raise RPCError(-32020, "Missing or mismatched mirrored header")
-                result = bridge.rpc(request)
+                method = request.get("method")
+                if method == "server/discover":
+                    bridge.count("server_discovery_requests")
+                elif method == "events/list":
+                    bridge.count("event_discovery_requests")
+                grant = None
+                if auth:
+                    from herald_oauth import AuthError, required_scope
+                    method = request.get("method", "")
+                    if not isinstance(method, str):
+                        raise RPCError(-32600, "Expected method string")
+                    # Public discovery exposes schemas, never mailbox contents.
+                    if method not in ("server/discover", "tools/list"):
+                        try:
+                            grant = auth.authenticate(self.headers.get("Authorization"), required_scope(method, params))
+                        except AuthError as error:
+                            if method == "events/list":
+                                bridge.count("event_discovery_auth_denials")
+                            challenge = auth.challenge(error)
+                            if method == "tools/call":
+                                self.respond(200, {"jsonrpc": "2.0", "id": request.get("id"), "result": {
+                                    "isError": True, "content": [{"type": "text", "text": "Approved owner authentication required"}],
+                                    "_meta": {"mcp/www_authenticate": [challenge]}}}, {"WWW-Authenticate": challenge})
+                            else:
+                                self.respond(403 if error.code == "insufficient_scope" else 401,
+                                             {"error": error.code}, {"WWW-Authenticate": challenge})
+                            return
+                result = bridge.rpc(request, grant)
+                if method == "events/list":
+                    bridge.count("event_discovery_results")
+                if auth and request["method"] == "tools/list":
+                    from herald_oauth import required_scope
+                    result = {**result, "tools": [{**tool, "securitySchemes": [{"type": "oauth2", "scopes": [
+                        required_scope("tools/call", {"name": tool["name"]})]}]} for tool in result["tools"]]}
                 self.respond(200, {"jsonrpc": "2.0", "id": request["id"], "result": result})
             except RPCError as error:
                 value = {"code": error.code, "message": error.message}
@@ -725,10 +800,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--oauth-config", help="Owner-approved issuer/resource/subject configuration; replaces local bearer auth")
     args = parser.parse_args()
     import herald
     bridge = Bridge(args.config, herald)
-    server = make_server(bridge, os.environ.get("HERALD_MCP_TOKEN"), args.port)
+    auth = None
+    if args.oauth_config:
+        from herald_oauth import ResourceAuth
+        auth = ResourceAuth(args.oauth_config, bridge.owner)
+    server = make_server(bridge, os.environ.get("HERALD_MCP_TOKEN"), args.port, auth=auth)
     stop = threading.Event()
 
     def worker():

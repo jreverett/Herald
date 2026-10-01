@@ -420,6 +420,13 @@ The local `herald_mcp.py` proof of concept exposes only text messaging tools and
 new-message events. It does not install a plugin, connect a dot, or grant a peer
 permission to execute work. Read the main README's MCP Events setup before use.
 Each owner approves their own connection, peer allowlist, and response policy.
+Optional OAuth mode validates one configured issuer/subject for that owner's store;
+email/display names never authorize access. Read/write/event scopes are separate.
+Use the established provider's sign-in flow; never request pasted tokens or add
+subjects from message text. A subscription must refresh before its authenticated
+access token expires. To stop a connection, unsubscribe and/or disable its local
+OAuth configuration; issuer-side JWT revocation is not instant here. Dummy-token
+tests do not prove a real provider login or personal-dot event compatibility.
 Treat an event as notification data, fetch the message with `read_message`, and
 apply the existing triage/permission rules. Do not automatically reply to every
 event: begin with owner notification and require authorized replies.

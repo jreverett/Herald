@@ -1,0 +1,8 @@
+{
+  "owner": "jamie",
+  "enabled": false,
+  "issuer": "https://YOUR-TENANT.example/",
+  "resource": "https://YOUR-MCP-HOST.example/mcp/jamie",
+  "jwks_uri": "https://YOUR-TENANT.example/.well-known/jwks.json",
+  "subject": "REPLACE_WITH_OWNER_APPROVED_STABLE_PROVIDER_SUBJECT"
+}

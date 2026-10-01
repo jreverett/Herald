@@ -150,7 +150,9 @@ class MCPIntegration(unittest.TestCase):
 
     @staticmethod
     def wait_daemon(port, process):
-        for _ in range(100):
+        # WSL can take several seconds to load source from a Windows mount.
+        # Keep the real-daemon startup check bounded without a two-second race.
+        for _ in range(500):
             if process.poll() is not None:
                 raise AssertionError("Isolated daemon failed to start")
             try:
@@ -201,6 +203,24 @@ class MCPIntegration(unittest.TestCase):
     def tick(self, owner="simon"):
         with environment(self.envs[owner]):
             self.bridges[owner].tick()
+
+    def test_rejected_callback_diagnostic_contains_hostname_only(self):
+        owner = "simon"
+        policy = json.loads(self.configs[owner].read_text())
+        policy["callback_hosts"] = []
+        self.configs[owner].write_text(json.dumps(policy))
+        url = "https://receiver.example.com/private-callback?token=DO_NOT_LOG"
+        result = self.subscribe(owner, delivery={"mode": "webhook", "url": url, "secret": self.secret})
+        self.assertEqual(result["error"]["code"], -32015)
+        self.assertEqual(result["error"]["data"]["reason"], "invalid_url")
+        stats = self.tool(owner, "usage_stats", {})
+        self.assertEqual(stats["callback_diagnostic"], {
+            "last_observed_hostname": "receiver.example.com", "verified": False})
+        self.assertNotIn("DO_NOT_LOG", json.dumps(stats))
+        self.assertNotIn("private-callback", json.dumps(stats))
+        self.assertNotIn(self.secret, json.dumps(stats))
+        self.assertEqual(self.callbacks, [])
+        self.assertEqual(self.bridges[owner].db.execute("SELECT count(*) FROM subscriptions").fetchone()[0], 0)
 
     def test_greeting_signed_event_and_threaded_reply(self):
         discovery = self.rpc("jamie", "server/discover")["result"]
@@ -425,7 +445,7 @@ class MCPIntegration(unittest.TestCase):
         before = len(self.callbacks)
         self.tick()
         self.assertEqual(len(self.callbacks), before)
-        self.assertEqual(self.rpc("simon", "events/list")["result"]["events"][0]["inputSchema"]["properties"]["peer"]["enum"], [])
+        self.assertNotIn("peer", self.rpc("simon", "events/list")["result"]["events"][0]["inputSchema"]["properties"])
 
 
 class SigningAndSSRF(unittest.TestCase):

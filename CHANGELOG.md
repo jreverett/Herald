@@ -2,6 +2,31 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.14.2
+
+- Rejected callback subscriptions left no way to identify the receiver for a
+  narrow allowlist. Owner-only usage statistics now retain only the last bounded
+  hostname, marked unverified, without URL paths, queries or signing secrets.
+  Callback rejection and delivery limits remain unchanged.
+
+- An owner with no peers exposed an unusable empty peer enum in event discovery.
+  The optional filter is now omitted until a peer is allowlisted. Fixed bounded
+  discovery/auth-denial/result counters help distinguish registry refresh from
+  authentication failures without logging requests, identities or tokens.
+
+- The MCP proof of concept accepted only one local bearer token and could not
+  identify an OAuth-connected owner or prompt a compatible client to sign in.
+  Optional resource-server mode now publishes protected-resource metadata and
+  tool auth challenges, validates provider RS256 access tokens with installed
+  OpenSSL, maps one issuer/subject to one owner store, and enforces read/write/event
+  scopes. An owner-approved single-account pilot verified sign-in and native
+  automation wake; two-owner/personal-dot compatibility and credit cost remain
+  separate acceptance gates.
+- Subscriptions now bind to their authenticated grant and cannot outlive its
+  token expiry. Disabling the local OAuth connection stops access and future
+  callbacks. Bounded caches avoid repeated key fetch/verification on idle ticks;
+  local dummy-token tests cover owner isolation and the signed message flow.
+
 ## 0.14.1
 
 - The MCP worker reread the complete inbox and delivery history each second,
