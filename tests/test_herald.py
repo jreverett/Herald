@@ -20,6 +20,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
@@ -41,6 +42,49 @@ def free_port():
 
 
 class PureFunctions(unittest.TestCase):
+    def test_ask_progress_extends_idle_deadline_past_original_window(self):
+        import contextlib
+        import io
+
+        for next_tick, expects_final in ((12, True), (20, False)):
+            with self.subTest(next_tick=next_tick):
+                clock = [0]
+                calls = [0]
+                shown = []
+                def claim(listener):
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        clock[0] = 9
+                        return dict(kind='result', status='working', meta={},
+                                    text='progress', **{'from': 'bob'})
+                    if calls[0] == 2:
+                        return None
+                    return dict(id='final', kind='result', status='done', meta={})
+                args = SimpleNamespace(task='task', message=None, meta=[], file=[],
+                                       mailbox=None, agent=None, fallback='hold',
+                                       peer='bob', timeout=10, out=None)
+                with contextlib.redirect_stdout(io.StringIO()), \
+                     patch.object(herald, 'register_listener', return_value={'session_id': 'test'}), \
+                     patch.object(herald.atexit, 'register'), \
+                     patch.object(herald.signal, 'signal'), \
+                     patch.object(herald, 'attach_files'), \
+                     patch.object(herald, 'deliver', return_value={'id': 'request', 'thread': 't', 'delivery_state': 'delivered'}), \
+                     patch.object(herald, 'write_session'), \
+                     patch.object(herald, 'clear_session'), \
+                     patch.object(herald, '_write_files'), \
+                     patch.object(herald, '_claim_next', side_effect=claim), \
+                     patch.object(herald, '_show_item', side_effect=lambda item, out: shown.append((item['id'], clock[0]))), \
+                     patch.object(herald.time, 'time', side_effect=lambda: clock[0]), \
+                     patch.object(herald.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, next_tick)):
+                    if expects_final:
+                        herald.cmd_ask({'me': 'alice'}, args)
+                        self.assertEqual(shown, [('final', 12)])
+                    else:
+                        with self.assertRaises(SystemExit) as error:
+                            herald.cmd_ask({'me': 'alice'}, args)
+                        self.assertEqual(error.exception.code, 2)
+                        self.assertEqual(shown, [])
+
     def test_receiver_startup_does_not_need_reverse_dns(self):
         server_type = getattr(herald, "ReceiverServer", herald.ThreadingHTTPServer)
 
@@ -355,6 +399,18 @@ class Protocol(unittest.TestCase):
         self._write_config("bob", "alice", issued=self.TB, token=self.TA)
         self.daemons = {}
         self.addCleanup(self._cleanup_daemons)
+        # Reap every child this fixture starts, including clients left behind
+        # by a failed assertion. Never inspect or stop processes outside it.
+        self.children = []
+        original_popen = subprocess.Popen
+        def tracked_popen(*args, **kwargs):
+            child = original_popen(*args, **kwargs)
+            self.children.append(child)
+            return child
+        tracker = patch.object(subprocess, 'Popen', side_effect=tracked_popen)
+        tracker.start()
+        self.addCleanup(tracker.stop)
+        self.addCleanup(self._cleanup_children)
         self.start_daemon("alice")
         self.start_daemon("bob")
         for name in ("alice", "bob"):
@@ -372,6 +428,16 @@ class Protocol(unittest.TestCase):
                 p.kill()
         import shutil
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def _cleanup_children(self):
+        for child in self.children:
+            if child.poll() is None:
+                child.kill()
+        for child in self.children:
+            child.wait(timeout=5)
+            for stream in (child.stdin, child.stdout, child.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
 
     # ---- harness helpers ----
 
@@ -761,16 +827,37 @@ class Protocol(unittest.TestCase):
         self.assertIn("ABOUT-738", out, err)
 
     def test_undirected_work_waits_when_two_sessions_could_take_it(self):
-        one = self._listener("bob", "bob-one", timeout="8")
-        two = self._listener("bob", "bob-two", timeout="8")
+        one = self._listener("bob", "bob-one", timeout="60")
+        two = self._listener("bob", "bob-two", timeout="60")
         try:
             self.cli("alice", "send", "bob", "-m", "AMBIGUOUS", agent="alice-1")
-            one_out, _ = one.communicate(timeout=30)
-            two_out, _ = two.communicate(timeout=30)
+            item = self.wait_for_inbox("bob", lambda i: i.get("text") == "AMBIGUOUS" and i.get('unrouted'))
+            self.assertIsNotNone(item)
+            # Ambiguity is a property of two live listeners. Letting the first
+            # expire before inspecting the second tests a different condition.
+            # The daemon reroutes on a five-second maintenance tick. Observe
+            # across two ticks while both listeners remain live, so a routing
+            # regression after HTTP receipt cannot escape this assertion.
+            end = time.monotonic() + 2 * herald.HEARTBEAT_INTERVAL + 2
+            while time.monotonic() < end:
+                self.assertIsNone(one.poll())
+                self.assertIsNone(two.poll())
+                current = next(i for i in self.inbox("bob") if i['id'] == item['id'])
+                self.assertEqual(current['state'], 'pending')
+                self.assertFalse(current.get('claimed_by'))
+                self.assertFalse(current.get('assigned_session'))
+                self.assertTrue(current['unrouted'])
+                time.sleep(0.05)
+            # Freeze both before teardown, so killing one cannot turn this
+            # into a test of delivery to the sole remaining listener.
+            for proc in (one, two):
+                os.kill(proc.pid, signal.SIGSTOP)
         finally:
             for proc in (one, two):
                 if proc.poll() is None:
                     proc.kill()
+            one_out, _ = one.communicate(timeout=5)
+            two_out, _ = two.communicate(timeout=5)
         self.assertNotIn("AMBIGUOUS", one_out)
         self.assertNotIn("AMBIGUOUS", two_out)
         item = [x for x in self.inbox("bob") if "AMBIGUOUS" in x.get("text", "")][0]
@@ -1159,27 +1246,33 @@ class Protocol(unittest.TestCase):
         # The invariant under test: the final reply lands after the ORIGINAL
         # deadline but within one idle window of the acknowledgement.
         #
-        # The usable window for that final reply is (acked - started - 1), which
-        # does NOT widen with a longer idle timeout - so raising `idle` alone does
-        # nothing. What widens it is acknowledging later in the original window.
-        # Both sleeps are therefore computed from a measured start, and the ack is
-        # deliberately left until near the end of the first window. Each self.cli()
-        # spawns a Python process, which on a loaded machine costs seconds.
+        # Send progress/final through the real HTTP receiver without spawning a
+        # CLI inside the timed window. Exact deadline arithmetic is also tested
+        # with a controlled clock above; this verifies real ask/daemon delivery.
         idle = 20
-        ack_at = idle * 0.75            # ack near the end of the original window
-        final_at = idle + 1             # just past the original deadline
+        ack_at = idle * 0.5
+        final_at = idle + 3
+        def result(status, text, task):
+            payload = dict(kind='result', status=status, text=text, thread=task['thread'],
+                           reply_to=task['id'], to_agent='alice-ask', targeted=True,
+                           meta={}, from_agent='bob-w')
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.ports['alice']}/send",
+                data=json.dumps(payload).encode(),
+                headers={'Authorization': f'Bearer {self.TA}', 'Content-Type': 'application/json'})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
         p = subprocess.Popen(
             [sys.executable, HERALD_PY, "ask", "bob", "-t", "review please",
              "--timeout", str(idle)],
             env=self._env("alice", "alice-ask"), cwd=self.root,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            task = self.wait_for_inbox("bob", lambda i: i["kind"] == "task")
+            task = self.wait_for_inbox("bob", lambda i: i["kind"] == "task", timeout=20)
             self.assertIsNotNone(task)
             started = time.time()
             time.sleep(max(0, (started + ack_at) - time.time()))
-            self.cli("bob", "result", task["id"], "--status", "working", "-m", long_ack,
-                     agent="bob-w")
+            result('working', long_ack, task)
             acked = time.time()
             self.assertLess(acked - started, idle,
                             "ack must land inside the original window for this test to mean anything")
@@ -1188,8 +1281,7 @@ class Protocol(unittest.TestCase):
             time.sleep(max(0, (started + final_at) - time.time()))
             self.assertLess(time.time() - acked, idle - 3,
                             "final reply must have room left in the restarted window")
-            self.cli("bob", "result", task["id"], "--status", "done", "-m", "FINAL-ANSWER",
-                     agent="bob-w")
+            result('done', 'FINAL-ANSWER', task)
             out, err = p.communicate(timeout=25)
         finally:
             if p.poll() is None:
@@ -1525,7 +1617,7 @@ class Protocol(unittest.TestCase):
                  agent="alice-1")
 
         personal = self.cli("bob", "resume", "--timeout", "2",
-                            agent="copilot-personal", mailbox="personal", timeout=5)
+                            agent="copilot-personal", mailbox="personal", timeout=20)
         work = self.cli("bob", "resume", "--timeout", "5",
                         agent="codex-work", mailbox="work")
 

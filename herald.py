@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.14.2"
+__version__ = "0.14.4"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -890,6 +890,10 @@ def _settle_acknowledged_on_thread(item, skip_path=None):
     promised. That answer usually arrives as a fresh message on the thread rather than
     as a reply to the acknowledged id, so without this the record waits for ever.
     """
+    # An explicit reply answers that request only. It may be an unrelated FYI
+    # or a delayed duplicate; neither fulfils other promises on the thread.
+    if item.get("reply_to"):
+        return
     thread = item.get("thread", "")
     if not thread:
         return
@@ -934,6 +938,9 @@ def _update_outstanding_request(item):
         try:
             request = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
+            return
+        if (request.get("to") != item.get("from")
+                or request.get("thread") != item.get("thread")):
             return
         if is_progress:
             waiting = request.get("awaiting_reply_ids")
@@ -1526,6 +1533,9 @@ def _record_outbox(payload, result, peer_name):
                 except (OSError, json.JSONDecodeError):
                     continue
                 if response.get("reply_to") not in record["remote_ids"]:
+                    continue
+                if (response.get("from") != record.get("to")
+                        or response.get("thread") != record.get("thread")):
                     continue
                 if not ((response.get("kind") == "result"
                          and response.get("status") in ("accepted", "working"))
