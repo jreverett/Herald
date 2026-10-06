@@ -158,6 +158,10 @@ herald ping <person>                                  # is their daemon up? whic
 - An outgoing request settles when its reply arrives. An acknowledgement keeps it
   open on purpose, and the answer it promised closes it even when that answer comes
   as a fresh message on the thread rather than a direct reply.
+  An explicit `reply` or `result` settles only the request it answers, from the
+  expected peer on the same thread. Other acknowledged requests remain open.
+  Legacy answers without a reply ID retain thread-wide settlement; Herald
+  cannot infer whether that prose answers one request or is an unrelated FYI.
 - If a peer is offline the send is **queued, not lost** — you'll see "Peer
   '<name>' is unreachable ... queued for retry". Queued items deliver
   automatically on your next successful contact with that peer, are retried by

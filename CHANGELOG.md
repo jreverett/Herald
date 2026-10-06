@@ -2,6 +2,21 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.14.4
+
+- A terminal reply to one request also closed other acknowledged requests on
+  the same thread, including when an old reply arrived again after new work
+  started. Those requests disappeared from outgoing work before their answers
+  arrived. Explicit replies now settle only their matching request and verify
+  its peer and thread, including cached terminal replies that arrive before
+  the outgoing record is saved. Fresh answers without a reply ID keep the existing
+  thread-settlement behavior. Offline replay removes five incorrect settlements
+  across four synthetic scenarios. Recovery-message reductions are simulated;
+  real agent message counts, token cost and latency have not been measured.
+  Uncorrelated legacy answers still cannot distinguish an unrelated FYI or a
+  stale answer on that thread; narrowing those semantics needs a separately
+  reviewed protocol/migration change. Existing handled records are not reopened.
+
 ## 0.14.2
 
 - Rejected callback subscriptions left no way to identify the receiver for a
