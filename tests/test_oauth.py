@@ -1,5 +1,6 @@
 """Dummy signed-token tests: no identity-provider accounts or network access."""
 import base64
+import io
 import json
 import shutil
 import subprocess
@@ -153,12 +154,26 @@ class OAuthHTTPTests(unittest.TestCase):
             metadata=json.load(response)
         self.assertEqual(metadata["resource"],self.configs["jamie"]["resource"])
         tools=self.f.rpc("jamie","tools/list",token="not-a-token")["result"]["tools"]
-        self.assertEqual(len(tools),5)
+        self.assertEqual(len(tools),6)
         self.assertTrue(all(t["securitySchemes"][0]["type"]=="oauth2" for t in tools))
         response=self.f.rpc("jamie","tools/call",{"name":"list_messages","arguments":{}},token="bad")
         self.assertTrue(response["result"]["isError"])
         self.assertIn("resource_metadata",response["result"]["_meta"]["mcp/www_authenticate"][0])
         self.assertEqual(self.f.bridges["jamie"].counts["tool_calls"],0)
+
+    def test_request_log_names_denial_reason_without_token(self):
+        args={"name":"usage_stats","arguments":{}}
+        with patch("sys.stdout",new_callable=io.StringIO) as out:
+            self.f.rpc("jamie","tools/call",args,token="bad")
+            self.f.rpc("jamie","tools/call",args,token=self.f.tokens["simon"])
+            self.f.rpc("jamie","tools/call",args,token=self.f.tokens["jamie"])
+        lines=out.getvalue().splitlines()
+        self.assertEqual([line.split(" ",1)[1] for line in lines],[
+            "request method=tools/call tool=usage_stats status=200 auth=malformed_token",
+            "request method=tools/call tool=usage_stats status=200 auth=subject_mismatch",
+            "request method=tools/call tool=usage_stats status=200 auth=ok"])
+        self.assertTrue(all(line.endswith("Z") for line in (l.split(" ",1)[0] for l in lines)))
+        self.assertNotIn(self.f.tokens["jamie"],out.getvalue())
 
     def test_wrong_owner_and_read_only_scope_cannot_send(self):
         args={"name":"send_message","arguments":{"peer":"simon","text":"Hi","request_id":"oauth-reject"}}

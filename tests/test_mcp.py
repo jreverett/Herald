@@ -226,7 +226,7 @@ class MCPIntegration(unittest.TestCase):
         discovery = self.rpc("jamie", "server/discover")["result"]
         self.assertEqual(discovery["supportedVersions"], ["2026-07-28"])
         self.assertIn("events", discovery["capabilities"])
-        self.assertEqual(len(self.rpc("jamie", "tools/list")["result"]["tools"]), 5)
+        self.assertEqual(len(self.rpc("jamie", "tools/list")["result"]["tools"]), 6)
         self.assertEqual(self.rpc("simon", "events/list")["result"]["events"][0]["name"], mcp.EVENT)
         subscription = self.subscribe()["result"]
         greeting = self.send()

@@ -124,6 +124,8 @@ def text_property(description):
 
 
 TOOLS = [
+    {"name": "check_event_access", "description": "Confirm event permission through the normal owner sign-in flow. Does not read messages, subscribe, send or reply.",
+     "inputSchema": schema({}, [])},
     {"name": "usage_stats", "description": "Read local bridge counters and resource usage. ChatGPT tokens/credits are not observable here.",
      "inputSchema": schema({}, [])},
     {"name": "send_message", "description": "Send owner-approved text to an allowlisted person's dot mailbox.",
@@ -138,8 +140,10 @@ TOOLS = [
      "inputSchema": schema({"id": text_property("Inbox message ID"), "text": text_property("Reply data"),
                             "request_id": text_property("Retry key")}, ["id", "text", "request_id"])},
 ]
+TOOL_NAMES = {tool["name"] for tool in TOOLS}
+LOGGED_METHODS = ("server/discover", "tools/list", "tools/call", "events/list", "events/subscribe", "events/unsubscribe")
 for tool in TOOLS:
-    read_only = tool["name"] in ("usage_stats", "list_messages", "read_message")
+    read_only = tool["name"] in ("check_event_access", "usage_stats", "list_messages", "read_message")
     tool["annotations"] = {"readOnlyHint": read_only, "destructiveHint": False,
                            "idempotentHint": True, "openWorldHint": not read_only}
 
@@ -278,6 +282,9 @@ class Bridge:
 
     def tool(self, name, args):
         self.count("tool_calls")
+        if name == "check_event_access":
+            strings(args, [])
+            return {"authorized": True}
         if name == "usage_stats":
             strings(args, [])
             with self.stats_lock:
@@ -695,7 +702,13 @@ def make_server(bridge, token=None, port=0, auth=None):
         def log_message(self, *args):
             pass  # Never log authorization, callback secrets, or message bodies.
 
+        def diagnose(self, label):
+            self.rpc_label, self.tool_label, self.auth_outcome = label, "-", "n/a" if not auth else "public"
+
         def respond(self, status, value, headers=None):
+            # One fixed-vocabulary line per request; never headers, tokens, paths or bodies.
+            print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} request method={self.rpc_label} "
+                  f"tool={self.tool_label} status={status} auth={self.auth_outcome}", flush=True)
             body = canonical(value).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -707,12 +720,15 @@ def make_server(bridge, token=None, port=0, auth=None):
             self.wfile.write(body)
 
         def do_GET(self):
+            self.diagnose("get")
             if auth and self.path in (auth.metadata_path(), "/.well-known/oauth-protected-resource"):
+                self.rpc_label = "resource_metadata"
                 self.respond(200, auth.metadata())
                 return
             self.respond(405, {"error": "Use POST /mcp"})
 
         def do_POST(self):
+            self.diagnose("unparsed")
             if self.path != "/mcp":
                 self.respond(404, {"error": "Not found"})
                 return
@@ -732,6 +748,10 @@ def make_server(bridge, token=None, port=0, auth=None):
                 if not isinstance(request, dict) or not isinstance(request.get("params", {}), dict):
                     raise RPCError(-32600, "Expected object request and params")
                 params = request.get("params", {})
+                self.rpc_label = request.get("method") if request.get("method") in LOGGED_METHODS else "other"
+                if self.rpc_label == "tools/call":
+                    name = params.get("name")
+                    self.tool_label = name if isinstance(name, str) and name in TOOL_NAMES else "other"
                 meta = params.get("_meta", {})
                 if not isinstance(meta, dict):
                     raise RPCError(-32602, "Expected object metadata")
@@ -761,8 +781,10 @@ def make_server(bridge, token=None, port=0, auth=None):
                     # Public discovery exposes schemas, never mailbox contents.
                     if method not in ("server/discover", "tools/list"):
                         try:
-                            grant = auth.authenticate(self.headers.get("Authorization"), required_scope(method, params))
+                            grant = auth.authenticate(self.headers.get("Authorization"), required_scope(method, params), rpc_method=method)
+                            self.auth_outcome = "ok"
                         except AuthError as error:
+                            self.auth_outcome = error.reason
                             if method == "events/list":
                                 bridge.count("event_discovery_auth_denials")
                             challenge = auth.challenge(error)

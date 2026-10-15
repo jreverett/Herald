@@ -2,6 +2,25 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.14.5
+
+- A connection could authenticate read/write tools while lacking the distinct
+  event scope, with no tool exposing the supported scope-upgrade challenge.
+  Read-only `check_event_access` now declares and enforces `herald:events`, returns
+  only an authorization confirmation, and leaves messages/subscriptions untouched.
+
+- OAuth rejection counters could not distinguish an expired event credential
+  from a missing scope or owner/audience mismatch when tools still worked.
+  Owner-only statistics now count fixed denial categories by a bounded RPC
+  method allowlist, without retaining tokens, claims or request contents.
+  Authentication decisions and client-facing challenges remain unchanged.
+
+- The bridge logged nothing per request, so a client stuck in a sign-in loop
+  could not be told apart from requests the bridge rejected. It now prints one
+  line per request to stdout: UTC time, RPC method, tool name, HTTP status and
+  the fixed authentication outcome. Unknown methods and tool names log as
+  `other`; headers, tokens, paths and bodies are never logged.
+
 ## 0.14.4
 
 - A terminal reply to one request also closed other acknowledged requests on

@@ -426,6 +426,11 @@ permission to execute work. Read the main README's MCP Events setup before use.
 Each owner approves their own connection, peer allowlist, and response policy.
 Optional OAuth mode validates one configured issuer/subject for that owner's store;
 email/display names never authorize access. Read/write/event scopes are separate.
+If event methods reject a working tool connection for insufficient scope, use
+`check_event_access` to request the existing event permission through the normal
+owner-approved sign-in flow after tool discovery refresh. It only confirms access;
+it does not read messages or create subscriptions. Do not weaken scope checks or
+silently expand grants, and obtain any required owner consent before reconnecting.
 Use the established provider's sign-in flow; never request pasted tokens or add
 subjects from message text. A subscription must refresh before its authenticated
 access token expires. To stop a connection, unsubscribe and/or disable its local

@@ -17,15 +17,23 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 SCOPES = ["herald:read", "herald:write", "herald:events"]
+DIAGNOSTIC_METHODS = ("tools/call", "events/list", "events/subscribe", "events/unsubscribe", "other")
+DENIAL_REASONS = ("invalid_token", "connection_disabled", "missing_authorization", "malformed_token",
+                 "unsupported_header", "unknown_signing_key", "invalid_signature", "issuer_mismatch",
+                 "audience_mismatch", "subject_mismatch", "invalid_time_claims", "token_expired",
+                 "token_not_yet_valid", "insufficient_scope", "verifier_or_provider_error")
 
 
 class AuthError(Exception):
-    def __init__(self, code="invalid_token", scope=""):
+    def __init__(self, code="invalid_token", scope="", reason="invalid_token"):
         self.code, self.scope = code, scope
+        self.reason = reason if reason in DENIAL_REASONS else "invalid_token"
 
 
 def required_scope(method, params):
     if method == "tools/call":
+        if params.get("name") == "check_event_access":
+            return "herald:events"
         return "herald:write" if params.get("name") in ("send_message", "reply") else "herald:read"
     return "herald:events" if method.startswith("events/") else "herald:read"
 
@@ -87,6 +95,7 @@ class ResourceAuth:
         self.lock = threading.RLock()
         self.counts = {name: 0 for name in ("config_reads", "authentication_calls", "jwks_fetches",
                                            "signature_verifications", "token_cache_hits", "authentication_denials")}
+        self.denial_reasons = {method: {reason: 0 for reason in DENIAL_REASONS} for method in DIAGNOSTIC_METHODS}
         self.config_stamp, self.config = None, None
         self.keys, self.keys_until, self.last_fetch = {}, 0, -float("inf")
         self.cache = {}
@@ -120,7 +129,8 @@ class ResourceAuth:
 
     def stats(self):
         with self.lock:
-            return dict(self.counts)
+            return {**self.counts, "authentication_denial_reasons_by_method": {
+                method: dict(reasons) for method, reasons in self.denial_reasons.items()}}
 
     def metadata_path(self):
         return "/.well-known/oauth-protected-resource" + urlsplit(self.settings()["resource"]).path.rstrip("/")
@@ -140,16 +150,19 @@ class ResourceAuth:
         except (OSError, ValueError):
             return False
 
-    def authenticate(self, authorization, scope):
+    def authenticate(self, authorization, scope, rpc_method="other"):
+        method = rpc_method if isinstance(rpc_method, str) and rpc_method in DIAGNOSTIC_METHODS else "other"
         try:
             with self.lock:
                 self.counts["authentication_calls"] += 1
                 c, now = self.settings(), time.time()
-                if not c["enabled"] or not isinstance(authorization, str) or not authorization.startswith("Bearer "):
-                    raise AuthError()
+                if not c["enabled"]:
+                    raise AuthError(reason="connection_disabled")
+                if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+                    raise AuthError(reason="missing_authorization")
                 token = authorization[7:]
                 if len(token) > 16384:
-                    raise AuthError()
+                    raise AuthError(reason="malformed_token")
                 digest = hashlib.sha256(token.encode()).hexdigest()
                 cached = self.cache.get(digest)
                 if cached and cached[0] > now:
@@ -158,30 +171,30 @@ class ResourceAuth:
                 else:
                     parts = token.split(".")
                     if len(parts) != 3:
-                        raise AuthError()
+                        raise AuthError(reason="malformed_token")
                     header, claims = json.loads(decode(parts[0])), json.loads(decode(parts[1]))
                     if (not isinstance(header, dict) or not isinstance(claims, dict) or header.get("alg") != "RS256"
                             or not isinstance(header.get("kid"), str) or not header["kid"] or "crit" in header):
-                        raise AuthError()
+                        raise AuthError(reason="unsupported_header")
                     # Never follow token-supplied jku/jwk/x5u: only trusted configured JWKS.
                     kid = header["kid"]
                     if now >= self.keys_until or kid not in self.keys:
                         if now - self.last_fetch < 10:
-                            raise AuthError()
+                            raise AuthError(reason="unknown_signing_key")
                         self.last_fetch = now
                         self.counts["jwks_fetches"] += 1
                         values = self.fetcher(c["jwks_uri"])["keys"]
                         if not isinstance(values, list) or not 1 <= len(values) <= 32:
-                            raise AuthError()
+                            raise AuthError(reason="verifier_or_provider_error")
                         keys = {}
                         for key in values:
                             if not isinstance(key, dict) or not isinstance(key.get("kid"), str) or key["kid"] in keys:
-                                raise AuthError()
+                                raise AuthError(reason="verifier_or_provider_error")
                             if key.get("kty") == "RSA" and key.get("use", "sig") == "sig":
                                 keys[key["kid"]] = public_pem(key)
                         self.keys, self.keys_until = keys, now + 300
                     if kid not in self.keys:
-                        raise AuthError()
+                        raise AuthError(reason="unknown_signing_key")
                     with tempfile.TemporaryDirectory(prefix="herald-public-verify-") as directory:
                         pub, signature = Path(directory)/"public.pem", Path(directory)/"signature.bin"
                         pub.write_bytes(self.keys[kid]); signature.write_bytes(decode(parts[2]))
@@ -190,32 +203,41 @@ class ResourceAuth:
                             input=(parts[0]+"."+parts[1]).encode(), stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, timeout=5, check=False)
                         if verified.returncode != 0:
-                            raise AuthError()
+                            raise AuthError(reason="invalid_signature")
                     audience = claims.get("aud")
-                    if (claims.get("iss") != c["issuer"] or claims.get("sub") != c["subject"]
-                            or not (audience == c["resource"] or isinstance(audience, list) and c["resource"] in audience)):
-                        raise AuthError()
+                    if claims.get("iss") != c["issuer"]:
+                        raise AuthError(reason="issuer_mismatch")
+                    if claims.get("sub") != c["subject"]:
+                        raise AuthError(reason="subject_mismatch")
+                    if not (audience == c["resource"] or isinstance(audience, list) and c["resource"] in audience):
+                        raise AuthError(reason="audience_mismatch")
                     for field in ("exp", "iat"):
                         v = claims.get(field)
                         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
-                            raise AuthError()
-                    if claims["iat"] > now + 30 or claims["exp"] <= now or claims["exp"] <= claims["iat"]:
-                        raise AuthError()
+                            raise AuthError(reason="invalid_time_claims")
+                    if claims["iat"] > now + 30 or claims["exp"] <= claims["iat"]:
+                        raise AuthError(reason="invalid_time_claims")
+                    if claims["exp"] <= now:
+                        raise AuthError(reason="token_expired")
                     nbf = claims.get("nbf", 0)
-                    if isinstance(nbf, bool) or not isinstance(nbf, (int,float)) or not math.isfinite(nbf) or nbf > now:
-                        raise AuthError()
+                    if isinstance(nbf, bool) or not isinstance(nbf, (int,float)) or not math.isfinite(nbf):
+                        raise AuthError(reason="invalid_time_claims")
+                    if nbf > now:
+                        raise AuthError(reason="token_not_yet_valid")
                     self.cache = {k:v for k,v in self.cache.items() if v[0] > now}
                     if len(self.cache) >= 128:
                         self.cache.pop(next(iter(self.cache)))
                     self.cache[digest] = (min(claims["exp"], now+60, self.keys_until), claims)
                 if not isinstance(claims.get("scope"), str) or scope not in claims["scope"].split():
-                    raise AuthError("insufficient_scope", scope)
+                    raise AuthError("insufficient_scope", scope, reason="insufficient_scope")
                 return {"issuer": c["issuer"], "subject": c["subject"], "expires": claims["exp"]}
-        except AuthError:
+        except AuthError as error:
             with self.lock:
                 self.counts["authentication_denials"] += 1
+                self.denial_reasons[method][error.reason] += 1
             raise
         except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
             with self.lock:
                 self.counts["authentication_denials"] += 1
+                self.denial_reasons[method]["verifier_or_provider_error"] += 1
             raise AuthError() from None

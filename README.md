@@ -357,7 +357,12 @@ Discovery/tool schemas are public in OAuth mode; mailbox contents and event
 discovery remain authenticated. Tools advertise `securitySchemes`; missing tokens
 produce a resource-metadata challenge and tool-level `mcp/www_authenticate` result.
 Scopes are `herald:read` (read/list/local stats), `herald:write` (send/reply), and
-`herald:events` (event discovery/subscribe/unsubscribe). The server validates RS256,
+`herald:events` (event discovery/subscribe/unsubscribe and `check_event_access`).
+The read-only `check_event_access` tool explicitly declares event scope and returns
+only `{"authorized": true}` after authentication. If an existing connection lacks
+event scope, refresh tool discovery and use the normal owner-consented OAuth
+challenge from this tool; it never creates a subscription or reads mailbox data.
+The server validates RS256,
 issuer, resource audience, exact subject, expiry, not-before and scopes. It never
 follows token-supplied key URLs. Provider JWKS is HTTPS-only, size/time bounded,
 with no redirects; only public keys are stored. Key refresh is request-driven,
