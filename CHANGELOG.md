@@ -2,6 +2,18 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.16.0
+
+- The bridge accepted exactly one hand-copied provider subject. A wrong copy, or
+  a provider that creates a separate user per login method, refused every sign-in
+  and looped the connector. The config now takes a list of approved `subjects`
+  (legacy `subject` still works). An otherwise valid sign-in from an unapproved
+  account is recorded privately, and the owner approves or revokes it with
+  `herald mcp accounts|approve|revoke`, applied on the next request.
+- The subject is now checked after signature, issuer, audience and time checks,
+  so only a fully valid token can become a candidate. A token for another owner's
+  bridge is therefore reported as `audience_mismatch`, not `subject_mismatch`.
+
 ## 0.15.0
 
 - The dot bridge was started by hand and nothing noticed when it stopped, so a

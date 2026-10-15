@@ -163,9 +163,10 @@ class OAuthHTTPTests(unittest.TestCase):
 
     def test_request_log_names_denial_reason_without_token(self):
         args={"name":"usage_stats","arguments":{}}
+        other=self.keys.token(self.configs["jamie"],{"sub":"google-oauth2|someone-else"})
         with patch("sys.stdout",new_callable=io.StringIO) as out:
             self.f.rpc("jamie","tools/call",args,token="bad")
-            self.f.rpc("jamie","tools/call",args,token=self.f.tokens["simon"])
+            self.f.rpc("jamie","tools/call",args,token=other)
             self.f.rpc("jamie","tools/call",args,token=self.f.tokens["jamie"])
         lines=out.getvalue().splitlines()
         self.assertEqual([line.split(" ",1)[1] for line in lines],[
@@ -173,7 +174,7 @@ class OAuthHTTPTests(unittest.TestCase):
             "request method=tools/call tool=usage_stats status=200 auth=subject_mismatch",
             "request method=tools/call tool=usage_stats status=200 auth=ok"])
         self.assertTrue(all(line.endswith("Z") for line in (l.split(" ",1)[0] for l in lines)))
-        wrong=self.f.rpc("jamie","tools/call",args,token=self.f.tokens["simon"])
+        wrong=self.f.rpc("jamie","tools/call",args,token=other)
         self.assertIn("has not approved",wrong["result"]["content"][0]["text"])
         self.assertNotIn(self.f.tokens["jamie"],out.getvalue())
 

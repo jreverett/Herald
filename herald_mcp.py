@@ -826,7 +826,8 @@ def make_server(bridge, token=None, port=0, auth=None):
 DENIAL_TEXT = {
     "default": "Approved owner authentication required",
     "subject_mismatch": ("Signed in as an account this Herald owner has not approved. Signing in again with the "
-                         "same account will not help: use the approved account, or ask the owner to approve this one."),
+                         "same account will not help: use the approved account, or the owner can approve this one "
+                         "with `herald mcp accounts` and `herald mcp approve`."),
     "token_expired": "The Herald sign-in has expired. Reconnect to continue.",
     "connection_disabled": "The Herald owner has disabled this connection.",
 }

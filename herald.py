@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1886,6 +1886,33 @@ def cmd_status(cfg, args):
         print("\n".join(herald_mcp.bridge_status_lines(cfg["mcp_bridge"], HERALD_DIR)))
 
 
+def cmd_mcp(cfg, args):
+    import herald_oauth
+    path = args.oauth_config or (cfg.get("mcp_bridge") or {}).get("oauth_config")
+    if not path:
+        sys.exit("No OAuth config: pass --oauth-config or set mcp_bridge.oauth_config in this store's config")
+    try:
+        if args.action == "approve":
+            chosen = herald_oauth.approve_candidate(path, args.number or 0)
+            print(f"Approved {chosen['subject']} ({chosen.get('email', 'no email claim')}). "
+                  "The bridge accepts it on the next request.")
+        elif args.action == "revoke":
+            print(f"Revoked {herald_oauth.revoke_subject(path, args.number or 0)}. "
+                  "Its sign-ins and subscriptions stop on the next request.")
+        else:
+            approved, candidates = herald_oauth.list_accounts(path)
+            print("Approved accounts:" if approved else "Approved accounts: none")
+            for number, subject in enumerate(approved, 1):
+                print(f"  {number}. {subject}")
+            print("Refused sign-ins (approve with `herald mcp approve <n>`):" if candidates else "Refused sign-ins: none")
+            for number, c in enumerate(candidates, 1):
+                seen = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.get("last_seen", 0)))
+                print(f"  {number}. {c['subject']}  {c.get('email', 'no email claim')}  {c.get('name', '')}  "
+                      f"last {seen}, {c.get('count', 1)} attempt(s)")
+    except (OSError, ValueError) as error:
+        sys.exit(f"herald mcp {args.action}: {error}")
+
+
 def queued_count(peer_name):
     d = QUEUE_DIR / sanitize_filename(peer_name)
     return len(list(d.glob("*.json"))) if d.exists() else 0
@@ -2983,6 +3010,10 @@ def main():
     sp.add_argument("peer", nargs="?", help="a single peer (default: all)")
 
     sub.add_parser("status", help="report whether the daemon is running")
+    sp = sub.add_parser("mcp", help="manage which dot sign-in accounts the MCP bridge accepts")
+    sp.add_argument("action", choices=["accounts", "approve", "revoke"])
+    sp.add_argument("number", nargs="?", type=int, help="number from `herald mcp accounts`")
+    sp.add_argument("--oauth-config", help="defaults to mcp_bridge.oauth_config in this store's config")
 
     sub.add_parser("sessions", help="list agent sessions currently listening")
 
@@ -3026,7 +3057,7 @@ def main():
      "resume": cmd_resume, "flush": cmd_flush,
      "claim": cmd_claim, "release": cmd_release, "handoff": cmd_handoff,
      "claims": cmd_claims,
-     "status": cmd_status, "sessions": cmd_sessions,
+     "status": cmd_status, "sessions": cmd_sessions, "mcp": cmd_mcp,
      "activity": cmd_activity}[args.cmd](cfg, args)
 
 

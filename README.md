@@ -331,9 +331,20 @@ RSA keys using OpenSSL; those private keys are never production credentials.
 
 Copy `examples/oauth.example.json` outside the repository and supply the approved
 issuer, exact canonical HTTPS resource/audience, same-origin JWKS URI, stable
-provider subject and Herald owner. Each process permits exactly one `(issuer, sub)`
-mapped to its existing store; email is never an identity or a linking key. A
-second owner uses a second process/store/configuration. Leave `enabled` false until
+Herald owner and, if known, the owner's provider subject(s) as `subjects` (a single
+legacy `subject` still works). Each process accepts only the owner-approved
+`(issuer, sub)` pairs, all mapped to that owner's existing store; email is never an
+identity or a linking key. A second owner uses a second process/store/configuration.
+
+A provider can give one person several subjects (Auth0 creates a separate user for
+each login method), so copying the right one by hand is easy to get wrong. Leave
+`subjects` empty instead and sign in once from the dot: the bridge refuses the
+sign-in, and records the subject of an otherwise valid token (with its email/name
+claims, for recognition only) in a private `*.pending.json` beside the config.
+The owner then runs `herald mcp accounts` to list approved accounts and refused
+sign-ins, `herald mcp approve <n>` to accept one, and `herald mcp revoke <n>` to
+remove one. Changes apply on the next request without a restart; revoking also
+stops subscriptions bound to that account. Nothing is approved without the owner. Leave `enabled` false until
 the actual owner approves their connection. The subject is private account metadata;
 keep actual configuration outside source control. This connection grants only the
 configured Herald mailbox/peer permissions, not other account data.

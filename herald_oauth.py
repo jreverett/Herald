@@ -1,12 +1,13 @@
 """Optional OAuth resource-server boundary. No authorization server or login UI.
 
 Python uses only its standard library. RS256 verification delegates to installed
-OpenSSL, not a handwritten cryptographic primitive. One issuer/subject per owner.
+OpenSSL, not a handwritten cryptographic primitive. One issuer and owner-approved subjects per owner.
 """
 import base64
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 import tempfile
@@ -22,6 +23,80 @@ DENIAL_REASONS = ("invalid_token", "connection_disabled", "missing_authorization
                  "unsupported_header", "unknown_signing_key", "invalid_signature", "issuer_mismatch",
                  "audience_mismatch", "subject_mismatch", "invalid_time_claims", "token_expired",
                  "token_not_yet_valid", "insufficient_scope", "verifier_or_provider_error")
+
+
+MAX_SUBJECTS = 8
+MAX_CANDIDATES = 5
+CANDIDATE_WRITE_INTERVAL = 60
+
+
+def valid_text(value):
+    return isinstance(value, str) and bool(value) and not any(ord(c) < 32 for c in value)
+
+
+def approved_subjects(config):
+    subjects = set(config.get("subjects", []))
+    if config.get("subject"):
+        subjects.add(config["subject"])
+    return subjects
+
+
+def pending_path(config_path):
+    return Path(config_path).with_suffix(".pending.json")
+
+
+def write_json(path, value, mode):
+    temporary = path.with_name(path.name + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(value, handle, indent=2)
+        handle.write("\n")
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def load_candidates(config_path):
+    try:
+        value = json.loads(pending_path(config_path).read_text())
+    except (OSError, ValueError):
+        return []
+    candidates = value.get("candidates", []) if isinstance(value, dict) else []
+    return [c for c in candidates if isinstance(c, dict) and valid_text(c.get("subject"))]
+
+
+def list_accounts(config_path):
+    return sorted(approved_subjects(json.loads(Path(config_path).read_text()))), load_candidates(config_path)
+
+
+def save_subjects(path, config, subjects):
+    config.pop("subject", None)
+    config["subjects"] = sorted(subjects)
+    write_json(path, config, path.stat().st_mode & 0o777)
+
+
+def approve_candidate(config_path, number):
+    path = Path(config_path)
+    candidates = load_candidates(path)
+    if not 1 <= number <= len(candidates):
+        raise ValueError(f"No pending sign-in number {number}")
+    chosen = candidates[number - 1]
+    config = json.loads(path.read_text())
+    subjects = approved_subjects(config) | {chosen["subject"]}
+    if len(subjects) > MAX_SUBJECTS:
+        raise ValueError(f"At most {MAX_SUBJECTS} approved accounts")
+    save_subjects(path, config, subjects)
+    write_json(pending_path(path), {"candidates": [c for c in candidates if c is not chosen]}, 0o600)
+    return chosen
+
+
+def revoke_subject(config_path, number):
+    path = Path(config_path)
+    config = json.loads(path.read_text())
+    subjects = sorted(approved_subjects(config))
+    if not 1 <= number <= len(subjects):
+        raise ValueError(f"No approved account number {number}")
+    save_subjects(path, config, set(subjects) - {subjects[number - 1]})
+    return subjects[number - 1]
 
 
 class AuthError(Exception):
@@ -110,9 +185,13 @@ class ResourceAuth:
                 self.counts["config_reads"] += 1
                 if value.get("owner") != self.owner or not isinstance(value.get("enabled"), bool):
                     raise ValueError("OAuth owner/enabled mismatch")
-                for field in ("issuer", "resource", "jwks_uri", "subject"):
-                    if not isinstance(value.get(field), str) or not value[field] or any(ord(c) < 32 for c in value[field]):
+                for field in ("issuer", "resource", "jwks_uri"):
+                    if not valid_text(value.get(field)):
                         raise ValueError("OAuth configuration incomplete")
+                subjects = value.get("subjects", [])
+                if ("subject" in value and not valid_text(value["subject"]) or not isinstance(subjects, list)
+                        or len(subjects) > MAX_SUBJECTS or not all(valid_text(s) for s in subjects)):
+                    raise ValueError("OAuth subjects must be non-empty strings")
                 for field in ("issuer", "resource", "jwks_uri"):
                     p = urlsplit(value[field])
                     if p.scheme != "https" or not p.hostname or p.username or p.password or p.fragment or p.query:
@@ -122,6 +201,25 @@ class ResourceAuth:
                 self.config, self.config_stamp = value, stamp
                 self.keys, self.cache, self.keys_until, self.last_fetch = {}, {}, 0, -float("inf")
             return dict(self.config)
+
+    def record_candidate(self, claims, now):
+        subject = claims.get("sub")
+        if not valid_text(subject) or len(subject) > 256:
+            return
+        candidates = load_candidates(self.path)
+        existing = next((c for c in candidates if c["subject"] == subject), None)
+        if existing and now - existing.get("last_seen", 0) < CANDIDATE_WRITE_INTERVAL:
+            return
+        entry = existing or {"subject": subject, "first_seen": now, "count": 0}
+        entry.update({"last_seen": now, "count": entry.get("count", 0) + 1})
+        for claim in ("email", "name"):
+            if valid_text(claims.get(claim)) and len(claims[claim]) <= 256:
+                entry[claim] = claims[claim]
+        others = [c for c in candidates if c is not existing]
+        try:
+            write_json(pending_path(self.path), {"candidates": ([entry] + others)[:MAX_CANDIDATES]}, 0o600)
+        except OSError:
+            pass
 
     def metadata(self):
         config = self.settings()
@@ -146,7 +244,7 @@ class ResourceAuth:
         try:
             c = self.settings()
             return (c["enabled"] and isinstance(grant, dict) and grant.get("issuer") == c["issuer"]
-                    and grant.get("subject") == c["subject"] and grant.get("expires", 0) > time.time())
+                    and grant.get("subject") in approved_subjects(c) and grant.get("expires", 0) > time.time())
         except (OSError, ValueError):
             return False
 
@@ -207,8 +305,6 @@ class ResourceAuth:
                     audience = claims.get("aud")
                     if claims.get("iss") != c["issuer"]:
                         raise AuthError(reason="issuer_mismatch")
-                    if claims.get("sub") != c["subject"]:
-                        raise AuthError(reason="subject_mismatch")
                     if not (audience == c["resource"] or isinstance(audience, list) and c["resource"] in audience):
                         raise AuthError(reason="audience_mismatch")
                     for field in ("exp", "iat"):
@@ -224,13 +320,17 @@ class ResourceAuth:
                         raise AuthError(reason="invalid_time_claims")
                     if nbf > now:
                         raise AuthError(reason="token_not_yet_valid")
+                    # Subject is checked last so only an otherwise valid sign-in becomes a candidate.
+                    if claims.get("sub") not in approved_subjects(c):
+                        self.record_candidate(claims, now)
+                        raise AuthError(reason="subject_mismatch")
                     self.cache = {k:v for k,v in self.cache.items() if v[0] > now}
                     if len(self.cache) >= 128:
                         self.cache.pop(next(iter(self.cache)))
                     self.cache[digest] = (min(claims["exp"], now+60, self.keys_until), claims)
                 if not isinstance(claims.get("scope"), str) or scope not in claims["scope"].split():
                     raise AuthError("insufficient_scope", scope, reason="insufficient_scope")
-                return {"issuer": c["issuer"], "subject": c["subject"], "expires": claims["exp"]}
+                return {"issuer": c["issuer"], "subject": claims["sub"], "expires": claims["exp"]}
         except AuthError as error:
             with self.lock:
                 self.counts["authentication_denials"] += 1
