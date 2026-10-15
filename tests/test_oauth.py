@@ -173,6 +173,8 @@ class OAuthHTTPTests(unittest.TestCase):
             "request method=tools/call tool=usage_stats status=200 auth=subject_mismatch",
             "request method=tools/call tool=usage_stats status=200 auth=ok"])
         self.assertTrue(all(line.endswith("Z") for line in (l.split(" ",1)[0] for l in lines)))
+        wrong=self.f.rpc("jamie","tools/call",args,token=self.f.tokens["simon"])
+        self.assertIn("has not approved",wrong["result"]["content"][0]["text"])
         self.assertNotIn(self.f.tokens["jamie"],out.getvalue())
 
     def test_wrong_owner_and_read_only_scope_cannot_send(self):

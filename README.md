@@ -343,6 +343,20 @@ python3 herald_mcp.py --config /path/to/bridge.json --oauth-config /path/to/oaut
 python3 -B -m unittest discover -s tests -p test_oauth.py -v
 ```
 
+To keep the bridge running, let the store's daemon supervise it instead of starting
+it by hand. Add this block to that store's `config.json` and restart the daemon:
+
+```json
+"mcp_bridge": {"config": "/path/to/bridge.json", "oauth_config": "/path/to/oauth.json", "port": 8766}
+```
+
+The daemon starts the bridge with `HERALD_DIR` set to its own store and
+`HERALD_AGENT`/`HERALD_MAILBOX` taken from `bridge.json`, restarts it if it exits,
+and stops it when the daemon stops. Bridge output goes to `mcp-bridge.log` in the
+store. After five exits within 30 seconds of starting, it stops retrying and
+records why. `herald status` reports the bridge state, a local probe and a probe of
+the public resource URL, so a stopped bridge or a broken public route is visible.
+
 The endpoint still binds only to loopback. Arrange an approved HTTPS ingress or
 supported secure tunnel to the OAuth-mode MCP route; do not expose the Herald
 peer receiver or the local bearer mode. For an owner resource such as

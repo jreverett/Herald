@@ -14,11 +14,16 @@ import os
 import re
 import secrets
 import resource
+import signal
 import socket
 import sqlite3
 import ssl
+import subprocess
+import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -790,7 +795,7 @@ def make_server(bridge, token=None, port=0, auth=None):
                             challenge = auth.challenge(error)
                             if method == "tools/call":
                                 self.respond(200, {"jsonrpc": "2.0", "id": request.get("id"), "result": {
-                                    "isError": True, "content": [{"type": "text", "text": "Approved owner authentication required"}],
+                                    "isError": True, "content": [{"type": "text", "text": DENIAL_TEXT.get(error.reason, DENIAL_TEXT["default"])}],
                                     "_meta": {"mcp/www_authenticate": [challenge]}}}, {"WWW-Authenticate": challenge})
                             else:
                                 self.respond(403 if error.code == "insufficient_scope" else 401,
@@ -816,6 +821,145 @@ def make_server(bridge, token=None, port=0, auth=None):
                 self.respond(500, {"error": "Bridge operation failed"})
 
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
+DENIAL_TEXT = {
+    "default": "Approved owner authentication required",
+    "subject_mismatch": ("Signed in as an account this Herald owner has not approved. Signing in again with the "
+                         "same account will not help: use the approved account, or ask the owner to approve this one."),
+    "token_expired": "The Herald sign-in has expired. Reconnect to continue.",
+    "connection_disabled": "The Herald owner has disabled this connection.",
+}
+
+BRIDGE_STATE = "mcp-bridge.json"
+BRIDGE_LOG = "mcp-bridge.log"
+RESTART_DELAY = 5
+MAX_RESTART_DELAY = 300
+FAST_EXIT_SECONDS = 30
+MAX_FAST_EXITS = 5
+
+
+def bridge_command(block):
+    command = [sys.executable, "-B", str(Path(__file__).resolve()), "--config", block["config"],
+               "--port", str(block.get("port", 8766))]
+    if block.get("oauth_config"):
+        command += ["--oauth-config", block["oauth_config"]]
+    return command
+
+
+def write_bridge_state(herald_dir, **fields):
+    path = Path(herald_dir) / BRIDGE_STATE
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps({**fields, "updated": time.time()}))
+    os.replace(temporary, path)
+
+
+def read_bridge_state(herald_dir):
+    try:
+        return json.loads((Path(herald_dir) / BRIDGE_STATE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def stop_recorded_bridge(herald_dir):
+    # A daemon killed without cleanup leaves its bridge holding the port.
+    pid = read_bridge_state(herald_dir).get("pid")
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return
+    try:
+        command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                                 timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if "herald_mcp.py" in command:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def supervise_bridge(block, herald_dir, stop, command=None):
+    """Keep one bridge process running for this store until stop is set."""
+    herald_dir = Path(herald_dir)
+    try:
+        policy = json.loads(Path(block["config"]).read_text())
+        env = {**os.environ, "HERALD_DIR": str(herald_dir), "HERALD_AGENT": policy["agent"],
+               "HERALD_MAILBOX": policy["mailbox"]}
+        command = command or bridge_command(block)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        write_bridge_state(herald_dir, state="gave_up", reason=f"bridge configuration unreadable: {type(error).__name__}")
+        return
+    stop_recorded_bridge(herald_dir)
+    delay, fast_exits, restarts, last_exit = RESTART_DELAY, 0, 0, None
+    while not stop.is_set():
+        started = time.time()
+        with open(herald_dir / BRIDGE_LOG, "a") as log:
+            child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        write_bridge_state(herald_dir, state="running", pid=child.pid, started=started, restarts=restarts,
+                           last_exit=last_exit, port=block.get("port", 8766))
+        while child.poll() is None and not stop.wait(1):
+            pass
+        if stop.is_set():
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            write_bridge_state(herald_dir, state="stopped", restarts=restarts, last_exit=child.returncode)
+            return
+        last_exit = child.returncode
+        fast_exits = fast_exits + 1 if time.time() - started < FAST_EXIT_SECONDS else 0
+        if fast_exits >= MAX_FAST_EXITS:
+            write_bridge_state(herald_dir, state="gave_up", restarts=restarts, last_exit=last_exit,
+                               reason=f"exited {fast_exits} times within {FAST_EXIT_SECONDS}s; see {BRIDGE_LOG}")
+            return
+        restarts += 1
+        write_bridge_state(herald_dir, state="restarting", restarts=restarts, last_exit=last_exit)
+        if stop.wait(delay):
+            return
+        delay = min(delay * 2, MAX_RESTART_DELAY) if fast_exits else RESTART_DELAY
+
+
+def probe(url, timeout):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return str(response.status)
+    except urllib.error.HTTPError as error:
+        return str(error.code)
+    except (OSError, ValueError):
+        return "unreachable"
+
+
+def bridge_status_lines(block, herald_dir):
+    state = read_bridge_state(herald_dir)
+    port = block.get("port", 8766)
+    pid = state.get("pid")
+    alive = False
+    if state.get("state") == "running" and isinstance(pid, int):
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except OSError:
+            pass
+    if alive:
+        line = f"mcp bridge: running (pid {pid}, port {port}, {state.get('restarts', 0)} restarts)"
+    elif state.get("state") == "gave_up":
+        line = f"mcp bridge: STOPPED - gave up ({state.get('reason', 'unknown reason')}). Fix it, then restart the daemon"
+    else:
+        line = f"mcp bridge: NOT RUNNING (state {state.get('state', 'unknown')}). Restart the daemon to start it"
+    lines = [line]
+    if alive:
+        lines.append(f"mcp bridge local: HTTP {probe(f'http://127.0.0.1:{port}/.well-known/oauth-protected-resource', 2)}")
+    try:
+        resource_url = json.loads(Path(block["oauth_config"]).read_text())["resource"] if block.get("oauth_config") else None
+    except (OSError, ValueError, KeyError, TypeError):
+        resource_url = None
+    if resource_url:
+        p = urlsplit(resource_url)
+        public = f"{p.scheme}://{p.netloc}/.well-known/oauth-protected-resource{p.path.rstrip('/')}"
+        lines.append(f"mcp bridge public: HTTP {probe(public, 3)} ({p.netloc})")
+    return lines
 
 
 def main():

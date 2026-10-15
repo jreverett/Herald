@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.14.5"
+__version__ = "0.15.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1193,15 +1193,25 @@ def cmd_daemon(cfg, args):
     heartbeat = threading.Thread(target=_heartbeat_loop,
                                  args=(cfg["me"], f"{host}:{port}", started, stop, maintenance),
                                  daemon=True)
+    bridge = None
+    if cfg.get("mcp_bridge"):
+        import herald_mcp
+        bridge = threading.Thread(target=herald_mcp.supervise_bridge, args=(cfg["mcp_bridge"], HERALD_DIR, stop),
+                                  daemon=True)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # Run the finally below so the bridge stops too.
     with server:
         maintenance.start()
         heartbeat.start()
+        if bridge:
+            bridge.start()
         try:
             server.serve_forever()
         finally:
             stop.set()
             heartbeat.join(timeout=1)
             maintenance.join(timeout=1)
+            if bridge:
+                bridge.join(timeout=15)
 
 
 def _heartbeat_loop(me, listen, started, stop, maintenance):
@@ -1871,6 +1881,9 @@ def cmd_status(cfg, args):
     busy += f", waiting on you: {', '.join(blocked)}" if blocked else ""
     print(f"herald v{s.get('version', '?')} daemon: running - {s.get('me')} on {s.get('listen')} "
           f"(pid {s.get('pid')}, up since {s.get('started')}, {s.get('queued', 0)} queued{busy})")
+    if cfg.get("mcp_bridge"):
+        import herald_mcp
+        print("\n".join(herald_mcp.bridge_status_lines(cfg["mcp_bridge"], HERALD_DIR)))
 
 
 def queued_count(peer_name):

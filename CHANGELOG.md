@@ -2,6 +2,17 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.15.0
+
+- The dot bridge was started by hand and nothing noticed when it stopped, so a
+  connected dot silently lost Herald for days. A store's daemon can now supervise
+  the bridge through an optional `mcp_bridge` block in `config.json`: it starts,
+  restarts with backoff and stops the bridge, gives up after repeated fast exits,
+  and `herald status` reports the bridge and probes its local and public URLs.
+- A sign-in with an unapproved account told the user only to re-authenticate, so
+  they reconnected with the same account and looped. The tool error now says the
+  account is not approved and that signing in again with it will not help.
+
 ## 0.14.5
 
 - A connection could authenticate read/write tools while lacking the distinct
