@@ -57,7 +57,7 @@ class ApprovedAccounts(unittest.TestCase):
         self.assertEqual(oauth.list_accounts(self.path)[1], [])
 
     def test_approve_takes_effect_without_restart_and_revoke_ends_the_grant(self):
-        self.refused({"sub": "google-oauth2|simon"})
+        self.refused({"sub": "google-oauth2|simon", "email": "simon@example.test"})
 
         oauth.approve_candidate(self.path, 1)
         grant = self.verify({"sub": "google-oauth2|simon"})
@@ -68,6 +68,16 @@ class ApprovedAccounts(unittest.TestCase):
         oauth.revoke_subject(self.path, approved.index("google-oauth2|simon") + 1)
         self.assertFalse(self.auth.active_grant(grant))
         self.assertEqual(self.refused({"sub": "google-oauth2|simon"}), "subject_mismatch")
+
+    def test_sign_in_without_email_needs_force_to_approve(self):
+        self.refused({"sub": "google-oauth2|unknown"})
+
+        with self.assertRaises(ValueError):
+            oauth.approve_candidate(self.path, 1)
+        self.assertEqual(oauth.list_accounts(self.path)[0], ["dummy|jamie"])
+
+        oauth.approve_candidate(self.path, 1, force=True)
+        self.assertIn("google-oauth2|unknown", oauth.list_accounts(self.path)[0])
 
     def test_empty_approved_list_loads_and_refuses_everyone(self):
         self.path.write_text(json.dumps({k: v for k, v in self.config.items() if k != "subject"}))

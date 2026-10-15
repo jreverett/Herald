@@ -2,6 +2,12 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.16.1
+
+- Auth0 access tokens often carry no email, so a refused sign-in from another
+  person in the same tenant could look like the owner's own. `herald mcp approve`
+  now refuses a sign-in without an email claim unless `--force` is passed.
+
 ## 0.16.0
 
 - The bridge accepted exactly one hand-copied provider subject. A wrong copy, or

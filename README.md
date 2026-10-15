@@ -342,7 +342,8 @@ each login method), so copying the right one by hand is easy to get wrong. Leave
 sign-in, and records the subject of an otherwise valid token (with its email/name
 claims, for recognition only) in a private `*.pending.json` beside the config.
 The owner then runs `herald mcp accounts` to list approved accounts and refused
-sign-ins, `herald mcp approve <n>` to accept one, and `herald mcp revoke <n>` to
+sign-ins, `herald mcp approve <n>` to accept one (a sign-in without an email claim needs
+`--force`, after checking its time against your own sign-in), and `herald mcp revoke <n>` to
 remove one. Changes apply on the next request without a restart; revoking also
 stops subscriptions bound to that account. Nothing is approved without the owner. Leave `enabled` false until
 the actual owner approves their connection. The subject is private account metadata;

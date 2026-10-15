@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.16.0"
+__version__ = "0.16.1"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1893,7 +1893,7 @@ def cmd_mcp(cfg, args):
         sys.exit("No OAuth config: pass --oauth-config or set mcp_bridge.oauth_config in this store's config")
     try:
         if args.action == "approve":
-            chosen = herald_oauth.approve_candidate(path, args.number or 0)
+            chosen = herald_oauth.approve_candidate(path, args.number or 0, force=args.force)
             print(f"Approved {chosen['subject']} ({chosen.get('email', 'no email claim')}). "
                   "The bridge accepts it on the next request.")
         elif args.action == "revoke":
@@ -3014,6 +3014,7 @@ def main():
     sp.add_argument("action", choices=["accounts", "approve", "revoke"])
     sp.add_argument("number", nargs="?", type=int, help="number from `herald mcp accounts`")
     sp.add_argument("--oauth-config", help="defaults to mcp_bridge.oauth_config in this store's config")
+    sp.add_argument("--force", action="store_true", help="approve a sign-in that carries no email claim")
 
     sub.add_parser("sessions", help="list agent sessions currently listening")
 

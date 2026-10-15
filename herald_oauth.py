@@ -74,12 +74,15 @@ def save_subjects(path, config, subjects):
     write_json(path, config, path.stat().st_mode & 0o777)
 
 
-def approve_candidate(config_path, number):
+def approve_candidate(config_path, number, force=False):
     path = Path(config_path)
     candidates = load_candidates(path)
     if not 1 <= number <= len(candidates):
         raise ValueError(f"No pending sign-in number {number}")
     chosen = candidates[number - 1]
+    if not chosen.get("email") and not force:
+        raise ValueError("This sign-in carries no email claim, so it cannot be identified; "
+                         "check its time against your own sign-in and pass --force to approve it anyway")
     config = json.loads(path.read_text())
     subjects = approved_subjects(config) | {chosen["subject"]}
     if len(subjects) > MAX_SUBJECTS:
