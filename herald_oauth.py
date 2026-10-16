@@ -45,13 +45,18 @@ def pending_path(config_path):
     return Path(config_path).with_suffix(".pending.json")
 
 
-def write_json(path, value, mode):
+def write_json(path, value, mode, like=None):
     temporary = path.with_name(path.name + ".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w") as handle:
         json.dump(value, handle, indent=2)
         handle.write("\n")
     os.chmod(temporary, mode)
+    like = like or (path if path.exists() else None)
+    if like and os.geteuid() == 0:
+        # Root edits another owner's file; keep it readable by that owner's bridge.
+        owner = Path(like).stat()
+        os.chown(temporary, owner.st_uid, owner.st_gid)
     os.replace(temporary, path)
 
 
@@ -74,8 +79,9 @@ def save_subjects(path, config, subjects):
     write_json(path, config, path.stat().st_mode & 0o777)
 
 
-def approve_candidate(config_path, number, force=False):
+def approve_candidate(config_path, number, force=False, target_path=None):
     path = Path(config_path)
+    target = Path(target_path) if target_path else path
     candidates = load_candidates(path)
     if not 1 <= number <= len(candidates):
         raise ValueError(f"No pending sign-in number {number}")
@@ -83,12 +89,12 @@ def approve_candidate(config_path, number, force=False):
     if not chosen.get("email") and not force:
         raise ValueError("This sign-in carries no email claim, so it cannot be identified; "
                          "check its time against your own sign-in and pass --force to approve it anyway")
-    config = json.loads(path.read_text())
+    config = json.loads(target.read_text())
     subjects = approved_subjects(config) | {chosen["subject"]}
     if len(subjects) > MAX_SUBJECTS:
         raise ValueError(f"At most {MAX_SUBJECTS} approved accounts")
-    save_subjects(path, config, subjects)
-    write_json(pending_path(path), {"candidates": [c for c in candidates if c is not chosen]}, 0o600)
+    save_subjects(target, config, subjects)
+    write_json(pending_path(path), {"candidates": [c for c in candidates if c is not chosen]}, 0o600, like=path)
     return chosen
 
 

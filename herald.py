@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.16.1"
+__version__ = "0.17.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -1888,14 +1888,27 @@ def cmd_status(cfg, args):
 
 def cmd_mcp(cfg, args):
     import herald_oauth
+    routes = None
+    if args.owner or args.routes:
+        import herald_route
+        routes = json.loads(Path(args.routes or herald_route.DEFAULT_ROUTES).read_text())
     path = args.oauth_config or (cfg.get("mcp_bridge") or {}).get("oauth_config")
+    if routes and not args.oauth_config:
+        path = routes["owners"][routes["default"]].get("oauth_config")
     if not path:
         sys.exit("No OAuth config: pass --oauth-config or set mcp_bridge.oauth_config in this store's config")
     try:
         if args.action == "approve":
-            chosen = herald_oauth.approve_candidate(path, args.number or 0, force=args.force)
-            print(f"Approved {chosen['subject']} ({chosen.get('email', 'no email claim')}). "
-                  "The bridge accepts it on the next request.")
+            target = None
+            if args.owner:
+                if args.owner not in routes["owners"] or not routes["owners"][args.owner].get("oauth_config"):
+                    sys.exit(f"herald mcp approve: no route with an oauth_config for owner {args.owner}")
+                target = routes["owners"][args.owner]["oauth_config"]
+            chosen = herald_oauth.approve_candidate(path, args.number or 0, force=args.force, target_path=target)
+            if args.owner:
+                herald_route.add_subject(args.routes or herald_route.DEFAULT_ROUTES, args.owner, chosen["subject"])
+            print(f"Approved {chosen['subject']} ({chosen.get('email', 'no email claim')})"
+                  + (f" for {args.owner}" if args.owner else "") + ". The bridge accepts it on the next request.")
         elif args.action == "revoke":
             print(f"Revoked {herald_oauth.revoke_subject(path, args.number or 0)}. "
                   "Its sign-ins and subscriptions stop on the next request.")
@@ -3015,6 +3028,8 @@ def main():
     sp.add_argument("number", nargs="?", type=int, help="number from `herald mcp accounts`")
     sp.add_argument("--oauth-config", help="defaults to mcp_bridge.oauth_config in this store's config")
     sp.add_argument("--force", action="store_true", help="approve a sign-in that carries no email claim")
+    sp.add_argument("--owner", help="with a shared router: approve the sign-in for this owner's inbox")
+    sp.add_argument("--routes", help="router routes file (default /etc/herald/routes.json)")
 
     sub.add_parser("sessions", help="list agent sessions currently listening")
 

@@ -345,7 +345,28 @@ The owner then runs `herald mcp accounts` to list approved accounts and refused
 sign-ins, `herald mcp approve <n>` to accept one (a sign-in without an email claim needs
 `--force`, after checking its time against your own sign-in), and `herald mcp revoke <n>` to
 remove one. Changes apply on the next request without a restart; revoking also
-stops subscriptions bound to that account. Nothing is approved without the owner. Leave `enabled` false until
+stops subscriptions bound to that account. Nothing is approved without the owner.
+
+### One shared address for several owners
+
+To let a whole workspace install one published app, put `herald_route.py` in front of
+the owner bridges. It listens on loopback, reads only the unverified `sub` claim to
+pick an owner, and forwards the request unchanged to that owner's bridge, which still
+verifies the token fully. Every owner's `oauth.json` uses the same shared `resource`,
+and so the same identity-provider API. Routes live in a root-owned `routes.json`:
+
+```json
+{"default": "jamie", "owners": {
+  "jamie": {"port": 8766, "oauth_config": "/home/herald/pilot/oauth.json", "subjects": ["google-oauth2|..."]},
+  "simon": {"port": 8767, "oauth_config": "/home/herald-simon/pilot/oauth.json", "subjects": ["google-oauth2|..."]}}}
+```
+
+A token with no matching subject goes to the default (admin) bridge, which records a
+valid sign-in as a refused candidate. To onboard someone: they install the app and sign
+in once, then the admin runs `herald mcp accounts --routes /etc/herald/routes.json` and
+`herald mcp approve <n> --owner <name>` as root. That writes the subject into the
+owner's `oauth.json` and `routes.json`, and the router picks it up on its next request.
+ Leave `enabled` false until
 the actual owner approves their connection. The subject is private account metadata;
 keep actual configuration outside source control. This connection grants only the
 configured Herald mailbox/peer permissions, not other account data.

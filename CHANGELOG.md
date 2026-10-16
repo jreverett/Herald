@@ -2,6 +2,16 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.17.0
+
+- Each owner needed their own public address, identity-provider API and ChatGPT app,
+  so a new person could not just install the workspace's app. `herald_route.py` puts
+  one shared address in front of the owner bridges and forwards each request to the
+  owner whose approved subject is in the token, unchanged. The bridges still verify
+  every token. `herald mcp approve <n> --owner <name>` approves a refused sign-in for
+  another owner's inbox and updates the routes; run as root, it keeps each file owned
+  by its owner.
+
 ## 0.16.1
 
 - Auth0 access tokens often carry no email, so a refused sign-in from another
