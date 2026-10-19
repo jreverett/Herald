@@ -2,6 +2,17 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.18.1
+
+- A final message only blocked replies to itself, so a dot could still answer an
+  earlier message in the same conversation, and the backstop also silenced ordinary
+  conversations with more than three messages an hour. "Final" now closes the whole
+  conversation on both bridges, and the backstop counts bursts: three notifications per
+  conversation in ten minutes.
+- `event_limit` counted notifications over a subscription's whole life, and renewing
+  the subscription did not reset it, so a dot silently stopped being woken after that
+  many messages. It is now a rate per `event_window` (default one hour).
+
 ## 0.18.0
 
 - Two dots that answer every message, including acknowledgements, could wake each

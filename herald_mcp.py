@@ -130,7 +130,8 @@ def text_property(description):
 
 FINAL_PROPERTY = {"type": "boolean", "description": "True when the recipient must not reply"}
 THREAD_EVENT_LIMIT = 3
-THREAD_EVENT_WINDOW = 3600
+THREAD_EVENT_WINDOW = 600
+EVENT_WINDOW = 3600
 
 
 def is_final(item):
@@ -218,6 +219,7 @@ class Bridge:
                 (id TEXT PRIMARY KEY, received REAL, peer TEXT, mailbox TEXT, agent TEXT, thread TEXT);
             CREATE INDEX IF NOT EXISTS catalog_received ON message_catalog(received);
             CREATE TABLE IF NOT EXISTS final_messages (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS closed_threads (thread TEXT PRIMARY KEY, closed_by TEXT, closed REAL);
         """)
         self.db.commit()
 
@@ -258,7 +260,8 @@ class Bridge:
             raise RPCError(-32012, "Restart required after identity changes")
         for key, default, low, high in (("event_limit", 10, 0, 1000), ("max_subscriptions", 8, 1, 64),
                                        ("callbacks_per_tick", 16, 1, 64), ("thread_event_limit", THREAD_EVENT_LIMIT, 1, 100),
-                                       ("thread_event_window", THREAD_EVENT_WINDOW, 60, 86400)):
+                                       ("thread_event_window", THREAD_EVENT_WINDOW, 60, 86400),
+                                       ("event_window", EVENT_WINDOW, 60, 86400)):
             value = policy.get(key, default)
             if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
                 raise ValueError("Invalid bridge resource limit")
@@ -357,9 +360,11 @@ class Bridge:
                            "to_agent": address["agent"], "targeted": True, "fallback": "hold"}
             else:
                 orig = self.item(args["id"])
-                if is_final(orig) and not row:
+                closed = self.db.execute("SELECT 1 FROM closed_threads WHERE thread=?", (orig["thread"],)).fetchone()
+                if (is_final(orig) or closed) and not row:
                     self.count("final_reply_refusals")
-                    raise RPCError(-32014, "This message is final; no reply is expected")
+                    raise RPCError(-32014, "This conversation is closed; no reply is expected. "
+                                           "Use send_message to start a new conversation.")
                 peer = orig["from"]
                 address = self.peer(peer)
                 # Only the configured adapter identity may claim; callers cannot override it.
@@ -383,6 +388,9 @@ class Bridge:
                 self.commit()  # Persist stable delivery ID BEFORE network transmission.
             self.count("send_calls" if name == "send_message" else "reply_calls")
             result = self.herald.deliver(self.herald_config(), peer, payload)
+            if final and isinstance(result, dict) and result.get("thread"):
+                self.db.execute("INSERT OR IGNORE INTO closed_threads VALUES (?,?,?)",
+                                (result["thread"], result.get("id"), time.time()))
             self.db.execute("UPDATE writes SET result=? WHERE key=?", (canonical(result), key))
             self.commit()
             return result
@@ -533,6 +541,8 @@ class Bridge:
                                      item.get("to_agent", ""), item["thread"]))
                     if is_final(item):
                         self.db.execute("INSERT OR IGNORE INTO final_messages VALUES (?)", (item["id"],))
+                        self.db.execute("INSERT OR IGNORE INTO closed_threads VALUES (?,?,?)",
+                                        (item["thread"], item["id"], item["received_ts"]))
                     changed = True
                 self.db.execute("INSERT OR IGNORE INTO inbox_seen VALUES (?)", (entry.name,))
                 writes = True
@@ -548,19 +558,18 @@ class Bridge:
             peers = [p for p in peers if p == sub["arguments"]["peer"]]
         if not peers:
             return
-        used = self.db.execute("SELECT count(*) FROM deliveries WHERE sub=? AND json_extract(record,'$.state')!='suppressed'",
-                               (sub["id"],)).fetchone()[0]
+        now = time.time()
+        used = self.db.execute("SELECT count(*) FROM deliveries WHERE sub=? AND json_extract(record,'$.state')!='suppressed' "
+                               "AND json_extract(record,'$.created')>=?",
+                               (sub["id"], now - policy.get("event_window", EVENT_WINDOW))).fetchone()[0]
         remaining = max(0, policy.get("event_limit", 10) - used)
-        if not remaining:
-            return
         placeholders = ",".join("?" for _ in peers)
         rows = self.db.execute(
             "SELECT id,received,peer,mailbox,thread FROM message_catalog c WHERE received>=? "
             "AND mailbox=? AND agent IN ('',?) AND peer IN (" + placeholders + ") "
             "AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.sub=? AND "
-            "json_extract(d.record,'$.event.data.id')=c.id) ORDER BY received,id LIMIT ?",
-            (sub["created"], policy["mailbox"], policy["agent"], *peers, sub["id"], remaining)).fetchall()
-        now = time.time()
+            "json_extract(d.record,'$.event.data.id')=c.id) ORDER BY received,id LIMIT 100",
+            (sub["created"], policy["mailbox"], policy["agent"], *peers, sub["id"])).fetchall()
         for item_id, received, peer, mailbox, thread in rows:
             event_id = "evt_" + hashlib.sha256(canonical([self.owner, item_id]).encode()).hexdigest()
             final = self.db.execute("SELECT 1 FROM final_messages WHERE id=?", (item_id,)).fetchone() is not None
@@ -571,8 +580,13 @@ class Bridge:
                 "SELECT count(*) FROM deliveries WHERE sub=? AND json_extract(record,'$.event.data.thread')=? "
                 "AND json_extract(record,'$.state')!='suppressed' AND json_extract(record,'$.created')>=?",
                 (sub["id"], thread, now - policy.get("thread_event_window", THREAD_EVENT_WINDOW))).fetchone()[0]
-            # A busy thread stops waking the dot; its messages stay readable in the inbox.
-            state = "suppressed" if recent >= policy.get("thread_event_limit", THREAD_EVENT_LIMIT) else "pending"
+            closed_by = self.db.execute("SELECT closed_by FROM closed_threads WHERE thread=?", (thread,)).fetchone()
+            # A closed or busy thread stops waking the dot; its messages stay readable in the inbox.
+            if (closed_by and closed_by[0] != item_id) or remaining <= 0:
+                state = "suppressed"
+            else:
+                state = "suppressed" if recent >= policy.get("thread_event_limit", THREAD_EVENT_LIMIT) else "pending"
+            remaining -= state == "pending"
             record = {"event": event, "attempts": 0, "next": 0, "state": state, "created": now}
             self.db.execute("INSERT OR IGNORE INTO deliveries VALUES (?,?,?)", (sub["id"], event_id, canonical(record)))
             self.count("events_suppressed" if state == "suppressed" else "events_created")

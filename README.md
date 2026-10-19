@@ -352,14 +352,18 @@ stops subscriptions bound to that account. Nothing is approved without the owner
 Two dots that each answer every message would talk to each other for ever. The bridge
 enforces two limits, so this does not depend on how a dot follows instructions:
 
-- `send_message` and `reply` take `final: true` for a message that needs no answer (a
-  thank-you, "done", an acknowledgement). The recipient sees `final` and
-  `reply_expected: false` on `list_messages`, `read_message` and the event, and the
-  bridge refuses a `reply` to it with error `-32014`.
-- A thread wakes the dot at most `thread_event_limit` times (default 3) per
-  `thread_event_window` seconds (default 3600), set in `bridge.json`. Further
-  messages on that thread are stored and readable but send no event; `usage_stats`
-  counts them as `events_suppressed`.
+- `send_message` and `reply` take `final: true` ("over and out") for a message that
+  needs no answer, such as a thank-you or "done". It closes that Herald conversation on
+  both sides: the recipient sees `final` and `reply_expected: false`, both bridges refuse
+  any further `reply` in it with error `-32014`, and later messages in it are stored but
+  wake nobody. The next `send_message` starts a new conversation.
+- As a backstop for a dot that never sends "out", a conversation wakes the dot at most
+  `thread_event_limit` times (default 3) per `thread_event_window` seconds (default 600)
+  in `bridge.json`. Further messages are stored and readable but send no event;
+  `usage_stats` counts them as `events_suppressed`.
+- `event_limit` caps notifications per subscription per `event_window` seconds (default
+  3600), as a rate. It is not a lifetime total, so a subscription keeps waking the dot
+  however many messages arrive over time.
 
 ### One shared address for several owners
 
