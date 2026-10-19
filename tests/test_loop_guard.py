@@ -61,7 +61,10 @@ class LoopGuard(unittest.TestCase):
         self.f.tick()
 
         self.assertEqual([e["data"]["id"] for e in self.events_for(out["thread"])], [out["id"]])
-        self.assertEqual(self.f.tool("simon", "read_message", {"id": late["id"]})["text"], "ignoring the close")
+        read = self.f.tool("simon", "read_message", {"id": late["id"]})
+        listed = {m["id"]: m for m in self.f.tool("simon", "list_messages")["messages"]}
+        self.assertEqual((read["text"], read["conversation_closed"], read["reply_expected"]), ("ignoring the close", True, False))
+        self.assertEqual((listed[late["id"]]["conversation_closed"], listed[late["id"]]["reply_expected"]), (True, False))
 
     def test_notification_limit_is_a_rate_not_a_lifetime_cap(self):
         policy = json.loads(self.f.configs["simon"].read_text())

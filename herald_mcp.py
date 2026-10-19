@@ -329,14 +329,21 @@ class Bridge:
                     "scope": "Counters are in-memory since this bridge start; resources cover this process, not the whole host."}
         if name == "list_messages":
             strings(args, [])
+            with self.lock:
+                closed = {row[0] for row in self.db.execute("SELECT thread FROM closed_threads")}
             return {"messages": [{"id": i["id"], "from": i["from"], "thread": i["thread"],
-                                   "state": self.herald.item_state(i), "final": is_final(i)}
+                                   "state": self.herald.item_state(i), "final": is_final(i),
+                                   "conversation_closed": i["thread"] in closed,
+                                   "reply_expected": not is_final(i) and i["thread"] not in closed}
                                   for i in self.items()[-100:]]}
         if name == "read_message":
             strings(args, ["id"])
             item = self.item(args["id"])
+            with self.lock:
+                closed = self.db.execute("SELECT 1 FROM closed_threads WHERE thread=?", (item["thread"],)).fetchone() is not None
             return {**{k: item[k] for k in ("id", "from", "thread", "text", "received")},
-                    "final": is_final(item), "reply_expected": not is_final(item)}
+                    "final": is_final(item), "conversation_closed": closed,
+                    "reply_expected": not is_final(item) and not closed}
         if name not in ("send_message", "reply"):
             raise RPCError(-32602, "Unknown tool")
         final = args.get("final", False) if isinstance(args, dict) else False

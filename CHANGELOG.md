@@ -2,6 +2,13 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.18.2
+
+- A message that arrived in a conversation after it was closed still showed
+  `reply_expected: true`, although the bridge refused the reply. `list_messages`
+  and `read_message` now show `conversation_closed` and set `reply_expected` to
+  false for it.
+
 ## 0.18.1
 
 - A final message only blocked replies to itself, so a dot could still answer an
