@@ -2,6 +2,14 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.18.0
+
+- Two dots that answer every message, including acknowledgements, could wake each
+  other for ever and spend tokens on both sides. `send_message` and `reply` now take
+  `final: true` for messages that need no answer; the recipient sees them marked as
+  final and the bridge refuses a reply. Each thread also wakes a dot at most three
+  times an hour by default; further messages are stored without an event.
+
 ## 0.17.0
 
 - Each owner needed their own public address, identity-provider API and ChatGPT app,

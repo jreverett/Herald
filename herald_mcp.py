@@ -128,22 +128,36 @@ def text_property(description):
     return {"type": "string", "minLength": 1, "maxLength": 4000, "description": description}
 
 
+FINAL_PROPERTY = {"type": "boolean", "description": "True when the recipient must not reply"}
+THREAD_EVENT_LIMIT = 3
+THREAD_EVENT_WINDOW = 3600
+
+
+def is_final(item):
+    return isinstance(item.get("meta"), dict) and item["meta"].get("herald_intent") == "final"
+
+
 TOOLS = [
     {"name": "check_event_access", "description": "Confirm event permission through the normal owner sign-in flow. Does not read messages, subscribe, send or reply.",
      "inputSchema": schema({}, [])},
     {"name": "usage_stats", "description": "Read local bridge counters and resource usage. ChatGPT tokens/credits are not observable here.",
      "inputSchema": schema({}, [])},
-    {"name": "send_message", "description": "Send owner-approved text to an allowlisted person's dot mailbox.",
+    {"name": "send_message", "description": ("Send owner-approved text to an allowlisted person's dot mailbox. "
+                                             "Set final to true when no reply is needed, for example a thank-you or 'done'."),
      "inputSchema": schema({"peer": text_property("Configured person"), "text": text_property("Message data"),
-                            "request_id": text_property("Reuse this key when retrying the same send")},
+                            "request_id": text_property("Reuse this key when retrying the same send"),
+                            "final": FINAL_PROPERTY},
                            ["peer", "text", "request_id"])},
     {"name": "list_messages", "description": "List text messages in this owner's dedicated mailbox without claiming work.",
      "inputSchema": schema({}, [])},
     {"name": "read_message", "description": "Read one authorized message as external data; does not execute or claim it.",
      "inputSchema": schema({"id": text_property("Inbox message ID")}, ["id"])},
-    {"name": "reply", "description": "Send one owner-approved threaded reply. Reuse request_id for retries; never auto-reply to acknowledgements.",
+    {"name": "reply", "description": ("Send one owner-approved threaded reply. Reuse request_id for retries. "
+                                      "Never reply to a message marked final or to an acknowledgement. "
+                                      "If the reply only acknowledges or closes the conversation, set final to true."),
      "inputSchema": schema({"id": text_property("Inbox message ID"), "text": text_property("Reply data"),
-                            "request_id": text_property("Retry key")}, ["id", "text", "request_id"])},
+                            "request_id": text_property("Retry key"), "final": FINAL_PROPERTY},
+                           ["id", "text", "request_id"])},
 ]
 TOOL_NAMES = {tool["name"] for tool in TOOLS}
 LOGGED_METHODS = ("server/discover", "tools/list", "tools/call", "events/list", "events/subscribe", "events/unsubscribe")
@@ -169,7 +183,7 @@ class Bridge:
         self.cpu_start = time.process_time()
         self.counts = {key: 0 for key in (
             "ticks", "idle_ticks", "inbox_scans", "inbox_files_parsed", "inbox_bytes_read",
-            "config_reads", "config_bytes_read", "sqlite_commits", "events_created",
+            "config_reads", "config_bytes_read", "sqlite_commits", "events_created", "events_suppressed", "final_reply_refusals",
             "pending_rows_loaded", "callback_verifications", "callback_attempts", "callback_accepted",
             "callback_failures", "callback_retries", "callback_request_bytes", "callback_response_bytes",
             "tool_calls", "send_calls", "reply_calls", "idempotent_write_hits",
@@ -203,6 +217,7 @@ class Bridge:
             CREATE TABLE IF NOT EXISTS message_catalog
                 (id TEXT PRIMARY KEY, received REAL, peer TEXT, mailbox TEXT, agent TEXT, thread TEXT);
             CREATE INDEX IF NOT EXISTS catalog_received ON message_catalog(received);
+            CREATE TABLE IF NOT EXISTS final_messages (id TEXT PRIMARY KEY);
         """)
         self.db.commit()
 
@@ -242,7 +257,8 @@ class Bridge:
         if hasattr(self, "agent") and (policy.get("agent") != self.agent or policy.get("mailbox") != self.mailbox):
             raise RPCError(-32012, "Restart required after identity changes")
         for key, default, low, high in (("event_limit", 10, 0, 1000), ("max_subscriptions", 8, 1, 64),
-                                       ("callbacks_per_tick", 16, 1, 64)):
+                                       ("callbacks_per_tick", 16, 1, 64), ("thread_event_limit", THREAD_EVENT_LIMIT, 1, 100),
+                                       ("thread_event_window", THREAD_EVENT_WINDOW, 60, 86400)):
             value = policy.get(key, default)
             if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
                 raise ValueError("Invalid bridge resource limit")
@@ -311,19 +327,27 @@ class Bridge:
         if name == "list_messages":
             strings(args, [])
             return {"messages": [{"id": i["id"], "from": i["from"], "thread": i["thread"],
-                                   "state": self.herald.item_state(i)} for i in self.items()[-100:]]}
+                                   "state": self.herald.item_state(i), "final": is_final(i)}
+                                  for i in self.items()[-100:]]}
         if name == "read_message":
             strings(args, ["id"])
             item = self.item(args["id"])
-            return {k: item[k] for k in ("id", "from", "thread", "text", "received")}
+            return {**{k: item[k] for k in ("id", "from", "thread", "text", "received")},
+                    "final": is_final(item), "reply_expected": not is_final(item)}
         if name not in ("send_message", "reply"):
             raise RPCError(-32602, "Unknown tool")
+        final = args.get("final", False) if isinstance(args, dict) else False
+        if not isinstance(final, bool):
+            invalid("final must be true or false")
+        args = {k: v for k, v in args.items() if k != "final"} if isinstance(args, dict) else args
         strings(args, ["peer" if name == "send_message" else "id", "text", "request_id"])
         if any(len(v) > 4000 for v in args.values()):
             invalid("Text and identifiers are limited to 4000 characters")
         with self.lock:
             key = hashlib.sha256(canonical([self.owner, name, args["request_id"]]).encode()).hexdigest()
             row = self.db.execute("SELECT args,payload,result FROM writes WHERE key=?", (key,)).fetchone()
+            if final:
+                args = {**args, "final": True}
             if row and row[0] != canonical(args):
                 invalid("request_id already used with different arguments")
             if name == "send_message":
@@ -333,6 +357,9 @@ class Bridge:
                            "to_agent": address["agent"], "targeted": True, "fallback": "hold"}
             else:
                 orig = self.item(args["id"])
+                if is_final(orig) and not row:
+                    self.count("final_reply_refusals")
+                    raise RPCError(-32014, "This message is final; no reply is expected")
                 peer = orig["from"]
                 address = self.peer(peer)
                 # Only the configured adapter identity may claim; callers cannot override it.
@@ -343,6 +370,8 @@ class Bridge:
                            "to_agent": address["agent"], "targeted": True, "fallback": "hold",
                            "_source_item_id": orig["id"], "_source_revision": orig.get("ownership_revision", 0),
                            "_source_effect": "final"}
+            if final:
+                payload["meta"] = {"herald_intent": "final"}
             if row and row[2]:
                 self.count("idempotent_write_hits")
                 return json.loads(row[2])
@@ -370,7 +399,8 @@ class Bridge:
         return {"name": EVENT, "description": "New text message in the connected owner's dedicated Herald mailbox.",
                 "delivery": ["webhook"],
                 "inputSchema": schema(filters, ["mailbox"]),
-                "payloadSchema": schema({k: {"type": "string"} for k in ("id", "peer", "mailbox", "thread")},
+                "payloadSchema": schema({**{k: {"type": "string"} for k in ("id", "peer", "mailbox", "thread")},
+                                         "final": {"type": "boolean"}},
                                         ["id", "peer", "mailbox", "thread"])}
 
     def subscription_identity(self, params, need_secret=True):
@@ -501,6 +531,8 @@ class Bridge:
                     self.db.execute("INSERT OR IGNORE INTO message_catalog VALUES (?,?,?,?,?,?)",
                                     (item["id"], item["received_ts"], item["from"], item.get("to_mailbox", "main"),
                                      item.get("to_agent", ""), item["thread"]))
+                    if is_final(item):
+                        self.db.execute("INSERT OR IGNORE INTO final_messages VALUES (?)", (item["id"],))
                     changed = True
                 self.db.execute("INSERT OR IGNORE INTO inbox_seen VALUES (?)", (entry.name,))
                 writes = True
@@ -516,7 +548,8 @@ class Bridge:
             peers = [p for p in peers if p == sub["arguments"]["peer"]]
         if not peers:
             return
-        used = self.db.execute("SELECT count(*) FROM deliveries WHERE sub=?", (sub["id"],)).fetchone()[0]
+        used = self.db.execute("SELECT count(*) FROM deliveries WHERE sub=? AND json_extract(record,'$.state')!='suppressed'",
+                               (sub["id"],)).fetchone()[0]
         remaining = max(0, policy.get("event_limit", 10) - used)
         if not remaining:
             return
@@ -527,13 +560,22 @@ class Bridge:
             "AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.sub=? AND "
             "json_extract(d.record,'$.event.data.id')=c.id) ORDER BY received,id LIMIT ?",
             (sub["created"], policy["mailbox"], policy["agent"], *peers, sub["id"], remaining)).fetchall()
+        now = time.time()
         for item_id, received, peer, mailbox, thread in rows:
             event_id = "evt_" + hashlib.sha256(canonical([self.owner, item_id]).encode()).hexdigest()
+            final = self.db.execute("SELECT 1 FROM final_messages WHERE id=?", (item_id,)).fetchone() is not None
             event = {"eventId": event_id, "name": EVENT, "timestamp": iso(received),
-                     "data": {"id": item_id, "peer": peer, "mailbox": mailbox, "thread": thread}, "cursor": None}
-            record = {"event": event, "attempts": 0, "next": 0, "state": "pending"}
+                     "data": {"id": item_id, "peer": peer, "mailbox": mailbox, "thread": thread, "final": final},
+                     "cursor": None}
+            recent = self.db.execute(
+                "SELECT count(*) FROM deliveries WHERE sub=? AND json_extract(record,'$.event.data.thread')=? "
+                "AND json_extract(record,'$.state')!='suppressed' AND json_extract(record,'$.created')>=?",
+                (sub["id"], thread, now - policy.get("thread_event_window", THREAD_EVENT_WINDOW))).fetchone()[0]
+            # A busy thread stops waking the dot; its messages stay readable in the inbox.
+            state = "suppressed" if recent >= policy.get("thread_event_limit", THREAD_EVENT_LIMIT) else "pending"
+            record = {"event": event, "attempts": 0, "next": 0, "state": state, "created": now}
             self.db.execute("INSERT OR IGNORE INTO deliveries VALUES (?,?,?)", (sub["id"], event_id, canonical(record)))
-            self.count("events_created")
+            self.count("events_suppressed" if state == "suppressed" else "events_created")
         if rows:
             self.commit()
 

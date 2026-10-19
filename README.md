@@ -347,6 +347,20 @@ sign-ins, `herald mcp approve <n>` to accept one (a sign-in without an email cla
 remove one. Changes apply on the next request without a restart; revoking also
 stops subscriptions bound to that account. Nothing is approved without the owner.
 
+### Stopping reply loops between dots
+
+Two dots that each answer every message would talk to each other for ever. The bridge
+enforces two limits, so this does not depend on how a dot follows instructions:
+
+- `send_message` and `reply` take `final: true` for a message that needs no answer (a
+  thank-you, "done", an acknowledgement). The recipient sees `final` and
+  `reply_expected: false` on `list_messages`, `read_message` and the event, and the
+  bridge refuses a `reply` to it with error `-32014`.
+- A thread wakes the dot at most `thread_event_limit` times (default 3) per
+  `thread_event_window` seconds (default 3600), set in `bridge.json`. Further
+  messages on that thread are stored and readable but send no event; `usage_stats`
+  counts them as `events_suppressed`.
+
 ### One shared address for several owners
 
 To let a whole workspace install one published app, put `herald_route.py` in front of
