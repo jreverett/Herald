@@ -5,6 +5,7 @@ repo=Path(__file__).resolve().parents[1]
 if (repo/'herald_oauth.py').exists():
     sys.path.insert(0,str(repo));sys.path.insert(0,str(repo/'tests'))
 import herald_oauth as oauth
+import herald_mcp as mcp
 import test_oauth as fixtures
 
 class DenialDiagnostics(unittest.TestCase):
@@ -49,7 +50,7 @@ class HTTPDiagnostics(unittest.TestCase):
         challenge=denied['result']['_meta']['mcp/www_authenticate'][0]
         self.assertIn('insufficient_scope',challenge)
         self.assertIn('scope="herald:events"',challenge)
-        self.assertEqual(self.f.tool('jamie','check_event_access'),{'authorized':True})
+        self.assertEqual(self.f.tool('jamie','check_event_access'),{'authorized':True,'reply_guidance':mcp.REPLY_GUIDANCE})
         bridge=self.f.bridges['jamie']
         self.assertEqual(bridge.counts['inbox_scans'],0)
         self.assertEqual(bridge.counts['send_calls'],0)
