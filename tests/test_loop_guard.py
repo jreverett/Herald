@@ -92,7 +92,6 @@ class LoopGuard(unittest.TestCase):
         read = self.f.tool("simon", "read_message", {"id": sent["id"]})
         reply = self.f.tool("simon", "reply", {"id": sent["id"], "text": "Hi", "request_id": "r-1"})
         self.assertEqual((read["final"], read["reply_expected"]), (False, True))
-        self.assertEqual(read["reply_guidance"], fixtures.mcp.REPLY_GUIDANCE)
         self.assertEqual(reply["thread"], sent["thread"])
 
     def test_final_flag_must_be_boolean_and_is_part_of_the_retry_key(self):

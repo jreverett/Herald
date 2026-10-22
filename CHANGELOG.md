@@ -2,6 +2,15 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.19.0
+
+- `reply_guidance` becomes `message_handling`,
+  returned by `check_event_access` and `read_message`. It names the owner's approved
+  peers and offers two owner rules for the dot to propose once Herald is connected: an
+  approval boundary (other apps, commitments, private information) and automatic replies
+  to the named peers only. ChatGPT rejected a rule addressed to "the sender" as too broad.
+  Herald does not save or enforce these rules; the owner saves them through ChatGPT.
+
 ## 0.18.4
 
 - `check_event_access` and `read_message` now return `reply_guidance`, a
