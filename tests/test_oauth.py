@@ -256,7 +256,7 @@ class OAuthHTTPTests(unittest.TestCase):
         events=self.f.rpc("jamie","events/list")["result"]["events"]
         self.assertEqual(len(events),1)
         self.assertEqual(events[0]["name"],mcp.EVENT)
-        self.assertNotIn("peer",events[0]["inputSchema"]["properties"])
+        self.assertNotIn("enum",events[0]["inputSchema"]["properties"]["peer"])
         self.assertEqual(bridge.counts["server_discovery_requests"],1)
         self.assertEqual(bridge.counts["event_discovery_requests"],2)
         self.assertEqual(bridge.counts["event_discovery_auth_denials"],1)

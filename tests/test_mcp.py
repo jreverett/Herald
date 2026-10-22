@@ -222,6 +222,15 @@ class MCPIntegration(unittest.TestCase):
         self.assertEqual(self.callbacks, [])
         self.assertEqual(self.bridges[owner].db.execute("SELECT count(*) FROM subscriptions").fetchone()[0], 0)
 
+    def test_shared_app_schema_lists_no_owner_peers_and_stats_count_subscriptions(self):
+        self.assertEqual(self.tool("simon", "usage_stats", {})["active_subscriptions"], 0)
+        self.subscribe()
+
+        peer = self.rpc("simon", "events/list")["result"]["events"][0]["inputSchema"]["properties"]["peer"]
+        self.assertEqual(peer["type"], "string")
+        self.assertNotIn("enum", peer)
+        self.assertEqual(self.tool("simon", "usage_stats", {})["active_subscriptions"], 1)
+
     def test_greeting_signed_event_and_threaded_reply(self):
         discovery = self.rpc("jamie", "server/discover")["result"]
         self.assertEqual(discovery["supportedVersions"], ["2026-07-28"])
@@ -445,7 +454,7 @@ class MCPIntegration(unittest.TestCase):
         before = len(self.callbacks)
         self.tick()
         self.assertEqual(len(self.callbacks), before)
-        self.assertNotIn("peer", self.rpc("simon", "events/list")["result"]["events"][0]["inputSchema"]["properties"])
+        self.assertNotIn("enum", self.rpc("simon", "events/list")["result"]["events"][0]["inputSchema"]["properties"]["peer"])
 
 
 class SigningAndSSRF(unittest.TestCase):

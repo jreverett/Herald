@@ -2,6 +2,14 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.18.3
+
+- A shared ChatGPT app keeps the tool schema from the first install, so the
+  event's `peer` filter listed the first owner's peers and a second owner could
+  not filter on their own peer. The filter is now a plain string, and the bridge
+  still rejects a peer outside the owner's allowlist.
+- `usage_stats` now reports `active_subscriptions`.
+
 ## 0.18.2
 
 - A message that arrived in a conversation after it was closed still showed

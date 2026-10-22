@@ -318,12 +318,15 @@ class Bridge:
             peak_bytes = int(usage.ru_maxrss * (1 if os.uname().sysname == "Darwin" else 1024))
             with self.lock:
                 pending = self.db.execute("SELECT count(*) FROM deliveries WHERE json_extract(record,'$.state')='pending'").fetchone()[0]
+                active = self.db.execute("SELECT count(*) FROM subscriptions WHERE json_extract(record,'$.enabled')=1 "
+                                         "AND json_extract(record,'$.expires')>?", (time.time(),)).fetchone()[0]
             return {"callback_diagnostic": {"last_observed_hostname": callback_hostname, "verified": False},
                     "counters": counters, "uptime_seconds": time.time() - self.started,
                     "oauth_counters": self.auth.stats() if self.auth else None,
                     "process_cpu_seconds_since_bridge_start": time.process_time() - self.cpu_start,
                     "process_peak_rss_bytes": peak_bytes, "pending_events": pending,
                     "event_limit_per_subscription": self.policy().get("event_limit", 10),
+                    "active_subscriptions": active,
                     "bridge_model_calls": 0, "autonomous_reply_calls": 0,
                     "platform_tokens_and_credits": "unknown_until_owner_approved_live_test",
                     "scope": "Counters are in-memory since this bridge start; resources cover this process, not the whole host."}
@@ -404,13 +407,9 @@ class Bridge:
 
     def definition(self):
         p = self.policy()
-        reachable = sorted(set(p["peers"]) & set(self.herald_config().get("peers", {})))
-        filters = {"mailbox": {"type": "string", "enum": [p["mailbox"]]}}
-        # An empty enum is unusable and can be rejected by discovery consumers.
-        # Omit the optional filter until peers exist; server authorization still
-        # rejects any explicitly supplied peer outside the owner allowlist.
-        if reachable:
-            filters["peer"] = {"type": "string", "enum": reachable}
+        # A shared app keeps the first installer's schema, so it must not list one owner's peers.
+        filters = {"mailbox": {"type": "string", "enum": [p["mailbox"]]},
+                   "peer": {"type": "string", "description": "Optional sender peer name from the owner's allowlist."}}
         return {"name": EVENT, "description": "New text message in the connected owner's dedicated Herald mailbox.",
                 "delivery": ["webhook"],
                 "inputSchema": schema(filters, ["mailbox"]),
