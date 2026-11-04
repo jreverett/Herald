@@ -118,3 +118,7 @@ deliberate: a detached `Start-Process`/shortcut to `powershell.exe` launched fro
 WSL or a script does not attach to the interactive desktop, so its icon paints to
 an invisible window station. wscript spawns the tray as a child that inherits the
 visible desktop, so the icon actually appears - both at login and right away.
+
+The launcher also restarts the tray within a few seconds if it closes or is killed
+while the daemon is running. Choosing **Exit** from the menu stops it until the next
+login or `enable`.
