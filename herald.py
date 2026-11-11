@@ -2652,7 +2652,7 @@ def cmd_ask(cfg, args):
               f"of that acknowledgement (still open in thread {thread}).")
     else:
         print(f"No reply from {args.peer} within {idle_timeout}s (still open in thread {thread}).")
-    print("Nothing is listening now - run `herald resume` to receive the reply.")
+    print("Nothing is listening now - run `herald wait` under the same HERALD_AGENT to receive the reply.")
     sys.exit(2)
 
 

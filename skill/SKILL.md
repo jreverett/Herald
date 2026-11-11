@@ -132,7 +132,7 @@ herald ping <person>                                  # is their daemon up? whic
     The same applies to `ask`: its `--timeout` is an **idle** timeout (an
     acknowledgement restarts it), but a peer that acknowledges and then goes
     quiet for longer than the window still ends the listener, and the message
-    says so. Run `herald resume` when that happens.
+    says so. Run `herald wait` under the same agent name when that happens; `resume` takes the mailbox from another session.
   Prefer a background `herald wait` with no `--timeout` for an open-ended
   expected reply, so it survives until the answer lands. The reply is never
   lost without a listener, it just sits unread until someone checks the inbox —
