@@ -4,7 +4,7 @@
 # Or from a clone: ./install.sh --me alice
 set -e
 ME=""; PORT=8765; DIR="$HOME/herald"; SKIP_NETWORK=""; AUTH_KEY=""
-PEER_NAME=""; PEER_URL=""; PEER_TOKEN=""
+PEER_NAME=""; PEER_URL=""; PEER_TOKEN=""; AUTOLISTEN=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --me) ME="$2"; shift 2 ;;
@@ -15,10 +15,11 @@ while [ $# -gt 0 ]; do
     --peer-url) PEER_URL="$2"; shift 2 ;;
     --peer-token) PEER_TOKEN="$2"; shift 2 ;;
     --skip-network) SKIP_NETWORK=1; shift ;;
+    --autolisten) AUTOLISTEN=1; shift ;;
     *) echo "Unknown option $1"; exit 1 ;;
   esac
 done
-[ -n "$ME" ] || { echo "Usage: install.sh --me <name> [--auth-key tskey-...] [--peer <name> --peer-url <url> --peer-token <token>] [--port 8765] [--dir <clone-dir>] [--skip-network]"; exit 1; }
+[ -n "$ME" ] || [ -f "$HOME/.herald/config.json" ] || { echo "Usage: install.sh --me <name> [--auth-key tskey-...] [--peer <name> --peer-url <url> --peer-token <token>] [--port 8765] [--dir <clone-dir>] [--skip-network] [--autolisten]"; exit 1; }
 
 command -v python3 >/dev/null || { echo "python3 is required"; exit 1; }
 
@@ -217,6 +218,11 @@ EOF
   fi
 else
   echo "No systemd; start the daemon manually: nohup herald daemon >~/.herald/daemon.log 2>&1 &"
+fi
+
+# 4.2 auto-listener: opt in with --autolisten; an upgrade refreshes a service that is already installed.
+if [ -n "$AUTOLISTEN" ] || [ -f "$HOME/.config/systemd/user/herald-autolisten.service" ]; then
+  python3 "$REPO_DIR/herald.py" autolisten --install-service || true
 fi
 
 # 4.5 Windows tray indicator (only on WSL-with-Windows; skipped cleanly elsewhere)

@@ -102,6 +102,7 @@ herald tidy [--older-than DAYS] [--dry-run]  # close finished work still counted
 herald thread <thread-id>                   # whole conversation, both directions
 herald wait | herald resume                 # become listener; resume also shows existing open work
 herald sessions | herald status | herald flush [peer]
+herald autolisten [--once]                  # start a Claude desk session when work waits unheard
 herald mailbox list|add|remove|default
 herald peer issue|add|list|remove           # issue mints a peer their inbound token
 herald access                               # audit who can reach whom
@@ -201,6 +202,17 @@ curl -fsSL https://raw.githubusercontent.com/jreverett/herald/master/install.sh 
 The introduction carries bob's address and a token back; alice runs `herald accept <id>` and both
 directions are authenticated. Manual equivalent: `herald peer add <name> <url> <token> && herald
 introduce <name>`.
+
+### Auto-listener
+
+`./install.sh --autolisten` (systemd, tmux and claude required) installs `herald-autolisten.service`.
+Every minute it checks the inbox. When unclaimed work waits and no live listener exists under any
+agent name for two checks in a row, it starts `claude --remote-control herald-desk` in tmux session
+`rc-herald-desk` with `autolisten/desk-prompt.md`. It never claims or reads items itself.
+`herald autolisten --once` prints the current state: `idle`, `listened`, `desk-starting` or
+`unattended`. Settings go in `~/.config/herald/autolisten.env` or a `autolisten` object in
+`config.json`: `HERALD_AUTOLISTEN_AGENT` (default `me`), `_INTERVAL` (60), `_GRACE` (2),
+`_WORKDIR` (home) and `_PROMPT` (a desk prompt file; `{agent}` is replaced by the agent name).
 
 **A peer name must be exactly the other person's `--me`** - replies and results route back by it.
 

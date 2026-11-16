@@ -243,6 +243,9 @@ as well as new files, claims one eligible item, prints a notification, and exits
 Add `--read` to print the full claimed item and extract attachments.
 `wait` always claims; use `peek` for inspection. Restart the listener after each wake.
 
+A session that `herald autolisten` started (the Herald desk) listens with `herald wait`, never
+`resume`, and stops when another agent's listener appears.
+
 Use `herald resume` after a Claude account switch, a Codex or Copilot takeover,
 a restarted tab, or any other handoff. It supersedes the previous general
 consumer and presents the oldest eligible open item, even if that item arrived

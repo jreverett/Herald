@@ -2,6 +2,17 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.20.0
+
+- Work that arrived while no session listened, for example after a reboot, sat unread until a
+  human opened a session. Each owner ran a private copy of a script to start one. That script is
+  now `herald autolisten`: when unclaimed work waits and no live listener exists under any agent
+  name for two checks in a row, it starts a Claude Remote Control desk session in tmux with a
+  general desk prompt. `--once` prints the state. `install.sh --autolisten` installs it as the
+  `herald-autolisten` systemd user service, and an upgrade refreshes an installed one. Settings
+  come from `HERALD_AUTOLISTEN_*` in `~/.config/herald/autolisten.env` or `config.json`.
+- `install.sh` no longer needs `--me` when `~/.herald/config.json` already exists.
+
 ## 0.19.0
 
 - `reply_guidance` becomes `message_handling`,

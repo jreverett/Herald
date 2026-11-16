@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.19.0"
+__version__ = "0.20.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -2836,6 +2836,141 @@ def cmd_mailbox(cfg, args):
     atomic_write_json(CONFIG_PATH, cfg)
     print(f"Mailbox '{args.name}' updated")
 
+AUTOLISTEN_DESK = "herald-desk"
+AUTOLISTEN_UNIT = "herald-autolisten.service"
+AUTOLISTEN_ENV_FILE = Path.home() / ".config" / "herald" / "autolisten.env"
+AUTOLISTEN_PROMPT = Path(__file__).resolve().parent / "autolisten" / "desk-prompt.md"
+
+
+def autolisten_settings(cfg, env=None):
+    """Resolve auto-listener settings: HERALD_AUTOLISTEN_* env, then config "autolisten", then defaults."""
+    env = os.environ if env is None else env
+    conf = cfg.get("autolisten") or {}
+    def pick(key, default):
+        return env.get(f"HERALD_AUTOLISTEN_{key.upper()}") or conf.get(key) or default
+    return {
+        "agent": str(pick("agent", cfg.get("me") or socket.gethostname())),
+        "interval": int(pick("interval", 60)),
+        "grace": max(1, int(pick("grace", 2))),
+        "workdir": str(Path(pick("workdir", Path.home())).expanduser()),
+        "prompt": str(Path(pick("prompt", AUTOLISTEN_PROMPT)).expanduser()),
+    }
+
+
+def autolisten_state(pending, listeners, desk_running):
+    """Classify one check. Any live listener counts, whatever its agent name."""
+    if not pending:
+        return "idle"
+    if listeners:
+        return "listened"
+    if desk_running:
+        return "desk-starting"
+    return "unattended"
+
+
+def autolisten_step(state, misses, grace):
+    """Return (misses, start_desk) after one check; the desk starts after `grace` unattended checks in a row."""
+    if state != "unattended":
+        return 0, False
+    misses += 1
+    return misses, misses >= grace
+
+
+def autolisten_desk_running():
+    return subprocess.run(["tmux", "has-session", "-t", f"=rc-{AUTOLISTEN_DESK}"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def autolisten_check():
+    ensure_dirs()
+    pending = 0
+    for p in INBOX_DIR.glob("*.json"):
+        try:
+            pending += item_state(json.loads(p.read_text())) == "pending"
+        except (OSError, json.JSONDecodeError):
+            continue
+    return autolisten_state(pending, len(live_sessions()), pending and autolisten_desk_running())
+
+
+def autolisten_start_desk(settings):
+    prompt = Path(settings["prompt"]).read_text().replace("{agent}", settings["agent"])
+    return subprocess.run(
+        ["tmux", "new-session", "-d", "-s", f"rc-{AUTOLISTEN_DESK}", "-c", settings["workdir"],
+         "-e", f"HERALD_AGENT={settings['agent']}",
+         "claude", "--remote-control", AUTOLISTEN_DESK, prompt]).returncode == 0
+
+
+def autolisten_install_service():
+    import shutil
+    missing = [tool for tool in ("tmux", "claude") if not shutil.which(tool)]
+    systemd = shutil.which("systemctl") and subprocess.run(
+        ["systemctl", "--user", "show-environment"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if missing or not systemd:
+        print(f"Auto-listener service not installed ({', '.join(missing + ([] if systemd else ['systemd user session']))} not found).")
+        print(f"Start it by hand: nohup herald autolisten >{HERALD_DIR}/autolisten.log 2>&1 &")
+        return 1
+    path_dirs = []
+    for tool in ("claude", "tmux", "python3"):
+        folder = os.path.dirname(shutil.which(tool) or "")
+        if folder and folder not in path_dirs:
+            path_dirs.append(folder)
+    path = ":".join(path_dirs + ["/usr/local/bin", "/usr/bin", "/bin"])
+    unit = Path.home() / ".config" / "systemd" / "user" / AUTOLISTEN_UNIT
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text(f"""[Unit]
+Description=herald auto-listener: start a Claude desk session for Herald work nobody is listening for
+After=herald-daemon.service
+Wants=herald-daemon.service
+
+[Service]
+Environment=HERALD_DIR={HERALD_DIR}
+Environment=PATH={path}
+EnvironmentFile=-{AUTOLISTEN_ENV_FILE}
+ExecStart={sys.executable} {Path(__file__).resolve()} autolisten
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+""")
+    for action in (["daemon-reload"], ["enable", AUTOLISTEN_UNIT], ["restart", AUTOLISTEN_UNIT]):
+        if subprocess.run(["systemctl", "--user", *action]).returncode != 0:
+            print(f"systemctl --user {' '.join(action)} failed")
+            return 1
+    print(f"Auto-listener running (systemd user service {AUTOLISTEN_UNIT}; settings in {AUTOLISTEN_ENV_FILE})")
+    return 0
+
+
+def cmd_autolisten(cfg, args):
+    if args.install_service:
+        sys.exit(autolisten_install_service())
+    if args.once:
+        print(autolisten_check())
+        return
+    settings = autolisten_settings(cfg)
+    if not Path(settings["prompt"]).is_file():
+        sys.exit(f"Desk prompt not found: {settings['prompt']}")
+    HERALD_DIR.mkdir(parents=True, exist_ok=True)
+    lock = (HERALD_DIR / "autolisten.lock").open("a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("Another herald autolisten is already running")
+    def log(text):
+        print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {text}", flush=True)
+    log(f"started (agent {settings['agent']}, every {settings['interval']}s, grace {settings['grace']})")
+    misses = 0
+    while True:
+        misses, start = autolisten_step(autolisten_check(), misses, settings["grace"])
+        if start:
+            log(f"pending Herald work and no listener: starting {AUTOLISTEN_DESK}")
+            if autolisten_start_desk(settings):
+                misses = 0
+            else:
+                log("desk start failed")
+        time.sleep(settings["interval"])
+
 
 def cmd_init(cfg_unused, args):
     HERALD_DIR.mkdir(parents=True, exist_ok=True)
@@ -3032,6 +3167,9 @@ def main():
     sp.add_argument("--routes", help="router routes file (default /etc/herald/routes.json)")
 
     sub.add_parser("sessions", help="list agent sessions currently listening")
+    sp = sub.add_parser("autolisten", help="start a Claude desk session when work waits and nobody listens")
+    sp.add_argument("--once", action="store_true", help="print one check (idle, listened, desk-starting, unattended) and exit")
+    sp.add_argument("--install-service", action="store_true", help="install and start the systemd user service")
 
     sp = sub.add_parser("activity", help="record whether this agent turn is running (editor hook)")
     sp.add_argument("state", nargs="?", choices=("working", "idle"),
@@ -3073,7 +3211,7 @@ def main():
      "resume": cmd_resume, "flush": cmd_flush,
      "claim": cmd_claim, "release": cmd_release, "handoff": cmd_handoff,
      "claims": cmd_claims,
-     "status": cmd_status, "sessions": cmd_sessions, "mcp": cmd_mcp,
+     "status": cmd_status, "sessions": cmd_sessions, "autolisten": cmd_autolisten, "mcp": cmd_mcp,
      "activity": cmd_activity}[args.cmd](cfg, args)
 
 
