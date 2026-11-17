@@ -112,5 +112,67 @@ class AutolistenSettings(unittest.TestCase):
         self.assertEqual(argv[-1], "Use HERALD_AGENT=alice-vm.")
 
 
+class AutolistenHandover(unittest.TestCase):
+    DESK, OTHER = 4242, 5353
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp(prefix="herald-handover-"))
+        self.inbox, self.working = root / "inbox", root / "working"
+        self.inbox.mkdir()
+        self.working.mkdir()
+        for name, value in (("INBOX_DIR", self.inbox), ("WORKING_DIR", self.working)):
+            p = patch.object(herald, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.desk_pids = {self.DESK, self.DESK + 1}
+
+    def sessions(self, *records):
+        return {r["session_id"]: {"heartbeat": herald.time.time(), "mode": "general", "mailbox": "main",
+                                 "host": "elsewhere", **r} for r in records}
+
+    def desk_and_other(self, other_mailbox="main"):
+        return self.sessions(
+            {"session_id": "desk", "agent": "alice", "pid": self.DESK + 1, "harness_pid": self.DESK},
+            {"session_id": "orch", "agent": "alice", "pid": 77, "harness_pid": self.OTHER,
+             "mailbox": other_mailbox})
+
+    def test_idle_desk_hands_over_to_another_listener_with_the_same_agent_name(self):
+        desk = herald.autolisten_handover(self.desk_pids, self.desk_and_other())
+
+        self.assertEqual([s["session_id"] for s in desk], ["desk"])
+
+    def test_desk_alone_keeps_listening(self):
+        sessions = self.sessions({"session_id": "desk", "agent": "alice", "pid": self.DESK + 1,
+                                  "harness_pid": self.DESK})
+
+        self.assertIsNone(herald.autolisten_handover(self.desk_pids, sessions))
+
+    def test_listener_on_another_mailbox_does_not_take_over(self):
+        self.assertIsNone(herald.autolisten_handover(self.desk_pids, self.desk_and_other("ops")))
+
+    def test_desk_mid_turn_is_kept(self):
+        with patch.object(herald, "working_labels", return_value=["desk turn"]) as labels:
+            self.assertIsNone(herald.autolisten_handover(self.desk_pids, self.desk_and_other()))
+        self.assertEqual(labels.call_args.kwargs["only_pids"], self.desk_pids)
+
+    def test_desk_waiting_on_its_human_is_kept(self):
+        (self.inbox / "q1.json").write_text(json.dumps(
+            {"id": "q1", "state": "active", "claimed_pid": self.DESK}))
+
+        self.assertIsNone(herald.autolisten_handover(self.desk_pids, self.desk_and_other()))
+
+    def test_stop_desk_ends_listener_record_and_tmux_session(self):
+        record = {"session_id": "desk", "pid": self.DESK + 1, "host": herald.socket.gethostname()}
+
+        with patch.object(herald.os, "kill") as kill, \
+             patch.object(herald, "clear_session") as clear, \
+             patch.object(herald.subprocess, "run") as run:
+            herald.autolisten_stop_desk([record])
+
+        kill.assert_called_once_with(self.DESK + 1, herald.signal.SIGTERM)
+        clear.assert_called_once_with("desk")
+        self.assertEqual(run.call_args.args[0][:2], ["tmux", "kill-session"])
+
+
 if __name__ == "__main__":
     unittest.main()

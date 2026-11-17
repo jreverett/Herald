@@ -244,7 +244,7 @@ Add `--read` to print the full claimed item and extract attachments.
 `wait` always claims; use `peek` for inspection. Restart the listener after each wake.
 
 A session that `herald autolisten` started (the Herald desk) listens with `herald wait`, never
-`resume`, and stops when another agent's listener appears.
+`resume`. `herald autolisten` stops it when another session listens and the desk is idle.
 
 Use `herald resume` after a Claude account switch, a Codex or Copilot takeover,
 a restarted tab, or any other handoff. It supersedes the previous general

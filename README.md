@@ -209,6 +209,8 @@ introduce <name>`.
 Every minute it checks the inbox. When unclaimed work waits and no live listener exists under any
 agent name for two checks in a row, it starts `claude --remote-control herald-desk` in tmux session
 `rc-herald-desk` with `autolisten/desk-prompt.md`. It never claims or reads items itself.
+When another session listens on the desk's mailbox for two checks in a row and the desk has no
+running turn and no claimed item that owes an answer, it stops the desk and logs "handed over".
 `herald autolisten --once` prints the current state: `idle`, `listened`, `desk-starting` or
 `unattended`. Settings go in `~/.config/herald/autolisten.env` or a `autolisten` object in
 `config.json`: `HERALD_AUTOLISTEN_AGENT` (default `me`), `_INTERVAL` (60), `_GRACE` (2),

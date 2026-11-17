@@ -2,6 +2,16 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.20.1
+
+- The autolisten desk never handed over to a listener that started after it. Its prompt told it to
+  stop when another session listened, but a Claude session reads that only when a message wakes it,
+  so an idle desk listened beside the new owner until a human closed it. `herald autolisten` now
+  stops the desk itself: when another session listens on the desk's mailbox for two checks in a row
+  and the desk has no running turn and no claimed item that still owes an answer, it ends the
+  desk's listener, kills its tmux session and logs "handed over". The desk is found by process, not
+  by agent name, so a listener under the same name as the desk still takes over.
+
 ## 0.20.0
 
 - Work that arrived while no session listened, for example after a reboot, sat unread until a

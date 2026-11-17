@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.20.0"
+__version__ = "0.20.1"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -2881,6 +2881,64 @@ def autolisten_desk_running():
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
+def _descendant_pids(root):
+    children = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            text = stat.read_text()
+            ppid = int(text[text.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(stat.parent.name))
+    pids, todo = set(), [root]
+    while todo:
+        pid = todo.pop()
+        if pid not in pids:
+            pids.add(pid)
+            todo.extend(children.get(pid, []))
+    return pids
+
+
+def autolisten_desk_pids():
+    """The desk's pane process and everything it started, or an empty set when no desk runs."""
+    result = subprocess.run(["tmux", "list-panes", "-t", f"=rc-{AUTOLISTEN_DESK}", "-F", "#{pane_pid}"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return set()
+    pids = set()
+    for line in result.stdout.split():
+        if line.isdigit():
+            pids |= _descendant_pids(int(line))
+    return pids
+
+
+def autolisten_handover(desk_pids, sessions=None):
+    """The desk's listener records when another session listens on its mailbox and the desk is idle, else None.
+
+    The desk is busy while a turn runs or while it holds a claimed item it still owes an answer, which
+    includes a question waiting on its human."""
+    live = live_sessions(sessions, mode="general")
+    desk = [s for s in live if s.get("harness_pid") in desk_pids or s.get("pid") in desk_pids]
+    mailboxes = {s.get("mailbox", "main") for s in desk} or {"main"}
+    if not any(s not in desk and s.get("mailbox", "main") in mailboxes for s in live):
+        return None
+    if working_labels(only_pids=desk_pids) or desk_pids & herald_working_pids():
+        return None
+    return desk
+
+
+def autolisten_stop_desk(desk_listeners):
+    for s in desk_listeners:
+        if s.get("host") == socket.gethostname() and isinstance(s.get("pid"), int):
+            try:
+                os.kill(s["pid"], signal.SIGTERM)
+            except OSError:
+                pass
+        clear_session(s["session_id"])
+    subprocess.run(["tmux", "kill-session", "-t", f"=rc-{AUTOLISTEN_DESK}"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def autolisten_check():
     ensure_dirs()
     pending = 0
@@ -2960,8 +3018,15 @@ def cmd_autolisten(cfg, args):
     def log(text):
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {text}", flush=True)
     log(f"started (agent {settings['agent']}, every {settings['interval']}s, grace {settings['grace']})")
-    misses = 0
+    misses = handovers = 0
     while True:
+        desk_pids = autolisten_desk_pids()
+        desk = autolisten_handover(desk_pids) if desk_pids else None
+        handovers = handovers + 1 if desk is not None else 0
+        if handovers >= settings["grace"]:
+            autolisten_stop_desk(desk)
+            log(f"another session is listening and {AUTOLISTEN_DESK} is idle: handed over, desk stopped")
+            handovers = 0
         misses, start = autolisten_step(autolisten_check(), misses, settings["grace"])
         if start:
             log(f"pending Herald work and no listener: starting {AUTOLISTEN_DESK}")
