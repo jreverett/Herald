@@ -215,6 +215,11 @@ running turn and no claimed item that owes an answer, it stops the desk and logs
 `unattended`. Settings go in `~/.config/herald/autolisten.env` or a `autolisten` object in
 `config.json`: `HERALD_AUTOLISTEN_AGENT` (default `me`), `_INTERVAL` (60), `_GRACE` (2),
 `_WORKDIR` (home) and `_PROMPT` (a desk prompt file; `{agent}` is replaced by the agent name).
+Optional wake mode: set `HERALD_AUTOLISTEN_WAKE_CMD` (a shell command that wakes a session you keep
+running, for example a tmux `send-keys` into it) and `_WAKE_ALIVE_CMD` (exits 0 while that session
+is alive). Unattended work then runs the wake command once per new pending item instead of starting
+the desk. The desk starts only when the alive command fails or the wake command fails or times out
+(30 seconds). Without `_WAKE_CMD` nothing changes.
 
 **A peer name must be exactly the other person's `--me`** - replies and results route back by it.
 

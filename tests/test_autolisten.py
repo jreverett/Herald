@@ -174,5 +174,128 @@ class AutolistenHandover(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][:2], ["tmux", "kill-session"])
 
 
+class AutolistenWake(unittest.TestCase):
+    SETTINGS = {"wake_cmd": "wake", "wake_alive_cmd": "alive"}
+
+    def runner(self, alive=True, wakes=True):
+        calls = []
+        def run(command):
+            calls.append(command)
+            return alive if command == "alive" else wakes
+        return run, calls
+
+    def test_no_wake_command_starts_the_desk(self):
+        run, calls = self.runner()
+
+        action, woken = herald.autolisten_wake({"wake_cmd": ""}, {"a1"}, set(), run)
+
+        self.assertEqual(action, "desk")
+        self.assertEqual(calls, [])
+
+    def test_live_target_is_woken_once_per_item(self):
+        run, calls = self.runner()
+
+        action, woken = herald.autolisten_wake(self.SETTINGS, {"a1"}, set(), run)
+        again, woken = herald.autolisten_wake(self.SETTINGS, {"a1"}, woken, run)
+
+        self.assertEqual((action, again), ("woken", "already-woken"))
+        self.assertEqual(calls.count("wake"), 1)
+
+    def test_new_item_wakes_again_and_handled_items_are_forgotten(self):
+        run, calls = self.runner()
+
+        action, woken = herald.autolisten_wake(self.SETTINGS, {"a2"}, {"a1"}, run)
+
+        self.assertEqual(action, "woken")
+        self.assertEqual(woken, {"a2"})
+
+    def test_dead_target_falls_back_to_desk_even_for_woken_items(self):
+        run, calls = self.runner(alive=False)
+
+        action, woken = herald.autolisten_wake(self.SETTINGS, {"a1"}, {"a1"}, run)
+
+        self.assertEqual(action, "desk")
+        self.assertNotIn("wake", calls)
+
+    def test_failed_wake_falls_back_to_desk(self):
+        run, calls = self.runner(wakes=False)
+
+        action, woken = herald.autolisten_wake(self.SETTINGS, {"a1"}, set(), run)
+
+        self.assertEqual((action, woken), ("desk", set()))
+
+    def test_without_alive_command_the_wake_result_decides(self):
+        run, calls = self.runner()
+
+        action, woken = herald.autolisten_wake({"wake_cmd": "wake"}, {"a1"}, set(), run)
+
+        self.assertEqual((action, calls), ("woken", ["wake"]))
+
+    def test_commands_report_their_exit_status(self):
+        self.assertTrue(herald.autolisten_run("true"))
+        self.assertFalse(herald.autolisten_run("false"))
+
+    def test_timed_out_command_and_its_children_are_killed(self):
+        proc = SimpleNamespace(pid=999, wait=lambda timeout=None: (_ for _ in ()).throw(
+            herald.subprocess.TimeoutExpired("wake", 30)) if timeout else 0)
+
+        with patch.object(herald.subprocess, "Popen", return_value=proc), \
+             patch.object(herald.os, "killpg") as killpg:
+            self.assertFalse(herald.autolisten_run("wake"))
+
+        killpg.assert_called_once_with(999, herald.signal.SIGKILL)
+
+    def test_settings_read_wake_commands_from_env(self):
+        settings = herald.autolisten_settings({"me": "alice"}, {"HERALD_AUTOLISTEN_WAKE_CMD": "w",
+                                                                "HERALD_AUTOLISTEN_WAKE_ALIVE_CMD": "a"})
+
+        self.assertEqual((settings["wake_cmd"], settings["wake_alive_cmd"]), ("w", "a"))
+
+
+class AutolistenLoop(unittest.TestCase):
+    def run_loop(self, env, polls=4, pending=None):
+        prompt = Path(tempfile.mkdtemp()) / "prompt.md"
+        prompt.write_text("desk")
+        herald_dir = Path(tempfile.mkdtemp(prefix="herald-loop-"))
+        sleeps = []
+        def sleep(_):
+            sleeps.append(1)
+            if len(sleeps) >= polls:
+                raise KeyboardInterrupt
+        env = {"HERALD_AUTOLISTEN_PROMPT": str(prompt), "HERALD_AUTOLISTEN_GRACE": "1", **env}
+        with patch.dict(os.environ, env), \
+             patch.object(herald, "HERALD_DIR", herald_dir), \
+             patch.object(herald, "autolisten_desk_pids", return_value=set()), \
+             patch.object(herald, "autolisten_pending_ids", side_effect=pending or [{"a1"}] * polls), \
+             patch.object(herald, "live_sessions", return_value=[]), \
+             patch.object(herald, "autolisten_desk_running", return_value=False), \
+             patch.object(herald, "autolisten_run", return_value=True) as run, \
+             patch.object(herald, "autolisten_start_desk", return_value=True) as start, \
+             patch.object(herald.time, "sleep", side_effect=sleep), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             self.assertRaises(KeyboardInterrupt):
+            herald.cmd_autolisten({"me": "alice"}, SimpleNamespace(once=False, install_service=False))
+        return run, start
+
+    def test_wake_target_is_woken_once_and_no_desk_starts(self):
+        run, start = self.run_loop({"HERALD_AUTOLISTEN_WAKE_CMD": "wake"})
+
+        self.assertEqual([c.args[0] for c in run.call_args_list], ["wake"])
+        start.assert_not_called()
+
+    def test_item_that_was_handled_and_came_back_wakes_again(self):
+        run, start = self.run_loop({"HERALD_AUTOLISTEN_WAKE_CMD": "wake"},
+                                   pending=[{"a1"}, {"a1"}, set(), {"a1"}])
+
+        self.assertEqual(run.call_count, 2)
+        start.assert_not_called()
+
+    def test_without_wake_settings_the_desk_starts_as_before(self):
+        run, start = self.run_loop({})
+
+        run.assert_not_called()
+        self.assertTrue(start.called)
+
+
 if __name__ == "__main__":
     unittest.main()

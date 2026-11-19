@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
 
-__version__ = "0.20.1"
+__version__ = "0.21.0"
 
 HERALD_DIR = Path(os.environ.get("HERALD_DIR", Path.home() / ".herald"))
 CONFIG_PATH = HERALD_DIR / "config.json"
@@ -2854,6 +2854,8 @@ def autolisten_settings(cfg, env=None):
         "grace": max(1, int(pick("grace", 2))),
         "workdir": str(Path(pick("workdir", Path.home())).expanduser()),
         "prompt": str(Path(pick("prompt", AUTOLISTEN_PROMPT)).expanduser()),
+        "wake_cmd": str(pick("wake_cmd", "")),
+        "wake_alive_cmd": str(pick("wake_alive_cmd", "")),
     }
 
 
@@ -2874,6 +2876,42 @@ def autolisten_step(state, misses, grace):
         return 0, False
     misses += 1
     return misses, misses >= grace
+
+
+def autolisten_run(command):
+    """Run a configured shell command; True only when it exits 0 within 30 seconds."""
+    try:
+        proc = subprocess.Popen(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except (OSError, ValueError):
+        return False
+    try:
+        return proc.wait(timeout=30) == 0
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        return False
+
+
+def autolisten_wake(settings, pending_ids, woken, run=None):
+    """Return (action, woken) for unattended work: "desk", "woken" or "already-woken".
+
+    With a wake command set and its target alive, wake the target once per new pending item instead
+    of starting a desk; a dead target or a failed wake falls back to the desk."""
+    run = run or autolisten_run
+    if not settings.get("wake_cmd"):
+        return "desk", set()
+    woken = woken & pending_ids
+    if settings.get("wake_alive_cmd") and not run(settings["wake_alive_cmd"]):
+        return "desk", woken
+    if not pending_ids - woken:
+        return "already-woken", woken
+    if not run(settings["wake_cmd"]):
+        return "desk", woken
+    return "woken", woken | pending_ids
 
 
 def autolisten_desk_running():
@@ -2939,14 +2977,20 @@ def autolisten_stop_desk(desk_listeners):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def autolisten_check():
+def autolisten_pending_ids():
     ensure_dirs()
-    pending = 0
+    pending = set()
     for p in INBOX_DIR.glob("*.json"):
         try:
-            pending += item_state(json.loads(p.read_text())) == "pending"
+            if item_state(json.loads(p.read_text())) == "pending":
+                pending.add(p.stem)
         except (OSError, json.JSONDecodeError):
             continue
+    return pending
+
+
+def autolisten_check(pending_ids=None):
+    pending = len(autolisten_pending_ids() if pending_ids is None else pending_ids)
     return autolisten_state(pending, len(live_sessions()), pending and autolisten_desk_running())
 
 
@@ -3017,8 +3061,10 @@ def cmd_autolisten(cfg, args):
         sys.exit("Another herald autolisten is already running")
     def log(text):
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {text}", flush=True)
-    log(f"started (agent {settings['agent']}, every {settings['interval']}s, grace {settings['grace']})")
+    log(f"started (agent {settings['agent']}, every {settings['interval']}s, grace {settings['grace']}"
+        f"{', wake command set' if settings['wake_cmd'] else ''})")
     misses = handovers = 0
+    woken = set()
     while True:
         desk_pids = autolisten_desk_pids()
         desk = autolisten_handover(desk_pids) if desk_pids else None
@@ -3027,7 +3073,16 @@ def cmd_autolisten(cfg, args):
             autolisten_stop_desk(desk)
             log(f"another session is listening and {AUTOLISTEN_DESK} is idle: handed over, desk stopped")
             handovers = 0
-        misses, start = autolisten_step(autolisten_check(), misses, settings["grace"])
+        pending_ids = autolisten_pending_ids()
+        woken &= pending_ids
+        misses, start = autolisten_step(autolisten_check(pending_ids), misses, settings["grace"])
+        if start and settings["wake_cmd"]:
+            action, woken = autolisten_wake(settings, pending_ids, woken)
+            if action == "woken":
+                log(f"pending Herald work and no listener: woke the wake target for {len(pending_ids)} item(s)")
+            elif action == "desk":
+                log("wake target not alive or wake command failed: falling back to the desk")
+            start = action == "desk"
         if start:
             log(f"pending Herald work and no listener: starting {AUTOLISTEN_DESK}")
             if autolisten_start_desk(settings):

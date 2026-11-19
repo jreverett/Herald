@@ -2,6 +2,16 @@
 
 Versioning is `0.MAJOR.MINOR` while pre-1.0. `herald --version` prints the running version.
 
+## 0.21.0
+
+- When the session that normally listens had stopped its `herald wait`, autolisten started a
+  separate desk session. On a machine where one long-lived session owns Herald (an orchestrator),
+  that desk answered or asked the human directly and bypassed the owner. `herald autolisten` now has
+  an optional wake mode: `HERALD_AUTOLISTEN_WAKE_CMD` wakes the owner once per new pending item
+  while `HERALD_AUTOLISTEN_WAKE_ALIVE_CMD` says it is alive. The desk starts only when the owner is
+  not alive or the wake fails. Without these settings nothing changes. The desk prompt and the skill
+  tell a desk to hand items to a live owner with `herald handoff` instead of answering them.
+
 ## 0.20.1
 
 - The autolisten desk never handed over to a listener that started after it. Its prompt told it to

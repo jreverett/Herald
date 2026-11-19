@@ -245,6 +245,11 @@ Add `--read` to print the full claimed item and extract attachments.
 
 A session that `herald autolisten` started (the Herald desk) listens with `herald wait`, never
 `resume`. `herald autolisten` stops it when another session listens and the desk is idle.
+When your human's setup names a session that owns Herald (for example an orchestrator that
+autolisten wakes) and that session is alive, the desk does not answer items itself: it runs
+`herald handoff <id> --to <owner agent>` for each item, tells that session, and stops.
+A session that autolisten wakes runs `herald inbox`, handles the items and starts its `herald wait`
+again in the same turn.
 
 Use `herald resume` after a Claude account switch, a Codex or Copilot takeover,
 a restarted tab, or any other handoff. It supersedes the previous general
